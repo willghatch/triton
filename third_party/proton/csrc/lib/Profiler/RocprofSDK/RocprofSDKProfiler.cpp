@@ -645,7 +645,6 @@ void RocprofSDKProfiler::RocprofSDKProfilerPimpl::hipRuntimeCallback(
   if (record.phase == ROCPROFILER_CALLBACK_PHASE_ENTER) {
     if (!isKernelOp)
       return;
-
     const char *resolvedName = resolveKernelNameAtEnter(operation, payload);
     threadState.enterOp(
         Scope(resolvedName ? std::string(resolvedName) : std::string()));
