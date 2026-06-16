@@ -1378,3 +1378,48 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
 // CHECK-NEXT: ttg.barrier local
 // CHECK-NEXT: rocdl.sched.barrier
 // CHECK: scf.yield
+
+// -----
+
+// ---- Hard loop dot1 wrap-around boundary stays at tail by default ----
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @hard_loop_dot1_boundary_at_loop_tail_by_default(%n: index, %ptr0: !tt.ptr<f32>, %ptr1: !tt.ptr<f32>) {
+    %c0  = arith.constant 0 : index
+    %c1  = arith.constant 1 : index
+    %v0  = arith.constant 0.0 : f32
+    %v1  = arith.constant 1.0 : f32
+
+    scf.for %i = %c0 to %n step %c1 {
+      scf.execute_region {
+        tt.store %ptr0, %v0 : !tt.ptr<f32>
+        scf.yield
+      } {triton.warp_pipeline.stage = "dot1"}
+
+      scf.execute_region {
+        tt.store %ptr1, %v1 : !tt.ptr<f32>
+        scf.yield
+      } {triton.warp_pipeline.stage = "dot2"}
+
+      scf.yield
+    } {triton.warp_pipeline.pipelined_for}
+
+    tt.return
+  }
+}
+
+// CHECK-LABEL: tt.func @hard_loop_dot1_boundary_at_loop_tail_by_default
+// CHECK: scf.for
+// The literal dot1 name alone does not move the backedge boundary.
+// CHECK-NOT: rocdl.s.barrier
+// CHECK: tt.store
+// dot2 keeps its ordinary interior boundary before the second cluster body.
+// CHECK: rocdl.sched.barrier
+// CHECK-NEXT: rocdl.s.barrier
+// CHECK-NEXT: rocdl.sched.barrier
+// CHECK: tt.store
+// The cluster-0 wrap-around boundary remains at the loop tail by default.
+// CHECK: rocdl.sched.barrier
+// CHECK-NEXT: rocdl.s.barrier
+// CHECK-NEXT: rocdl.sched.barrier
+// CHECK: amdg.cond_barrier

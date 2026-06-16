@@ -309,10 +309,12 @@ static void emitPipelinePostlude(OpBuilder &b, Location loc,
 class ConvertPipelinedForPattern : public OpRewritePattern<scf::ForOp> {
 public:
   ConvertPipelinedForPattern(MLIRContext *ctx, ModuleAllocation &moduleAlloc,
-                             int threadsPerPipelineGroup)
+                             int threadsPerPipelineGroup,
+                             bool backedgeBarrierToHead)
       : OpRewritePattern<scf::ForOp>(ctx, /*benefit=*/2),
         moduleAllocation(moduleAlloc),
-        threadsPerPipelineGroup(threadsPerPipelineGroup) {}
+        threadsPerPipelineGroup(threadsPerPipelineGroup),
+        backedgeBarrierToHead(backedgeBarrierToHead) {}
 
   LogicalResult matchAndRewrite(scf::ForOp forOp,
                                 PatternRewriter &rewriter) const override {
@@ -402,13 +404,15 @@ private:
     //    The “local” variant is chosen when cluster-to-cluster memory
     //    dependence requires local-scope synchronization.
     //  • Cluster 0 is a special case: if no top-of-loop barrier existed,
-    //    the first cluster barrier must be inserted just before the loop’s
-    //    terminator, forming the wrap-around dependency.
+    //    the first cluster barrier forms the loop backedge dependency. By
+    //    default it is inserted just before the loop's terminator; with the
+    //    backedge-barrier-to-head option, the priority reset stays at the
+    //    tail and the barrier itself moves to the loop head.
     for (int i = 0; i < numClusters; i++) {
       if (i == 0 && !hasTopBarrier) {
         // Prime the first iteration's priority.  The loop-carried cluster-0
-        // barrier sits at the bottom of the loop body, so it only controls
-        // the next iteration.
+        // tail priority only controls the next iteration, so this covers
+        // iteration 0.
         b.setInsertionPoint(forOp);
         emitClusterPriority(b, loc, clusterOps[i], anyHasPriority);
       }
@@ -423,12 +427,26 @@ private:
                             anyHasPriority);
       } else {
         b.setInsertionPoint(clusterOps[i]);
-        // The first one wraps back to the last of the loop
+        bool emitPriorityAtBoundary = true;
+        // The first one wraps back to the last of the loop.
         if (i == 0 && !hasTopBarrier) {
-          // inserts just before yield (=End of the loop).
-          b.setInsertionPoint(terminatorOp);
+          if (backedgeBarrierToHead) {
+            // Keep only the priority reset at the tail; move the boundary
+            // fence itself to the loop head for the cluster-0 backedge.
+            // This also keeps the final s_barrier from being immediately
+            // followed by another scalar s_* instruction at the back-edge,
+            // which can interfere with the intended barrier scheduling.
+            b.setInsertionPoint(terminatorOp);
+            emitClusterPriority(b, loc, clusterOps[i], anyHasPriority);
+            b.setInsertionPoint(clusterOps[i]);
+            emitPriorityAtBoundary = false;
+          } else {
+            // Insert just before yield (= end of the loop).
+            b.setInsertionPoint(terminatorOp);
+          }
         }
-        emitClusterPriority(b, loc, clusterOps[i], anyHasPriority);
+        if (emitPriorityAtBoundary)
+          emitClusterPriority(b, loc, clusterOps[i], anyHasPriority);
         emitClusterBarrier(b, loc, /*needLocal=*/bars[i]);
       }
     }
@@ -440,6 +458,7 @@ private:
 
   ModuleAllocation &moduleAllocation;
   int threadsPerPipelineGroup;
+  bool backedgeBarrierToHead;
 };
 
 class InlineWarpPipelineExecuteRegionPattern
@@ -932,9 +951,10 @@ struct ConvertWarpPipeline
     : public mlir::triton::impl::ConvertWarpPipelineBase<ConvertWarpPipeline> {
 
 public:
-  ConvertWarpPipeline(StringRef gfxArch)
+  ConvertWarpPipeline(StringRef gfxArch, bool backedgeBarrierToHead)
       : ConvertWarpPipelineBase<ConvertWarpPipeline>() {
     this->gfxArch = gfxArch.str();
+    this->backedgeBarrierToHead = backedgeBarrierToHead;
   }
 
   void runOnOperation() override {
@@ -975,7 +995,8 @@ public:
     RewritePatternSet patternFor(&getContext());
     RewritePatternSet patternInline(&getContext());
     patternFor.add<ConvertPipelinedForPattern>(&getContext(), moduleAllocation,
-                                               threadsPerPipelineGroup);
+                                               threadsPerPipelineGroup,
+                                               backedgeBarrierToHead);
     patternInline.add<InlineWarpPipelineExecuteRegionPattern>(&getContext());
 
     if (failed(applyPatternsGreedily(m, std::move(patternFor))))
@@ -1000,7 +1021,8 @@ public:
 
 namespace mlir::triton::AMD {
 std::unique_ptr<OperationPass<ModuleOp>>
-createConvertWarpPipelinePass(StringRef gfxArch) {
-  return std::make_unique<ConvertWarpPipeline>(gfxArch);
+createConvertWarpPipelinePass(StringRef gfxArch, bool backedgeBarrierToHead) {
+  return std::make_unique<ConvertWarpPipeline>(gfxArch,
+                                               backedgeBarrierToHead);
 }
 } // namespace mlir::triton::AMD
