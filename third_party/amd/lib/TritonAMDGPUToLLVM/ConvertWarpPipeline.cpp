@@ -404,15 +404,13 @@ private:
     //    The “local” variant is chosen when cluster-to-cluster memory
     //    dependence requires local-scope synchronization.
     //  • Cluster 0 is a special case: if no top-of-loop barrier existed,
-    //    the first cluster barrier forms the loop backedge dependency. By
-    //    default it is inserted just before the loop's terminator; with the
-    //    backedge-barrier-to-head option, the priority reset stays at the
-    //    tail and the barrier itself moves to the loop head.
+    //    the first cluster barrier must be inserted just before the loop’s
+    //    terminator, forming the wrap-around dependency.
     for (int i = 0; i < numClusters; i++) {
       if (i == 0 && !hasTopBarrier) {
         // Prime the first iteration's priority.  The loop-carried cluster-0
-        // tail priority only controls the next iteration, so this covers
-        // iteration 0.
+        // barrier sits at the bottom of the loop body, so it only controls
+        // the next iteration.
         b.setInsertionPoint(forOp);
         emitClusterPriority(b, loc, clusterOps[i], anyHasPriority);
       }
@@ -431,11 +429,8 @@ private:
         // The first one wraps back to the last of the loop.
         if (i == 0 && !hasTopBarrier) {
           if (backedgeBarrierToHead) {
-            // Keep only the priority reset at the tail; move the boundary
-            // fence itself to the loop head for the cluster-0 backedge.
-            // This also keeps the final s_barrier from being immediately
-            // followed by another scalar s_* instruction at the back-edge,
-            // which can interfere with the intended barrier scheduling.
+            // Keep the priority reset at the tail while moving the backedge
+            // barrier itself to the loop head.
             b.setInsertionPoint(terminatorOp);
             emitClusterPriority(b, loc, clusterOps[i], anyHasPriority);
             b.setInsertionPoint(clusterOps[i]);
@@ -1022,7 +1017,6 @@ public:
 namespace mlir::triton::AMD {
 std::unique_ptr<OperationPass<ModuleOp>>
 createConvertWarpPipelinePass(StringRef gfxArch, bool backedgeBarrierToHead) {
-  return std::make_unique<ConvertWarpPipeline>(gfxArch,
-                                               backedgeBarrierToHead);
+  return std::make_unique<ConvertWarpPipeline>(gfxArch, backedgeBarrierToHead);
 }
 } // namespace mlir::triton::AMD

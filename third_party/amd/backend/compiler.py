@@ -58,8 +58,7 @@ def disable_real_true16_feature(arch):
 
 
 def has_schedule_hint(options, hint):
-    hints = {item.strip().lower()
-             for item in options.schedule_hint.split(",")}
+    hints = {item.strip().lower() for item in options.schedule_hint.split(",")}
     return hint in hints
 
 
@@ -103,28 +102,9 @@ class HIPOptions:
     instrumentation_mode: str = ""
 
     # The following option provides hints to the AMDGPU backend regarding instruction scheduling
-    # for all `tt.dot` operations in a kernel. The "none" variant preserves the default
-    # instruction scheduling of the AMDGPU backend which aims at maximizing occupancy.
-    # The option is experimental and may change at any time regarding its semantics and/or may
-    # be gone entirely anytime.
-    #
-    # Current experimental scheduling variants:
-    #
-    # attention: enables a bunch of optimizations for attention kernels, including:
-    #            - iglp 2 and sched.barrier around it
-    #            - sink-insts-to-avoid-spills flag to avoid register spills
-    # memory-bound-attention: enables custom scheduling strategy in llvm backend,
-    #            This option targets special FA variant, which is memory bound and
-    #            has a lot of elementwise operations from fused operand dequantizations.
-    #            Note that this option is highly experimental,
-    #            and will be removed as soon as default sceduler algorithm is fixed.
-    # warp-pipeline-backedge-barrier-to-head: moves the cluster-0 warp-pipeline
-    #            backedge barrier to the loop head to avoid a tail s_barrier
-    #            immediately followed by another scalar s_* instruction.
-    #
-    # Option allows to set multiple variants divided by commas:
-    # schedule_hint="attention,memory-bound-attention"
-    schedule_hint: str = 'none'
+    # for all `tt.dot` operations in a kernel. Experimental; semantics may change.
+    # Multiple hints can be comma-separated.
+    schedule_hint: str = ''
 
     # Experimental: intended for development and debugging; may change or be removed without notice.
     # Comma-separated LLVM function attributes; bare names are emitted as valueless attributes.
@@ -382,10 +362,8 @@ class HIPBackend(BaseBackend):
         pm = ir.pass_manager(mod.context)
         pm.enable_debug()
         amd.passes.ttgpuir.add_update_async_wait_count(pm, options.arch)
-        backedge_barrier_to_head = has_schedule_hint(
-            options, "warp-pipeline-backedge-barrier-to-head")
-        amd.passes.ttgpuir.add_warp_pipeline_conversion(
-            pm, options.arch, backedge_barrier_to_head)
+        backedge_barrier_to_head = has_schedule_hint(options, "warp-pipeline-backedge-barrier-to-head")
+        amd.passes.ttgpuir.add_warp_pipeline_conversion(pm, options.arch, backedge_barrier_to_head)
         passes.convert.add_scf_to_cf(pm)
         passes.gluon.add_inliner(pm)
         passes.convert.add_index_to_llvmir(pm)
