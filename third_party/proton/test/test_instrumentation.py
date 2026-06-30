@@ -19,6 +19,7 @@ from triton._internal_testing import (
     is_hip,
     is_hip_cdna2,
     is_hip_cdna4,
+    is_hip_gfx1250,
     supports_tma,
     supports_ws,
 )
@@ -174,7 +175,7 @@ def test_record(method, fresh_knobs, tmp_path: pathlib.Path):
 
     # check llir line info
     llir_lines = pgm.asm["llir"].splitlines()
-    clock_instr = "clock" if is_cuda() else "memtime"
+    clock_instr = "clock" if is_cuda() else ("s_get_shader_cycles" if is_hip_gfx1250() else "memtime")
     clock_loc = None
     for line in llir_lines:
         if clock_instr not in line or "!dbg" not in line:

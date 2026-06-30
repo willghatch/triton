@@ -13,7 +13,10 @@ DEFAULT_PROFILE_NAME = "proton"
 
 
 def _select_backend() -> str:
-    backend = triton.runtime.driver.active.get_current_target().backend
+    target = triton.runtime.driver.active.get_current_target()
+    backend = target.backend
+    if backend == "hip" and target.arch == "gfx1250":
+        return "roctracer"
     return libproton.select_profiler_from_triton_backend(backend)
 
 

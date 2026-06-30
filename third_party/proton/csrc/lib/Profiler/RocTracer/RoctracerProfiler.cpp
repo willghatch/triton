@@ -37,13 +37,17 @@ public:
     // Otherwise on nvidia platforms, the HSA call will fail because of no
     // available libraries.
     std::call_once(deviceOffsetFlag, [this]() { initDeviceOffset(); });
-    return id - deviceOffset;
+    if (deviceCount == 1)
+      return 0;
+    if (deviceOffset == std::numeric_limits<int>::max())
+      return id;
+    int mappedId = id - deviceOffset;
+    return mappedId >= 0 ? mappedId : id;
   }
 
 private:
   void initDeviceOffset() {
-    int dc = 0;
-    (void)hip::getDeviceCount<true>(&dc);
+    (void)hip::getDeviceCount<true>(&deviceCount);
     hsa::iterateAgents(
         [](hsa_agent_t agent, void *data) {
           auto &offset = *static_cast<int *>(data);
@@ -65,7 +69,8 @@ private:
   }
 
   std::once_flag deviceOffsetFlag;
-  int deviceOffset = 0x7fffffff;
+  int deviceCount = 0;
+  int deviceOffset = std::numeric_limits<int>::max();
 };
 
 std::unique_ptr<Metric>

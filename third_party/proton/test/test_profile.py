@@ -18,7 +18,7 @@ import triton.language as tl
 import triton.profiler.hooks.launch as proton_launch
 from triton.profiler.state import COMPUTE_METADATA_SCOPE_NAME
 import triton.profiler.viewer as viewer
-from triton._internal_testing import is_hip, is_cuda, is_blackwell
+from triton._internal_testing import is_hip, is_cuda, is_blackwell, is_hip_gfx1250
 
 
 def _find_frame_by_name(frame, name):
@@ -1457,6 +1457,8 @@ def test_scope_multiple_threads(tmp_path: pathlib.Path, device: str):
 def test_nvtx_range_push_pop(enable_nvtx, fresh_knobs, tmp_path: pathlib.Path, device: str):
     if enable_nvtx is not None:
         fresh_knobs.proton.enable_nvtx = enable_nvtx
+    if is_hip_gfx1250() and (enable_nvtx or enable_nvtx is None):
+        pytest.skip("gfx1250 uses roctracer for Proton, which does not capture torch.cuda.nvtx ranges")
     temp_file = tmp_path / "test_nvtx_range_push_pop.hatchet"
     proton.start(str(temp_file.with_suffix("")))
 
