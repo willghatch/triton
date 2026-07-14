@@ -592,15 +592,66 @@ struct RocprofSDKProfiler::RocprofSDKProfilerPimpl
   ThreadSafeMap<uint64_t, uint64_t, std::unordered_map<uint64_t, uint64_t>>
       corrIdToStreamId;
 
-  // Per-kernel PC sampling accumulator. Guarded by pcSamplingMutex.
+  // Per-dispatch PC sampling accumulator. Guarded by pcSamplingMutex.
   struct PCSamplingAccum {
     uint64_t values[PCSamplingMetric::PCSamplingMetricKind::Count] = {};
+    std::string kernelName = UnknownKernelName;
   };
   std::mutex pcSamplingMutex;
-  std::unordered_map<std::string, PCSamplingAccum> pcSamplingAccum;
+  std::unordered_map<uint64_t, PCSamplingAccum> pcSamplingAccum;
+
+  struct PCSamplingTarget {
+    std::string kernelName = UnknownKernelName;
+    DataToEntryMap dataToEntry;
+    bool needsKernelChild{true};
+    bool needsPCChild{false};
+  };
+  using DispatchToPCSamplingTargetMap =
+      ThreadSafeMap<uint64_t, PCSamplingTarget,
+                    std::unordered_map<uint64_t, PCSamplingTarget>>;
+  DispatchToPCSamplingTargetMap dispatchToPCSamplingTarget;
+
+  static bool isNativeHIPKernelSymbol(const std::string &kernelName) {
+    return kernelName.rfind("_Z", 0) == 0;
+  }
+
+  void recordPCSamplingTarget(uint64_t dispatchId, uint64_t correlationId,
+                              const std::string &kernelName, bool isGraph) {
+    if (dispatchId == 0)
+      return;
+
+    size_t externId = Scope::DummyScopeId;
+    if (!profiler.correlation.corrIdToExternId.withRead(
+            correlationId, [&](const size_t &value) { externId = value; }))
+      return;
+    if (externId == Scope::DummyScopeId)
+      return;
+
+    PCSamplingTarget target;
+    bool hasState = profiler.correlation.externIdToState.withRead(
+        externId, [&](const ExternIdState &state) {
+          target.kernelName = kernelName;
+          target.dataToEntry = state.dataToEntry;
+          target.needsKernelChild = isGraph || state.isMissingName;
+          target.needsPCChild =
+              !target.needsKernelChild && !isNativeHIPKernelSymbol(kernelName);
+        });
+    if (hasState) {
+      dispatchToPCSamplingTarget[dispatchId] = target;
+    }
+  }
+
+  static std::unique_ptr<PCSamplingMetric>
+  makePCSamplingMetric(const PCSamplingAccum &accum) {
+    auto metric = std::make_unique<PCSamplingMetric>();
+    for (int i = 0; i < PCSamplingMetric::PCSamplingMetricKind::Count; ++i)
+      metric->updateValue(
+          i, MetricValueType(static_cast<uint64_t>(accum.values[i])));
+    return metric;
+  }
 
   void flushPCSamplingAccum() {
-    std::unordered_map<std::string, PCSamplingAccum> snapshot;
+    std::unordered_map<uint64_t, PCSamplingAccum> snapshot;
     {
       std::lock_guard<std::mutex> lock(pcSamplingMutex);
       snapshot.swap(pcSamplingAccum);
@@ -609,16 +660,31 @@ struct RocprofSDKProfiler::RocprofSDKProfilerPimpl
       return;
 
     auto dataSet = profiler.getDataSet();
-    for (auto *data : dataSet) {
-      auto phase = data->getPhaseInfo().current;
-      for (auto &[kernelName, accum] : snapshot) {
-        auto metric = std::make_unique<PCSamplingMetric>();
-        for (int i = 0; i < PCSamplingMetric::PCSamplingMetricKind::Count; ++i)
-          metric->updateValue(
-              i, MetricValueType(static_cast<uint64_t>(accum.values[i])));
-        auto entry =
-            data->addOp(phase, Data::kRootEntryId, {Context(kernelName)});
-        entry.upsertMetric(std::move(metric));
+    for (auto &[dispatchId, accum] : snapshot) {
+      PCSamplingTarget target;
+      bool hasTarget = dispatchToPCSamplingTarget.withRead(
+          dispatchId, [&](const PCSamplingTarget &value) { target = value; });
+
+      if (hasTarget) {
+        for (auto &[data, entry] : target.dataToEntry) {
+          auto pcEntry = entry;
+          if (target.needsKernelChild)
+            pcEntry = data->addOp(entry.phase, entry.id,
+                                  {Context(target.kernelName)});
+          if (target.needsPCChild)
+            pcEntry = data->addOp(pcEntry.phase, pcEntry.id,
+                                  {Context("pc_sampling")});
+          pcEntry.upsertMetric(makePCSamplingMetric(accum));
+        }
+        dispatchToPCSamplingTarget.erase(dispatchId);
+      } else {
+        // Fallback for samples that cannot be correlated to a dispatch.
+        for (auto *data : dataSet) {
+          auto phase = data->getPhaseInfo().current;
+          auto entry = data->addOp(phase, Data::kRootEntryId,
+                                   {Context(accum.kernelName)});
+          entry.upsertMetric(makePCSamplingMetric(accum));
+        }
       }
     }
   }
@@ -888,9 +954,13 @@ void RocprofSDKProfiler::RocprofSDKProfilerPimpl::kernelBufferCallback(
             header->payload);
     maxCorrelationId =
         std::max(maxCorrelationId, record->correlation_id.internal);
-    impl->dispatchToKernelId[record->dispatch_info.dispatch_id] =
-        record->dispatch_info.kernel_id;
+    auto dispatchId = record->dispatch_info.dispatch_id;
+    impl->dispatchToKernelId[dispatchId] = record->dispatch_info.kernel_id;
     auto kernelName = impl->getKernelName(record->dispatch_info.kernel_id);
+    bool isGraph =
+        impl->corrIdToIsHipGraph.contain(record->correlation_id.internal);
+    impl->recordPCSamplingTarget(dispatchId, record->correlation_id.internal,
+                                 kernelName, isGraph);
     uint64_t streamId =
         static_cast<uint64_t>(record->dispatch_info.queue_id.handle);
     impl->corrIdToStreamId.withRead(
@@ -941,9 +1011,11 @@ PCSamplingMetric::PCSamplingMetricKind mapNotIssuedReason(
 
 void accumulatePCSample(RocprofSDKProfiler::RocprofSDKProfilerPimpl *impl,
                         PCSamplingMetric::PCSamplingMetricKind stallKind,
-                        bool isStalled, const std::string &kernelName) {
+                        bool isStalled, uint64_t dispatchId,
+                        const std::string &kernelName) {
   std::lock_guard<std::mutex> lock(impl->pcSamplingMutex);
-  auto &accum = impl->pcSamplingAccum[kernelName];
+  auto &accum = impl->pcSamplingAccum[dispatchId];
+  accum.kernelName = kernelName;
   accum.values[PCSamplingMetric::NumSamples]++;
   if (isStalled) {
     accum.values[PCSamplingMetric::NumStalledSamples]++;
@@ -984,7 +1056,8 @@ void RocprofSDKProfiler::RocprofSDKProfilerPimpl::pcSamplingBufferCallback(
                         rocprofiler_pc_sampling_instruction_not_issued_reason_t>(
                         sample->snapshot.reason_not_issued))
               : PCSamplingMetric::StalledSelected;
-      accumulatePCSample(impl, stallKind, isStalled, kernelName);
+      accumulatePCSample(impl, stallKind, isStalled, sample->dispatch_id,
+                         kernelName);
     } else if (header->kind ==
                ROCPROFILER_PC_SAMPLING_RECORD_HOST_TRAP_V0_SAMPLE) {
       auto *sample =
@@ -993,7 +1066,8 @@ void RocprofSDKProfiler::RocprofSDKProfilerPimpl::pcSamplingBufferCallback(
       auto kernelName = impl->resolvePCSampleKernel(
           sample->dispatch_id, sample->pc.code_object_id,
           sample->pc.code_object_offset);
-      accumulatePCSample(impl, PCSamplingMetric::NumSamples, false, kernelName);
+      accumulatePCSample(impl, PCSamplingMetric::NumSamples, false,
+                         sample->dispatch_id, kernelName);
     }
   }
 }
