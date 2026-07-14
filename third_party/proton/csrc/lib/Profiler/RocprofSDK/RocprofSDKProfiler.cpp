@@ -1234,9 +1234,6 @@ void protonToolFini(void *toolData) {
   rocprofiler::flushBuffer<false>(state->kernelBuffer);
   for (auto &buf : state->pcSamplingBuffers)
     rocprofiler::flushBuffer<false>(buf);
-  if (state->finalizeFunc && state->clientId) {
-    state->finalizeFunc(*state->clientId);
-  }
 }
 
 rocprofiler_tool_configure_result_t *
