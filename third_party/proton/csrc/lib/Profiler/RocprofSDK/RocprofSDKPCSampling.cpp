@@ -37,6 +37,7 @@ constexpr uint64_t MaxCodeObjectImageSize = 256 * 1024 * 1024;
 
 struct AgentPCSamplingConfig {
   rocprofiler_agent_id_t agentId;
+  uint32_t gfxTargetVersion{0};
   std::vector<rocprofiler_pc_sampling_configuration_t> configs;
 };
 
@@ -63,7 +64,8 @@ rocprofiler_status_t agentQueryCallback(rocprofiler_agent_version_t version,
     if (agentList[i]->type != ROCPROFILER_AGENT_TYPE_GPU)
       continue;
 
-    AgentPCSamplingConfig entry{agentList[i]->id, {}};
+    AgentPCSamplingConfig entry{
+        agentList[i]->id, agentList[i]->gfx_target_version, {}};
     auto status = rocprofiler::queryPCSamplingAgentConfigurations<false>(
         agentList[i]->id, pcSamplingConfigCallback, &entry.configs);
     if (status == ROCPROFILER_STATUS_SUCCESS && !entry.configs.empty())
@@ -254,12 +256,27 @@ void RocprofSDKPCSampling::configure(rocprofiler_buffer_tracing_cb_t callback) {
   std::stringstream failureDetails;
   size_t failedConfigCount = 0;
   size_t unsupportedConfigCount = 0;
+  const bool pcSamplingCorrectionEnabled =
+      getBoolEnv("PROTON_PC_SAMPLING_CORRECTION", true);
 
   for (auto &agent : agentsWithPCSampling) {
     auto *picked = pickPCSamplingConfig(agent.configs);
     if (!picked) {
       failureDetails << " agent " << agent.agentId.handle
                      << " has no supported PC sampling method;";
+      ++failedConfigCount;
+      continue;
+    }
+
+    const bool isGfx1250Stochastic =
+        pc_sampling_correction::isGfx1250(agent.gfxTargetVersion) &&
+        picked->method == ROCPROFILER_PC_SAMPLING_METHOD_STOCHASTIC;
+    if (isGfx1250Stochastic && pcSamplingCorrectionEnabled &&
+        !PROTON_ROCPROFILER_SDK_HAS_CODEOBJ_ADDRESS_TRANSLATE) {
+      failureDetails
+          << " agent " << agent.agentId.handle
+          << " requires code-object translation for gfx1250 stochastic "
+             "PC sampling correction;";
       ++failedConfigCount;
       continue;
     }
@@ -289,6 +306,8 @@ void RocprofSDKPCSampling::configure(rocprofiler_buffer_tracing_cb_t callback) {
                                               pcSamplingThread);
       pcSamplingBuffers.push_back(pcSamplingBuffer);
       pcSamplingConfigured = true;
+      if (isGfx1250Stochastic && pcSamplingCorrectionEnabled)
+        sampledGfx1250Agents.insert(agent.agentId.handle);
     } else {
       failureDetails << " agent " << agent.agentId.handle
                      << " status=" << rocprofilerStatusName(cfgStatus) << "("
@@ -303,6 +322,7 @@ void RocprofSDKPCSampling::configure(rocprofiler_buffer_tracing_cb_t callback) {
                 << agent.agentId.handle << " status=" << cfgStatus << std::endl;
     }
   }
+  pcSamplingCorrection.setEnabled(!sampledGfx1250Agents.empty());
 
   if (!pcSamplingConfigured) {
     if (failedConfigCount == unsupportedConfigCount) {
@@ -344,6 +364,7 @@ void RocprofSDKPCSampling::recordCodeObjectLoad(
     const rocprofiler_callback_tracing_code_object_load_data_t &load) {
   if (load.code_object_id == ROCPROFILER_CODE_OBJECT_ID_NONE)
     return;
+  pcSamplingCorrection.erase(load.code_object_id);
 
   CodeObjectInfo info;
   info.codeObjectId = load.code_object_id;
@@ -372,6 +393,19 @@ void RocprofSDKPCSampling::recordCodeObjectLoad(
 #endif
 
   codeObjects[load.code_object_id] = std::move(info);
+
+  if (pcSamplingCorrection.enabled() &&
+      sampledGfx1250Agents.count(load.agent_id.handle) > 0) {
+    if (!buildCorrectionClassification(load.code_object_id)) {
+      pcSamplingCorrection.markUnavailable(load.code_object_id);
+      if (!correctionUnavailableWarningEmitted) {
+        correctionUnavailableWarningEmitted = true;
+        std::cerr << "[PROTON] gfx1250 PC sampling correction could not "
+                     "classify a code object; affected samples may be dropped."
+                  << std::endl;
+      }
+    }
+  }
 }
 
 void RocprofSDKPCSampling::removeSourceLocationDecoder(
@@ -387,6 +421,71 @@ void RocprofSDKPCSampling::removeSourceLocationDecoder(
   }
 #else
   (void)info;
+#endif
+}
+
+bool RocprofSDKPCSampling::buildCorrectionClassification(
+    uint64_t codeObjectId) {
+#if !PROTON_ROCPROFILER_SDK_HAS_CODEOBJ_ADDRESS_TRANSLATE
+  (void)codeObjectId;
+  return false;
+#else
+  if (!ensureSourceLocationDecoder(codeObjectId))
+    return false;
+
+  auto classification =
+      std::make_shared<pc_sampling_correction::CodeObjectClassification>();
+  try {
+    std::lock_guard<std::mutex> lock(sourceLocationTranslatorMutex);
+    if (!sourceLocationTranslator)
+      return false;
+
+    auto symbols = sourceLocationTranslator->getSymbolMap(codeObjectId);
+    for (const auto &[offset, symbol] : symbols) {
+      (void)offset;
+      classification->addSymbol(
+          symbol.vaddr, symbol.mem_size, [&](uint64_t instructionOffset) {
+            auto inst =
+                sourceLocationTranslator->get(codeObjectId, instructionOffset);
+            if (!inst || inst->size == 0)
+              return std::optional<
+                  pc_sampling_correction::DecodedInstruction>{};
+            return std::optional<pc_sampling_correction::DecodedInstruction>{
+                {inst->inst, inst->size}};
+          });
+    }
+  } catch (...) {
+    return false;
+  }
+
+  classification->sort();
+  pcSamplingCorrection.publish(codeObjectId, std::move(classification));
+  return true;
+#endif
+}
+
+std::optional<std::string>
+RocprofSDKPCSampling::decodeInstruction(uint64_t codeObjectId,
+                                        uint64_t pcOffset) {
+#if !PROTON_ROCPROFILER_SDK_HAS_CODEOBJ_ADDRESS_TRANSLATE
+  (void)codeObjectId;
+  (void)pcOffset;
+  return std::nullopt;
+#else
+  if (!ensureSourceLocationDecoder(codeObjectId))
+    return std::nullopt;
+
+  std::lock_guard<std::mutex> lock(sourceLocationTranslatorMutex);
+  if (!sourceLocationTranslator)
+    return std::nullopt;
+  try {
+    auto inst = sourceLocationTranslator->get(codeObjectId, pcOffset);
+    if (!inst)
+      return std::nullopt;
+    return inst->inst;
+  } catch (...) {
+    return std::nullopt;
+  }
 #endif
 }
 
@@ -507,6 +606,33 @@ void RocprofSDKPCSampling::processBuffer(rocprofiler_record_header_t **headers,
                         sample->snapshot.reason_not_issued))
               : PCSamplingMetric::StalledSelected;
       auto pc = getSamplePC(sample);
+      if (pcSamplingCorrection.needsCorrection(pc.code_object_id)) {
+        auto decodedInstruction =
+            decodeInstruction(pc.code_object_id, pc.code_object_offset);
+        if (!decodedInstruction) {
+          if (!correctionUnavailableWarningEmitted) {
+            correctionUnavailableWarningEmitted = true;
+            std::cerr << "[PROTON] gfx1250 PC sampling correction could not "
+                         "decode a sampled instruction; dropping affected "
+                         "samples."
+                      << std::endl;
+          }
+          continue;
+        }
+
+        pc_sampling_correction::CorrectionInput correctionInput;
+        correctionInput.pc = pc;
+        correctionInput.hasWaveIssued = hasWaveIssueInfo;
+        correctionInput.waveIssued = hasWaveIssueInfo && sample->wave_issued;
+        correctionInput.hasReasonNotIssued = hasSnapshot;
+        correctionInput.reasonNotIssued =
+            hasSnapshot ? sample->snapshot.reason_not_issued : 0;
+        auto correction =
+            pcSamplingCorrection.correct(*decodedInstruction, correctionInput);
+        if (correction.action == pc_sampling_correction::CorrectionAction::Drop)
+          continue;
+        pc = correction.pc;
+      }
       accumulate(stallKind, isStalled, sample->dispatch_id, pc.code_object_id,
                  pc.code_object_offset);
     } else if (header->kind ==
@@ -636,6 +762,7 @@ void RocprofSDKPCSampling::releaseUnloadedCodeObject(uint64_t codeObjectId) {
   if (unloaded) {
     std::lock_guard<std::mutex> lock(sourceLocationTranslatorMutex);
     removeSourceLocationDecoder(codeObject);
+    pcSamplingCorrection.erase(codeObjectId);
     codeObjects.erase(codeObjectId);
   }
 }

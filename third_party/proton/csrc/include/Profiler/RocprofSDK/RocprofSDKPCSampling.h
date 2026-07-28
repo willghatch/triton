@@ -19,6 +19,10 @@
 #include <unordered_set>
 #include <vector>
 
+#if PROTON_ROCPROFILER_SDK_HAS_PC_SAMPLING
+#include "Profiler/RocprofSDK/RocprofSDKPCSamplingCorrection.h"
+#endif
+
 #if PROTON_ROCPROFILER_SDK_HAS_PC_SAMPLING &&                                  \
     PROTON_ROCPROFILER_SDK_HAS_CODEOBJ_ADDRESS_TRANSLATE
 namespace rocprofiler {
@@ -163,12 +167,18 @@ private:
   void clearSourceLocationCache(uint64_t codeObjectId);
   void releaseUnloadedCodeObject(uint64_t codeObjectId);
   void removeSourceLocationDecoder(const CodeObjectInfo &info);
+#if PROTON_ROCPROFILER_SDK_HAS_PC_SAMPLING
+  bool buildCorrectionClassification(uint64_t codeObjectId);
+  std::optional<std::string> decodeInstruction(uint64_t codeObjectId,
+                                               uint64_t pcOffset);
+#endif
 
   bool pcSamplingEnabled{false};
   bool pcSamplingConfigured{false};
   bool pcSamplingStarted{false};
   bool intervalWarningEmitted{false};
   bool sourceLocationWarningEmitted{false};
+  bool correctionUnavailableWarningEmitted{false};
   uint64_t pcSamplingInterval{1ULL << 17};
   std::string invalidPCSamplingInterval;
   std::string pcSamplingConfigurationFailureReason{
@@ -192,6 +202,10 @@ private:
   CodeObjectMap codeObjects;
   KernelSymbolMap kernelSymbols;
   DispatchToPCSamplingTargetMap dispatchToPCSamplingTarget;
+#if PROTON_ROCPROFILER_SDK_HAS_PC_SAMPLING
+  std::unordered_set<uint64_t> sampledGfx1250Agents;
+  pc_sampling_correction::CorrectionManager pcSamplingCorrection;
+#endif
 };
 
 } // namespace proton
