@@ -148,7 +148,7 @@ struct RocprofilerRuntimeState {
   // whether callbacks should logically be processed separately.
   std::atomic<bool> profilingActive{false};
   std::atomic<bool> nvtxEnabled{false};
-  RocprofSDKProfiler::RocprofSDKProfilerPimpl *pimpl{nullptr};
+  std::atomic<RocprofSDKProfiler::RocprofSDKProfilerPimpl *> pimpl{nullptr};
 };
 
 RocprofilerRuntimeState &getRuntimeState() {
@@ -690,7 +690,11 @@ struct RocprofSDKProfiler::RocprofSDKProfilerPimpl
     profiler.pendingGraphPool =
         std::make_unique<PendingGraphPool>(profiler.metricBuffer.get());
   }
-  virtual ~RocprofSDKProfilerPimpl() = default;
+  ~RocprofSDKProfilerPimpl() override {
+    auto &state = getRuntimeState();
+    auto *expected = this;
+    state.pimpl.compare_exchange_strong(expected, nullptr);
+  }
 
   void doStart() override;
   void doFlush() override;
@@ -1216,7 +1220,8 @@ void RocprofSDKProfiler::RocprofSDKProfilerPimpl::codeObjectCallback(
   if (record.kind != ROCPROFILER_CALLBACK_TRACING_CODE_OBJECT) {
     return;
   }
-  auto *impl = static_cast<RocprofSDKProfilerPimpl *>(arg);
+  auto *state = static_cast<RocprofilerRuntimeState *>(arg);
+  auto *impl = state->pimpl.load();
   if (!impl)
     return;
 
@@ -1337,6 +1342,7 @@ namespace {
 
 int protonToolInit(rocprofiler_client_finalize_t, void *toolData) {
   auto *state = static_cast<RocprofilerRuntimeState *>(toolData);
+  auto *impl = state->pimpl.load();
 
   // Context 1: always-active context for code object tracking. Kernel symbol
   // mappings are needed for ordinary profiling too; PC-sampling source image
@@ -1350,7 +1356,7 @@ int protonToolInit(rocprofiler_client_finalize_t, void *toolData) {
       state->codeObjectContext, ROCPROFILER_CALLBACK_TRACING_CODE_OBJECT,
       codeObjectOps, std::size(codeObjectOps),
       &RocprofSDKProfiler::RocprofSDKProfilerPimpl::codeObjectCallback,
-      static_cast<void *>(state->pimpl));
+      static_cast<void *>(state));
 
   // Context 2: on-demand profiling context for HIP callback tracing and
   // kernel dispatch buffer tracing. Started/stopped in doStart()/doStop().
@@ -1396,7 +1402,7 @@ int protonToolInit(rocprofiler_client_finalize_t, void *toolData) {
   rocprofiler::configureCallbackTracingService<true>(
       state->profilingContext, ROCPROFILER_CALLBACK_TRACING_HIP_GRAPH, nullptr,
       0, &RocprofSDKProfiler::RocprofSDKProfilerPimpl::hipGraphCallback,
-      static_cast<void *>(state->pimpl));
+      static_cast<void *>(impl));
 
   // Establish kernel correlation id -> graph node id mapping for graphs
   // recorded by graphLaunchStack tracking.
@@ -1456,7 +1462,7 @@ int protonToolInit(rocprofiler_client_finalize_t, void *toolData) {
   // Always attempt configuration opportunistically. The env var was set by the
   // constructor. The PC-sampling context is only *started* when mode=pcsampling
   // is used.
-  state->pimpl->pcSampling.configure(
+  impl->pcSampling.configure(
       &RocprofSDKProfiler::RocprofSDKProfilerPimpl::pcSamplingBufferCallback);
 
   // Start the code object context now so the upcoming
@@ -1475,7 +1481,8 @@ void protonToolFini(void *toolData) {
   state->nvtxEnabled.store(false, std::memory_order_relaxed);
   {
     std::lock_guard<std::mutex> lock(state->mutex);
-    state->pimpl->pcSampling.stopNoThrow();
+    if (auto *impl = state->pimpl.load())
+      impl->pcSampling.stopNoThrow();
     if (state->profilingStarted) {
       rocprofiler::stopContext<false>(state->profilingContext);
       state->profilingStarted = false;
@@ -1486,7 +1493,8 @@ void protonToolFini(void *toolData) {
     }
   }
   rocprofiler::flushBuffer<false>(state->kernelBuffer);
-  state->pimpl->pcSampling.flushBuffersNoThrow();
+  if (auto *impl = state->pimpl.load())
+    impl->pcSampling.flushBuffersNoThrow();
 }
 
 rocprofiler_tool_configure_result_t *
@@ -1573,7 +1581,7 @@ void RocprofSDKProfiler::RocprofSDKProfilerPimpl::doStop() {
 RocprofSDKProfiler::RocprofSDKProfiler() {
   pImpl = std::make_unique<RocprofSDKProfilerPimpl>(*this);
   auto &state = getRuntimeState();
-  state.pimpl = static_cast<RocprofSDKProfilerPimpl *>(pImpl.get());
+  state.pimpl.store(static_cast<RocprofSDKProfilerPimpl *>(pImpl.get()));
   // Configure rocprofiler-sdk as soon as this singleton is constructed.
   // Deferring until doStart() is unsafe: any code that fully initializes HSA
   // beforehand (e.g. triton's HIP driver query at pytest collection time,
