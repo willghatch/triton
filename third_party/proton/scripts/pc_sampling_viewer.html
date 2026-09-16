@@ -1,0 +1,221 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PC sampling explorer</title>
+<style>
+:root{color-scheme:light;--ink:#182c40;--muted:#586c7e;--border:#d9e3eb;--blue:#286ba5;--paper:#fff}
+*{box-sizing:border-box}body{margin:0;background:#f2f5f8;color:var(--ink);font:14px/1.5 system-ui,sans-serif}
+header{padding:25px 32px 18px;background:#132c42;color:white}h1{font-size:25px;margin:0 0 4px;font-weight:650}h2{font-size:18px;margin:0 0 8px}p{margin:8px 0}header p{color:#c1d2e2}
+main{padding:22px 32px;max-width:1900px;margin:auto}.controls{display:flex;gap:16px;flex-wrap:wrap;align-items:end;margin-bottom:16px}label{display:flex;flex-direction:column;gap:5px;color:var(--muted);font-size:12px}select,input,button{font:inherit}select,input{padding:8px;border:1px solid var(--border);border-radius:5px;background:white;color:var(--ink)}#kernel{max-width:min(750px,85vw)}button{cursor:pointer;border:1px solid var(--border);background:white;color:var(--ink);border-radius:5px;padding:7px 12px}button:hover{background:#e8f0f8}button:focus-visible,select:focus-visible{outline:3px solid #df9933;outline-offset:2px}
+.stats{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:18px}.stat{background:white;padding:12px 18px;border:1px solid var(--border);border-radius:7px;min-width:175px}.stat strong{display:block;font-size:23px}.muted,small{color:var(--muted)}nav{display:flex;gap:6px;margin-bottom:16px}nav button[aria-pressed=true]{background:var(--ink);color:white;border-color:var(--ink)}.panel{background:white;border:1px solid var(--border);border-radius:8px;padding:20px;min-width:0}.layout{display:grid;grid-template-columns:minmax(0,1fr) 310px;gap:18px}.notice{border-left:3px solid #d39431;padding:8px 12px;background:#fff7e8;margin:10px 0;color:#684c20}.scroll{overflow:auto;max-height:65vh}.legend{display:flex;gap:5px;flex-wrap:wrap;margin:12px 0}.legend button{font-size:12px;padding:3px 8px}.dot{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:5px}table{border-collapse:collapse;width:100%;font-size:13px}th{text-align:left;position:sticky;top:0;background:#f4f7fa;z-index:1;font-size:11px;color:var(--muted);padding:10px 8px;white-space:nowrap}td{border-bottom:1px solid #ecf0f4;padding:8px;vertical-align:middle}td.number{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}.location{max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.link{padding:0;border:0;background:transparent;text-align:left;color:#236499;max-width:100%;overflow:hidden;text-overflow:ellipsis;vertical-align:middle}.bar-track{height:16px;width:100%;min-width:140px;background:#edf2f7;border-radius:3px;overflow:hidden}.bar{height:100%;background:var(--blue);display:flex}.segment{height:100%;min-width:0}.selected{background:#e8f2fc}.code{white-space:pre;font:12px/1.65 ui-monospace,SFMono-Regular,Consolas,monospace}.source-table td{padding:1px 8px}.source-table .bar-track{min-width:100px}.source-table .line{width:50px;text-align:right}.heat{min-width:72px;text-align:right;font-variant-numeric:tabular-nums}.heat-head{max-width:140px;white-space:normal}.heat-head button{font-size:11px;border:0;background:transparent;padding:0}.breakdown{margin-top:16px}.breakdown p{display:flex;justify-content:space-between;gap:10px}.detail-title{overflow-wrap:anywhere;font-size:14px}.footnote{margin-top:18px;font-size:12px;color:var(--muted)}#context{overflow-wrap:anywhere}#details{align-self:start}#view-controls{margin-top:15px}@media(max-width:1000px){.layout{grid-template-columns:1fr}main{padding:15px}header{padding:20px}.location{max-width:250px}}
+</style>
+<style>
+.heat-head button{overflow-wrap:anywhere;max-width:100px}
+#view-controls select{max-width:85vw}
+.token.comment{color:#687c6c}.token.keyword,.token.boolean{color:#8546a3}.token.string{color:#267647}.token.number{color:#a35516}.token.function,.token.builtin{color:#17699d}.token.operator,.token.punctuation{color:#536579}
+</style>
+<header><h1>PC sampling explorer</h1><p id="profile"></p></header>
+<main>
+  <div class="controls">
+    <label>Kernel / retained context<select id="kernel"></select></label>
+    <label>Sample metric<select id="metric"></select></label>
+  </div>
+  <p class="muted" id="context"></p>
+  <div id="stats" class="stats"></div>
+  <nav aria-label="Visualization">
+    <button data-view="source" aria-pressed="false">Annotated source</button>
+    <button data-view="ranked" aria-pressed="true">Ranked hotspots</button>
+    <button data-view="heatmap" aria-pressed="false">Stall reason heatmap</button>
+  </nav>
+  <div class="layout">
+    <section class="panel"><h2 id="view-title"></h2><p id="description" class="muted"></p>
+      <div id="notices"></div><div id="view-controls" class="controls"></div><div id="legend" class="legend"></div>
+      <div id="content" class="scroll"></div>
+    </section>
+    <aside id="details" class="panel" aria-live="polite"></aside>
+  </div>
+  <p class="footnote">Raw Proton Hatchet aggregates · Each tree context is separate; repeated launches may be aggregated.
+    Counts are sampled observations, not execution counts or line time. A sampled wait location does not establish its cause.
+    Source files must match the sampled build; this report cannot verify that match. Backend reason names are preserved.
+    The input does not establish launch order, sampling loss, or unknown-kernel association.</p>
+</main>
+<script type="application/json" id="profile-data">/*PROFILE_DATA*/</script>
+<script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/prism.min.js"
+  integrity="sha384-BGaNxfftg+9+TtC098wxawPFVEUpKYvaiCgbB0iqAMjK/4jDdmUY+oGxrPNvnXEf" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-python.min.js"
+  integrity="sha384-WJdEkJKrbsqw0evQ4GB6mlsKe5cGTxBOw4KAEIa52ZLB7DDpliGkwdme/HMa5n1m" crossorigin="anonymous"></script>
+<script>
+'use strict';
+const data = JSON.parse(document.getElementById('profile-data').textContent);
+const $ = id => document.getElementById(id);
+const fmt = value => value == null ? 'Unavailable' : value.toLocaleString();
+const pct = (n,d) => d ? `${(100*n/d).toFixed(2)}%` : '—';
+const name = key => key === 'num_samples' ? 'All samples' : key === 'num_stalled_samples' ? 'Stalled samples' : key.replace(/^stalled_/, '');
+const palette = ['#337bb4','#d17b22','#39947d','#a25fa7','#d25665','#747ac0','#748d35','#a7775c','#418d9e','#8a6d9e'];
+let current, reasons, totals, partition, available, selected = null;
+let view = 'ranked', metric, sourceFile, composition = false, heatScale = 'global', heatSort = null;
+const highlightedSources = new Map();
+function highlightedSource(file){
+  if(!highlightedSources.has(file)){
+    // Highlight the entire file so multiline strings retain their token state.
+    const holder=el('div');
+    if(window.Prism?.languages?.python)holder.innerHTML=Prism.highlight(data.sources[file],Prism.languages.python,'python');
+    else holder.textContent=data.sources[file];
+    const lines=[document.createDocumentFragment()];
+    function visit(node,classes=[]){
+      if(node.nodeType===Node.TEXT_NODE){node.textContent.split('\n').forEach((part,index)=>{
+        if(index)lines.push(document.createDocumentFragment());
+        const span=el('span',part,classes.join(' '));lines.at(-1).append(span);
+      });}else for(const child of node.childNodes)visit(child,[...classes,...node.classList]);
+    }
+    for(const child of holder.childNodes)visit(child);
+    highlightedSources.set(file,lines);
+  }
+  return highlightedSources.get(file);
+}
+function el(tag, text, cls){const node=document.createElement(tag);if(text!=null)node.textContent=text;if(cls)node.className=cls;return node;}
+function button(text, action, cls){const node=el('button',text,cls);node.onclick=action;return node;}
+function option(select,value,text){const node=el('option',text);node.value=value;select.append(node);}
+function metricValue(row,key=metric){return row.metrics[key] ?? 0;}
+function color(key){return palette[reasons.indexOf(key)%palette.length];}
+function sum(rows,key){return rows.reduce((n,row)=>n+metricValue(row,key),0);}
+function chooseKernel(){
+  current=data.kernels[Number($('kernel').value)];
+  const keys=[...new Set(current.rows.flatMap(row=>Object.keys(row.metrics)))];
+  available=keys.filter(key=>current.rows.every(row=>key in row.metrics));
+  totals=Object.fromEntries(keys.map(key=>[key,available.includes(key)?sum(current.rows,key):null]));
+  reasons=keys.filter(key=>key.startsWith('stalled_')&&sum(current.rows,key)>0).sort((a,b)=>sum(current.rows,b)-sum(current.rows,a));
+  partition=available.includes('num_stalled_samples') && reasons.length>0 && reasons.every(key=>available.includes(key)) &&
+    current.rows.every(row=>reasons.reduce((n,key)=>n+metricValue(row,key),0)===row.metrics.num_stalled_samples);
+  $('metric').replaceChildren();
+  for(const key of ['num_samples','num_stalled_samples',...reasons].filter(key=>available.includes(key)))option($('metric'),key,name(key));
+  metric=available.includes('num_stalled_samples')&&totals.num_stalled_samples>0?'num_stalled_samples':'num_samples';$('metric').value=metric;
+  selected=null;heatSort=null;sourceFile=current.rows.find(row=>row.file&&Object.hasOwn(data.sources,row.file))?.file;
+  $('context').textContent=`${current.context} · tree ID ${current.id}`;
+  const stats=$('stats');stats.replaceChildren();
+  const attributed=sum(current.rows.filter(row=>row.file&&row.line>0),'num_samples');
+  const metadata=current.metadata;
+  for(const [label,value] of [['All samples',fmt(totals.num_samples)],['Stalled samples',fmt(totals.num_stalled_samples)],
+    ['Source attribution',pct(attributed,totals.num_samples)],['Invocations (aggregate)',fmt(metadata.count)],
+    ['Kernel duration (aggregate)',metadata['time (ns)']==null?'Unavailable':`${(metadata['time (ns)']/1e6).toFixed(3)} ms`]]){
+    const item=el('div',null,'stat');item.append(el('span',label,'muted'),el('strong',value));stats.append(item);
+  }
+  render();
+}
+function selectMetric(key){metric=key;heatSort=null;$('metric').value=key;render();}
+function bar(value,max,row,stack=false){
+  const track=el('div',null,'bar-track'), fill=el('div',null,'bar');
+  fill.style.width=`${max?100*value/max:0}%`;track.append(fill);
+  if(stack&&partition&&value){for(const reason of reasons){const segment=el('span',null,'segment');
+    segment.style.width=`${100*metricValue(row,reason)/value}%`;segment.style.background=color(reason);
+    segment.title=`${name(reason)}: ${fmt(metricValue(row,reason))} samples`;fill.append(segment);}}
+  return track;
+}
+function openRow(row){selected=row;sourceFile=row.file;view=row.file&&Object.hasOwn(data.sources,row.file)?'source':'ranked';render();
+  if(view==='source')document.querySelector('.source-table tr.selected')?.scrollIntoView({block:'center'});}
+function rowLabel(row){return row.file?`${row.file}:${row.line}@${row.function}`:row.label;}
+function locationCell(row){const td=el('td',null,'location');const label=row.file?`L${row.line} · ${row.file.split('/').at(-1)} @ ${row.function}`:row.label;
+  const node=button(label,()=>openRow(row),'link');node.title=rowLabel(row);node.setAttribute('aria-label',rowLabel(row));td.append(node);return td;}
+function heading(labels){const table=el('table'),thead=el('thead'),tr=el('tr');for(const label of labels)tr.append(el('th',label));thead.append(tr);table.append(thead);return table;}
+function metricCell(row){return el('td',`${fmt(metricValue(row))} · ${pct(metricValue(row),totals[metric])}`,'number');}
+function addControl(labelText,choices,value,change){const label=el('label',labelText),select=el('select');for(const [key,text] of choices)option(select,key,text);select.value=value;select.onchange=()=>change(select.value);label.append(select);$('view-controls').append(label);return select;}
+function render(){
+  document.querySelectorAll('nav button').forEach(node=>node.setAttribute('aria-pressed',String(node.dataset.view===view)));
+  for(const id of ['content','notices','legend','view-controls'])$(id).replaceChildren();
+  const notice=text=>$('notices').append(el('div',text,'notice'));
+  if(totals.num_stalled_samples==null)notice('Stall information is unavailable or incomplete. Ranking uses all samples; missing counters are not zero stalls.');
+  if(totals.num_stalled_samples===0&&!reasons.length)notice('The export contains zero stall counters and no nonzero reasons. Collection mode is not recorded here; zero-filled counters can mean stall information was not collected (for example host-trap sampling). The default ranking uses all samples.');
+  if(reasons.length&&!partition)notice('Reason counters do not form a complete partition of stalled samples. Bars are unsegmented; heatmap counters remain independent.');
+  $('description').textContent=`Selected metric: ${name(metric)}. Shares use all ${fmt(totals[metric])} ${name(metric).toLowerCase()} in this context, including unattributed source.`;
+  if(view==='ranked')renderRanked();else if(view==='source')renderSource(notice);else renderHeatmap(notice);
+  renderDetails();
+}
+function renderRanked(){
+  $('view-title').textContent='Source locations, hottest first';
+  const canStack=partition&&metric==='num_stalled_samples';
+  if(canStack)addControl('Bar scale',[['absolute','Absolute sample counts'],['composition','Normalized reason composition']],composition?'composition':'absolute',value=>{composition=value==='composition';render();});
+  for(const reason of reasons.filter(key=>available.includes(key))){const node=button(name(reason),()=>selectMetric(reason));const dot=el('span',null,'dot');dot.style.background=color(reason);node.prepend(dot);$('legend').append(node);}
+  const rows=[...current.rows].sort((a,b)=>metricValue(b)-metricValue(a));
+  const max=Math.max(...rows.map(row=>metricValue(row)),1);
+  const table=heading(['Source location',canStack&&composition?'Reason composition (each row = 100%)':`${name(metric)} · common count scale`,'Count · context share','All samples']);
+  const body=el('tbody');table.append(body);
+  for(const row of rows){const tr=el('tr',null,selected?.id===row.id?'selected':'');const td=el('td');
+    td.append(bar(metricValue(row),canStack&&composition?metricValue(row):max,row,canStack));
+    tr.append(locationCell(row),td,metricCell(row),el('td',fmt(row.metrics.num_samples),'number'));body.append(tr);}
+  $('content').append(table);
+}
+function renderSource(notice){
+  const files=[...new Set(current.rows.map(row=>row.file).filter(Boolean))];
+  if(!files.includes(sourceFile))sourceFile=files.find(file=>Object.hasOwn(data.sources,file))||files[0];
+  $('view-title').textContent='Annotated source';
+  if(files.length)addControl('Source file',files.map(file=>[file,file]),sourceFile,value=>{sourceFile=value;selected=null;render();});
+  if(!sourceFile||!Object.hasOwn(data.sources,sourceFile)){
+    notice('Source text is unavailable for this file. Showing ranked locations; regenerate with --source-root or --path-map to embed source.');
+    renderRanked();return;
+  }
+  const rows=current.rows.filter(row=>row.file===sourceFile), grouped=new Map();
+  $('view-controls').append(button('Jump to hottest line',()=>openRow(rows.reduce((best,row)=>metricValue(row)>metricValue(best)?row:best,rows[0]))));
+  for(const row of rows){if(!grouped.has(row.line))grouped.set(row.line,[]);grouped.get(row.line).push(row);}
+  const lines=data.sources[sourceFile].split(/\r?\n/);
+  if(lines.at(-1)==='')lines.pop();
+  if(rows.some(row=>row.line<1||row.line>lines.length))notice('Some sampled line numbers are outside this source file. Check the source version; these locations remain in Ranked bars.');
+  notice(`${fmt(sum(current.rows.filter(row=>!row.file),'num_samples'))} samples have no source attribution and remain in Ranked bars. Embedded source: ${data.source_paths[sourceFile]||sourceFile}`);
+  const table=heading(['Line',name(metric),'Count · context share','Source (original order)']);table.className='source-table';const body=el('tbody');table.append(body);
+  const highlighted=highlightedSource(sourceFile);
+  lines.forEach((text,index)=>{
+    const line=index+1, buckets=grouped.get(line)||[], value=sum(buckets,metric);
+    const combined={file:sourceFile,line,label:`${sourceFile}:${line}`,function:buckets.map(row=>row.function).join(', '),metrics:{},id:`line:${line}`};
+    for(const key of available)combined.metrics[key]=sum(buckets,key);
+    const tr=el('tr',null,selected?.file===sourceFile&&selected?.line===line?'selected':'');
+    const lineCell=el('td',null,'line');lineCell.append(button(String(line),()=>{selected=combined;const offset=$('content').scrollTop;render();$('content').scrollTop=offset;},'link'));
+    const td=el('td');td.append(bar(value,totals[metric],combined));
+    const code=el('td',null,'code');code.append(highlighted[index]?.cloneNode(true)||document.createTextNode(text));
+    tr.append(lineCell,td,metricCell(combined),code);body.append(tr);
+  });
+  $('content').append(table);
+}
+function renderHeatmap(notice){
+  $('view-title').textContent='Source location × stall reason';
+  if(!reasons.length){notice('No nonzero reason counters are available in this context. Use Ranked bars to inspect sample totals.');return;}
+  addControl('Cell intensity',[['global','Global count scale'],['share','Share of all context samples'],['row','Row normalization: reason / line samples']],heatScale,value=>{heatScale=value;render();});
+  $('description').textContent=`Row bars show all samples. Column clicks sort by that reason; current sort: ${name(heatSort||metric)}. `+
+    (heatScale==='global'?'One common scale: white = zero, darkest = largest reason count.':heatScale==='share'?'Intensity = reason count / all samples in this context (0–100%).':'Intensity = reason count / all samples on that row (0–100%).');
+  const rows=[...current.rows].sort((a,b)=>metricValue(b,heatSort||metric)-metricValue(a,heatSort||metric));
+  const maxCell=Math.max(1,...rows.flatMap(row=>reasons.map(key=>metricValue(row,key))));
+  const maxTotal=Math.max(1,...rows.map(row=>row.metrics.num_samples));
+  const table=heading(['Source location','All samples']);const head=table.querySelector('tr');
+  for(const reason of reasons){const th=el('th',null,'heat-head');th.append(button(`${name(reason)}${heatSort===reason?' ↓':''}`,()=>{heatSort=reason;render();}));head.append(th);}
+  const body=el('tbody');table.append(body);
+  for(const row of rows){const tr=el('tr');const total=el('td');total.append(el('span',fmt(row.metrics.num_samples)),bar(row.metrics.num_samples,maxTotal,row));tr.append(locationCell(row),total);
+    for(const reason of reasons){const count=row.metrics[reason];const denominator=heatScale==='row'?row.metrics.num_samples:heatScale==='share'?totals.num_samples:maxCell;
+      const intensity=count==null?0:Math.min(1,count/denominator);const td=el('td',count==null?'N/A':heatScale==='global'?fmt(count):pct(count,denominator),'heat');
+      td.style.background=count==null?'#eee':`rgba(40,107,165,${intensity})`;if(intensity>.65)td.style.color='white';
+      td.title=`${rowLabel(row)}\n${name(reason)}: ${fmt(count)} samples\n${count==null?'Unavailable':pct(count,totals.num_samples)+' of context samples; '+pct(count,row.metrics.num_samples)+' of line samples'}`;tr.append(td);}
+    body.append(tr);
+  }
+  $('content').append(table);
+}
+function renderDetails(){
+  const panel=$('details');panel.replaceChildren(el('h2','Location details'));
+  if(!selected){panel.append(el('p','Select a location to inspect counts and reasons. Ranked and heatmap rows open matching source when available.','muted'));return;}
+  panel.append(el('p',rowLabel(selected),'detail-title'));
+  const metrics=selected.metrics;
+  panel.append(el('p',`${fmt(metrics.num_samples)} all samples`),el('p',`${fmt(metrics.num_stalled_samples)} stalled samples`),
+    el('p',`Local stalled fraction: ${metrics.num_stalled_samples==null?'Unavailable':pct(metrics.num_stalled_samples,metrics.num_samples)}`));
+  if(selected.file&&Object.hasOwn(data.sources,selected.file)){
+    const code=highlightedSource(selected.file)[selected.line-1];if(code){const pre=el('pre',null,'code scroll');pre.append(code.cloneNode(true));panel.append(pre);}
+  }
+  const breakdown=el('div',null,'breakdown');breakdown.append(el('strong','Reason counts'));
+  for(const reason of reasons){const p=el('p');const node=available.includes(reason)?button(name(reason),()=>selectMetric(reason),'link'):el('span',name(reason));p.append(node,el('span',fmt(metrics[reason])));breakdown.append(p);}
+  if(!reasons.length)breakdown.append(el('p','Reason information unavailable.','muted'));
+  panel.append(breakdown);
+}
+$('profile').textContent=`${data.profile} · Offline PC sampling report`;
+data.kernels.forEach((kernel,index)=>option($('kernel'),index,`${kernel.context} [${kernel.id}]`));
+$('kernel').value=String(data.kernels.reduce((best,kernel,index)=>sum(kernel.rows,'num_samples')>sum(data.kernels[best].rows,'num_samples')?index:best,0));
+$('kernel').onchange=chooseKernel;$('metric').onchange=()=>selectMetric($('metric').value);
+document.querySelectorAll('nav button').forEach(node=>node.onclick=()=>{view=node.dataset.view;render();});
+chooseKernel();
+</script>
+</html>

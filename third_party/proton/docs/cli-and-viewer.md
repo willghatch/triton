@@ -37,6 +37,17 @@ proton -n samples -b cupti -m pcsampling script.py
 
 ## `proton-viewer`
 
+For PC sampling source annotations, ranked location bars, and reason heatmaps,
+the standalone [HTML prototype](../scripts/pc_sampling_viewer.md) generates an
+offline report from a raw Hatchet JSON profile:
+
+```bash
+python third_party/proton/scripts/pc_sampling_viewer.py profile.hatchet -o report.html
+```
+
+Open `report.html` in a browser. The generator uses only Python's standard library
+and supports source-path remapping with `--path-map OLD=NEW`.
+
 `proton-viewer` prints Hatchet tree profiles in the terminal.
 
 ```bash

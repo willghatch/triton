@@ -13,6 +13,76 @@ frame_example_file = file_path.replace("test_viewer.py", "examples/frame.json")
 leaf_example_file = file_path.replace("test_viewer.py", "examples/leaf_nodes.json")
 
 
+def _pc_sampling_report_module():
+    # The prototype is a standalone stdlib CLI, not part of the installed API.
+    import importlib.util
+    from pathlib import Path
+    path = Path(__file__).parents[1] / "scripts" / "pc_sampling_viewer.py"
+    spec = importlib.util.spec_from_file_location("pc_sampling_report", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_pc_sampling_report_contexts_and_unattributed():
+    module = _pc_sampling_report_module()
+
+    def node(name, metrics, children=()):
+        return {"frame": {"name": name}, "metrics": metrics, "children": list(children)}
+
+    first = node("kernel", {"num_samples": 3, "num_stalled_samples": 1}, [
+        node("/src/file.py:10@kernel", {"num_samples": 7, "num_stalled_samples": 5}),
+        node("/src/file.py:10@kernel", {"num_samples": 2, "num_stalled_samples": 1}),
+    ])
+    second = node("kernel", {"num_samples": 4})
+    data = module.normalize_profile([node("ROOT", {"num_samples": 0}, [first, second]), {"HIP": {}}])
+    left, right = data["kernels"]
+    assert left["id"] != right["id"]
+    assert sum(row["metrics"]["num_samples"] for row in left["rows"]) == 12
+    assert left["rows"][0]["file"] is None
+    assert left["rows"][0]["metrics"]["num_samples"] == 3
+    assert left["rows"][1]["metrics"]["num_samples"] == 9
+    assert left["rows"][1]["line"] == 10
+    assert "num_stalled_samples" not in right["rows"][0]["metrics"]
+
+
+def test_pc_sampling_report_sources_and_html(tmp_path):
+    import json
+    module = _pc_sampling_report_module()
+    source = tmp_path / "kernel.py"
+    source.write_text("# </script><script>alert('source')</script>\n", encoding="utf-8")
+    profile = [{
+        "frame": {"name": "kernel </script>"}, "metrics": {}, "children": [
+            {"frame": {"name": "/old/kernel.py:1@kernel"}, "metrics": {"num_samples": 10}},
+            {"frame": {"name": "/missing/kernel.py:2@kernel"}, "metrics": {"num_samples": 5}},
+        ]
+    }]
+    data = module.normalize_profile(profile)
+    module.attach_sources(data, tmp_path, [("/old", str(tmp_path))])
+    assert data["sources"] == {"/old/kernel.py": source.read_text()}
+    output = tmp_path / "report.html"
+    module.write_report(data, output)
+    html = output.read_text()
+    payload = html.split('id="profile-data">')[1].split('</script>')[0]
+    assert json.loads(payload) == data
+    assert "</script>" not in payload
+    assert "/*PROFILE_DATA*/" not in html
+    assert "cdn.jsdelivr.net/npm/prismjs@1.29.0/prism.min.js" in html
+    assert "cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-python.min.js" in html
+    assert "integrity=\"sha384-" in html
+    assert "Annotated source" in html
+    assert "Ranked hotspots" in html
+    assert "Stall reason heatmap" in html
+    assert "Linked assembly" not in html
+
+
+@pytest.mark.parametrize("metrics",
+                         [{}, {"num_samples": -1}, {"num_samples": 1.5}, {"num_samples": 1, "num_stalled_samples": 2}])
+def test_pc_sampling_report_invalid_or_empty(metrics):
+    with pytest.raises(ValueError):
+        _pc_sampling_report_module().normalize_profile([{"frame": {"name": "kernel"}, "metrics": metrics}])
+
+
 def test_help():
     # Only check if the viewer can be invoked
     subprocess.check_call(["proton-viewer", "-h"], env=clean_rocprofiler_env(), stdout=subprocess.DEVNULL)
