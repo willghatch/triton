@@ -21,6 +21,15 @@ inline bool parseIntArg(PyObject *obj, const char *name, int *out) {
   return true;
 }
 
+inline bool parseVoidPtrArg(PyObject *obj, void **out) {
+  *out = PyLong_AsVoidPtr(obj);
+  return !(*out == nullptr && PyErr_Occurred());
+}
+
+// The handle helpers below take CUDA handle types; the HIP build of the race
+// allocator parses gsan::drv handle types itself.
+#if !defined(GSAN_BACKEND_HIP)
+
 inline bool parseShareableHandleTypeArg(PyObject *obj, const char *name,
                                         CUmemAllocationHandleType *out) {
   int handleType = 0;
@@ -71,9 +80,6 @@ shareableHandleToPyObject(const ShareableHandle &handle,
       sizeof(handle.fabricHandle));
 }
 
-inline bool parseVoidPtrArg(PyObject *obj, void **out) {
-  *out = PyLong_AsVoidPtr(obj);
-  return !(*out == nullptr && PyErr_Occurred());
-}
+#endif // !defined(GSAN_BACKEND_HIP)
 
 } // namespace triton::cuda_allocator

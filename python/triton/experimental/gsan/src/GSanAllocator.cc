@@ -1,5 +1,4 @@
 #include <Python.h>
-#include <cuda.h>
 
 #include <algorithm>
 #include <cassert>
@@ -17,6 +16,9 @@
 
 #include "AllocatorPython.h"
 #include "GSan.h"
+#include "GSanDriver.h"
+
+namespace drv = gsan::drv;
 
 using namespace triton::cuda_allocator;
 
@@ -37,14 +39,36 @@ namespace {
 constexpr size_t kThreadStateHeaderSize =
     offsetof(gsan::ThreadState, vectorClock);
 
+union GSanShareableHandle {
+  int fd;
+  drv::FabricHandle fabricHandle;
+};
+
+void *getShareableHandleImportArg(const GSanShareableHandle *handle,
+                                  drv::HandleType handleType) {
+  if (handleType == drv::HandleType::PosixFileDescriptor)
+    return reinterpret_cast<void *>(static_cast<uintptr_t>(handle->fd));
+  if (handleType == drv::HandleType::Fabric)
+    return const_cast<drv::FabricHandle *>(&handle->fabricHandle);
+  return nullptr;
+}
+
+void *getShareableHandleExportArg(GSanShareableHandle *handle,
+                                  drv::HandleType handleType) {
+  if (handleType == drv::HandleType::PosixFileDescriptor)
+    return &handle->fd;
+  if (handleType == drv::HandleType::Fabric)
+    return &handle->fabricHandle;
+  return nullptr;
+}
+
 struct GSanConfig {
   int numGPUs = 1;
   int numSMs = 0;
   int numThreads = 0;
   int clockBufferSize = 0;
   uint32_t rngSeed = 0;
-  CUmemAllocationHandleType shareableHandleType =
-      CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
+  drv::HandleType shareableHandleType = drv::HandleType::PosixFileDescriptor;
   bool clockBufferSizeConfigured = false;
   bool rngSeedConfigured = false;
   bool shareableHandleTypeConfigured = false;
@@ -56,14 +80,19 @@ struct GSanConfig {
 
 struct AllocatorState {
   // User memory + shadow memory
-  CUdeviceptr reserveBaseAddress = 0;
+  uintptr_t reserveBaseAddress = 0;
   AllocNode treeRoots[gsan::kNumPools];
 
   // GSan global state
-  CUdeviceptr globalStateAddress = 0;
-  CUmemGenericAllocationHandle perDeviceHandles[gsan::kMaxGPUs] = {0};
+  uintptr_t globalStateAddress = 0;
+  drv::Handle perDeviceHandles[gsan::kMaxGPUs] = {0};
   size_t perDeviceStateSize = 0;
 };
+
+void printDriverError(drv::Result err) {
+  fprintf(stderr, "gsan allocator encountered an unexpected error: %s\n",
+          drv::errorString(err));
+}
 
 static AllocatorState *alloc = nullptr;
 static GSanConfig config;
@@ -78,11 +107,16 @@ bool hasLiveAllocations() {
   return false;
 }
 
-CUmemAllocationHandleType getRequestedShareableHandleType() {
+drv::HandleType getRequestedShareableHandleType() {
   if (config.shareableHandleTypeConfigured)
     return config.shareableHandleType;
 
-  return defaultShareableHandleType();
+  const auto *allocConf = getenv("PYTORCH_CUDA_ALLOC_CONF");
+  if (drv::kHasFabricHandles && allocConf != nullptr &&
+      strstr(allocConf, "fabric_handles:True") != nullptr) {
+    return drv::HandleType::Fabric;
+  }
+  return drv::HandleType::PosixFileDescriptor;
 }
 
 int getDeviceRankForCudaDevice(int device) {
@@ -95,20 +129,20 @@ int getDeviceRankForCudaDevice(int device) {
   return config.deviceRanks[device];
 }
 
-CUresult ensureTopologyConfigured() {
+drv::Result ensureTopologyConfigured() {
   if (config.topologyConfigured)
-    return CUDA_SUCCESS;
+    return drv::kSuccess;
 
   // Default topology assumes a single node with 1:1 mapping of device index to
   // GSan device ID.
   int cudaDeviceCount = 0;
-  CUresult err = cuDeviceGetCount(&cudaDeviceCount);
-  if (err != CUDA_SUCCESS)
+  drv::Result err = drv::deviceCount(&cudaDeviceCount);
+  if (err != drv::kSuccess)
     return err;
   if (cudaDeviceCount <= 0)
-    return CUDA_ERROR_NO_DEVICE;
+    return drv::kErrorNoDevice;
   if (cudaDeviceCount > static_cast<int>(gsan::kMaxGPUs))
-    return CUDA_ERROR_NOT_SUPPORTED;
+    return drv::kErrorNotSupported;
 
   config.numGPUs = cudaDeviceCount;
   for (int cudaDevice = 0; cudaDevice < cudaDeviceCount; ++cudaDevice) {
@@ -116,7 +150,7 @@ CUresult ensureTopologyConfigured() {
     config.configuredDeviceRanks[cudaDevice] = true;
   }
   config.topologyConfigured = true;
-  return CUDA_SUCCESS;
+  return drv::kSuccess;
 }
 
 size_t getShadowSize(size_t realMemSize, uintptr_t realAddress) {
@@ -124,7 +158,44 @@ size_t getShadowSize(size_t realMemSize, uintptr_t realAddress) {
   return wordSize * gsan::getShadowCellSize(realAddress);
 }
 
-AllocNode *findAllocation(CUdeviceptr address) {
+// GlobalState stores the clock buffer size as a u16.
+constexpr int kMaxClockBufferSize = std::numeric_limits<uint16_t>::max();
+constexpr int kDefaultClockBufferSize = 1024;
+
+size_t getPerSMStateSize(int numThreads, int clockBufferSize) {
+  auto clockSizeBytes = sizeof(gsan::epoch_t) * numThreads;
+  // 1 local clock + the circular clock buffer
+  auto clocksPerThread = 1 + static_cast<size_t>(clockBufferSize);
+  return roundUp(sizeof(gsan::ThreadState) + clockSizeBytes * clocksPerThread,
+                 alignof(gsan::ThreadState));
+}
+
+// Each device has a local copy of the constant global state, followed by one
+// thread state per SM.
+size_t getPerDeviceStateSize(int numSMs, int numThreads, int clockBufferSize) {
+  static_assert(alignof(gsan::GlobalState) >= alignof(gsan::ThreadState));
+  static_assert(alignof(gsan::ThreadState) >= alignof(gsan::epoch_t));
+  return sizeof(gsan::GlobalState) +
+         numSMs * getPerSMStateSize(numThreads, clockBufferSize);
+}
+
+// Largest clock buffer whose per-device state fits in its fixed-stride slot of
+// the globals reservation, or 0 if not even one entry fits.
+int getMaxClockBufferSize(int numSMs, int numThreads) {
+  size_t perSMBudget =
+      (gsan::kPerDeviceStateStride - sizeof(gsan::GlobalState)) / numSMs;
+  perSMBudget -= perSMBudget % alignof(gsan::ThreadState);
+  if (perSMBudget < sizeof(gsan::ThreadState))
+    return 0;
+  size_t clocksPerThread = (perSMBudget - sizeof(gsan::ThreadState)) /
+                           (sizeof(gsan::epoch_t) * numThreads);
+  if (clocksPerThread < 2)
+    return 0;
+  return static_cast<int>(
+      std::min<size_t>(clocksPerThread - 1, kMaxClockBufferSize));
+}
+
+AllocNode *findAllocation(uintptr_t address) {
   if (!gsan::isGsanManaged(address, alloc->reserveBaseAddress))
     return nullptr;
   return findNodeByAddress(&alloc->treeRoots[gsan::getPoolIndex(address)],
@@ -135,21 +206,20 @@ int gsanEnsureInit() {
   if (alloc)
     return 0;
 
-  CUdeviceptr reserveBase;
-  CUresult err = cuMemAddressReserve(&reserveBase, /*size*/ gsan::kReserveSize,
-                                     /*alignment*/ gsan::kReserveSize,
-                                     /*addr*/ 0, /*flags*/ 0);
-  if (err != CUDA_SUCCESS) {
-    printCUDAError(err);
+  uintptr_t reserveBase;
+  drv::Result err =
+      drv::addressReserve(&reserveBase, /*size*/ gsan::kReserveSize,
+                          /*alignment*/ gsan::kReserveSize);
+  if (err != drv::kSuccess) {
+    printDriverError(err);
     return -1;
   }
 
-  CUdeviceptr globalsBase;
-  err = cuMemAddressReserve(&globalsBase, /*size*/ gsan::kGlobalsReserveSize,
-                            /*alignment*/ gsan::kGlobalsReserveSize,
-                            /*addr*/ 0, /*flags*/ 0);
-  if (err != CUDA_SUCCESS) {
-    printCUDAError(err);
+  uintptr_t globalsBase;
+  err = drv::addressReserve(&globalsBase, /*size*/ gsan::kGlobalsReserveSize,
+                            /*alignment*/ gsan::kGlobalsReserveSize);
+  if (err != drv::kSuccess) {
+    printDriverError(err);
     return -1;
   }
   alloc = new AllocatorState();
@@ -174,36 +244,40 @@ int gsanEnsureInit() {
   return 0;
 }
 
-CUresult refreshConfigForDevice(int device) {
+drv::Result refreshConfigForDevice(int device) {
   if (alloc == nullptr)
-    return CUDA_ERROR_NOT_INITIALIZED;
+    return drv::kErrorNotInitialized;
 
   config.topologyFrozen = true;
-  CUresult err = ensureTopologyConfigured();
-  if (err != CUDA_SUCCESS)
+  drv::Result err = ensureTopologyConfigured();
+  if (err != drv::kSuccess)
     return err;
 
   int deviceRank = getDeviceRankForCudaDevice(device);
   if (device < 0)
-    return CUDA_ERROR_INVALID_DEVICE;
-
-  CUdevice cuDevice = 0;
-  err = cuDeviceGet(&cuDevice, device);
-  if (err != CUDA_SUCCESS)
-    return err;
+    return drv::kErrorInvalidDevice;
 
   int numSMs = 0;
-  err = cuDeviceGetAttribute(&numSMs, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
-                             cuDevice);
-  if (err != CUDA_SUCCESS)
+  err = drv::multiprocessorCount(device, &numSMs);
+  if (err != drv::kSuccess)
     return err;
   if (numSMs <= 0)
-    return CUDA_ERROR_INVALID_VALUE;
+    return drv::kErrorInvalidValue;
 
   config.numSMs = numSMs;
   config.numThreads = config.numGPUs * config.numSMs;
   if (config.numThreads > gsan::kMaxThreads)
-    return CUDA_ERROR_NOT_SUPPORTED;
+    return drv::kErrorNotSupported;
+  const int maxClockBufferSize =
+      getMaxClockBufferSize(config.numSMs, config.numThreads);
+  if (maxClockBufferSize == 0) {
+    fprintf(stderr,
+            "GSan runtime state for %d threads on %d SMs does not fit in "
+            "%zu MiB per device\n",
+            config.numThreads, config.numSMs,
+            static_cast<size_t>(gsan::kPerDeviceStateStride >> 20));
+    return drv::kErrorNotSupported;
+  }
 
   // Seed rng for stochastic read clocks.
   if (!config.rngSeedConfigured) {
@@ -215,7 +289,7 @@ CUresult refreshConfigForDevice(int device) {
         auto errc = make_error_code(res.ec);
         auto msg = errc.message();
         fprintf(stderr, "Invalid TRITON_GSAN_SEED value: %s", msg.c_str());
-        return CUDA_ERROR_INVALID_VALUE;
+        return drv::kErrorInvalidValue;
       }
     } else {
       std::uniform_int_distribution<uint32_t> dist;
@@ -233,29 +307,41 @@ CUresult refreshConfigForDevice(int device) {
       auto res =
           std::from_chars(userClockSize, userClockSizeEnd, clockBufferSize);
       if (res.ec != std::errc() || res.ptr != userClockSizeEnd ||
-          clockBufferSize <= 0) {
-        auto errc = make_error_code(res.ec);
-        auto msg = errc.message();
-        fprintf(stderr, "Invalid TRITON_GSAN_CLOCK_BUFFER_SIZE value: %s",
-                msg.c_str());
-        return CUDA_ERROR_INVALID_VALUE;
+          clockBufferSize <= 0 || clockBufferSize > kMaxClockBufferSize) {
+        fprintf(stderr,
+                "Invalid TRITON_GSAN_CLOCK_BUFFER_SIZE value '%s': must be an "
+                "integer in [1, %d]\n",
+                userClockSize, kMaxClockBufferSize);
+        return drv::kErrorInvalidValue;
       }
       config.clockBufferSize = clockBufferSize;
     } else {
-      config.clockBufferSize = 1024;
+      // Large topologies cannot afford the default for every SM, so shrink
+      // it to what fits rather than failing out of the box.
+      config.clockBufferSize =
+          std::min(kDefaultClockBufferSize, maxClockBufferSize);
     }
     config.clockBufferSizeConfigured = true;
+  }
+  if (config.clockBufferSize > maxClockBufferSize) {
+    fprintf(stderr,
+            "GSan clock_buffer_size %d does not fit in %zu MiB of runtime "
+            "state per device for %d threads on %d SMs; use at most %d\n",
+            config.clockBufferSize,
+            static_cast<size_t>(gsan::kPerDeviceStateStride >> 20),
+            config.numThreads, config.numSMs, maxClockBufferSize);
+    return drv::kErrorInvalidValue;
   }
   if (!config.shareableHandleTypeConfigured) {
     config.shareableHandleType = getRequestedShareableHandleType();
     config.shareableHandleTypeConfigured = true;
   }
-  return CUDA_SUCCESS;
+  return drv::kSuccess;
 }
 
-CUresult initializeRuntimeState(CUdeviceptr deviceAddr, size_t allocSize) {
-  CUresult err = cuMemsetD8(deviceAddr, 0, allocSize);
-  if (err != CUDA_SUCCESS)
+drv::Result initializeRuntimeState(uintptr_t deviceAddr, size_t allocSize) {
+  drv::Result err = drv::memsetD8(deviceAddr, allocSize);
+  if (err != drv::kSuccess)
     return err;
 
   gsan::GlobalState globals = {};
@@ -266,85 +352,109 @@ CUresult initializeRuntimeState(CUdeviceptr deviceAddr, size_t allocSize) {
   globals.numDevices = static_cast<gsan::thread_id_t>(config.numGPUs);
   globals.numThreads = static_cast<gsan::thread_id_t>(config.numThreads);
   globals.clockBufferSize = config.clockBufferSize;
-  return cuMemcpyHtoD(deviceAddr, &globals, sizeof(globals));
+  return drv::memcpyHtoD(deviceAddr, &globals, sizeof(globals));
 }
 
-CUresult ensureRuntimeStateMapped(int device) {
+drv::Result ensureRuntimeStateMapped(int device) {
   if (alloc == nullptr)
-    return CUDA_ERROR_NOT_INITIALIZED;
-  CUresult err = refreshConfigForDevice(device);
-  if (err != CUDA_SUCCESS)
+    return drv::kErrorNotInitialized;
+  drv::Result err = refreshConfigForDevice(device);
+  if (err != drv::kSuccess)
     return err;
   int deviceRank = getDeviceRankForCudaDevice(device);
   if (alloc->perDeviceHandles[deviceRank] != 0)
-    return CUDA_SUCCESS;
+    return drv::kSuccess;
 
-  CUmemAllocationProp prop = {};
-  prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
-  prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-  prop.location.id = device;
-  prop.requestedHandleTypes = getRequestedShareableHandleType();
-
+  const auto handleType = getRequestedShareableHandleType();
   size_t granularity = 0;
-  err = cuMemGetAllocationGranularity(&granularity, &prop,
-                                      CU_MEM_ALLOC_GRANULARITY_MINIMUM);
-  if (err != CUDA_SUCCESS)
+  err = drv::allocationGranularity(device, handleType, &granularity);
+  if (err != drv::kSuccess)
     return err;
 
-  static_assert(alignof(gsan::GlobalState) >= alignof(gsan::ThreadState));
-  static_assert(alignof(gsan::ThreadState) >= alignof(gsan::epoch_t));
+  // refreshConfigForDevice bounds the clock buffer so this fits.
+  size_t allocSize =
+      roundUp(getPerDeviceStateSize(config.numSMs, config.numThreads,
+                                    config.clockBufferSize),
+              granularity);
+  if (allocSize > gsan::kPerDeviceStateStride)
+    return drv::kErrorNotSupported;
 
-  auto numSMs = config.numSMs;
-  auto numThreads = config.numThreads;
-  assert(numThreads <= gsan::kMaxThreads);
-  auto clockSizeBytes = sizeof(gsan::epoch_t) * config.numThreads;
-  // 1 local clock + the circular clock buffer
-  auto clocksPerThread = 1 + config.clockBufferSize;
-  auto perSMStateSize =
-      sizeof(gsan::ThreadState) + clockSizeBytes * clocksPerThread;
-  perSMStateSize = roundUp(perSMStateSize, alignof(gsan::ThreadState));
-  // Each device has a local copy of the constant global state
-  auto perDeviceStateSize =
-      (sizeof(gsan::GlobalState) + config.numSMs * perSMStateSize);
-  size_t allocSize = roundUp(perDeviceStateSize, granularity);
-  assert(allocSize <= gsan::kPerDeviceStateStride);
-
-  CUmemGenericAllocationHandle allocHandle = 0;
+  drv::Handle allocHandle = 0;
   bool mapped = false;
-  CUmemAccessDesc accessDesc = {};
-  CUdeviceptr deviceAddr =
+  uintptr_t deviceAddr =
       alloc->globalStateAddress + deviceRank * gsan::kPerDeviceStateStride;
 
-  err = cuMemCreate(&allocHandle, allocSize, &prop, 0);
-  if (err != CUDA_SUCCESS)
+  err = drv::memCreate(&allocHandle, allocSize, device, handleType);
+  if (err != drv::kSuccess)
     goto error;
 
-  err = cuMemMap(deviceAddr, allocSize, /*offset*/ 0, allocHandle, /*flags*/ 0);
-  if (err != CUDA_SUCCESS)
+  err = drv::memMap(deviceAddr, allocSize, allocHandle);
+  if (err != drv::kSuccess)
     goto error;
   mapped = true;
 
-  accessDesc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-  accessDesc.location.id = device;
-  accessDesc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-  err = cuMemSetAccess(deviceAddr, allocSize, &accessDesc, 1);
-  if (err != CUDA_SUCCESS)
+  err = drv::memSetAccess(deviceAddr, allocSize, device);
+  if (err != drv::kSuccess)
     goto error;
 
   err = initializeRuntimeState(deviceAddr, allocSize);
-  if (err != CUDA_SUCCESS)
+  if (err != drv::kSuccess)
     goto error;
 
   alloc->perDeviceHandles[deviceRank] = allocHandle;
   alloc->perDeviceStateSize = allocSize;
-  return CUDA_SUCCESS;
+  return drv::kSuccess;
 
 error:
   if (mapped)
-    cuMemUnmap(deviceAddr, allocSize);
+    (void)drv::memUnmap(deviceAddr, allocSize);
   if (allocHandle != 0)
-    cuMemRelease(allocHandle);
+    (void)drv::memRelease(allocHandle);
   return err;
+}
+
+drv::Result mapNodeHandles(AllocNode *node, drv::Handle realHandle,
+                           drv::Handle shadowHandle, size_t allocSize,
+                           int device, bool *realMapped, bool *shadowMapped) {
+  assert(node != nullptr);
+  assert(realMapped != nullptr);
+  assert(shadowMapped != nullptr);
+
+  const auto shadowAddress = gsan::getShadowAddress(node->virtualAddress);
+  const auto shadowSize = getShadowSize(allocSize, node->virtualAddress);
+
+  drv::Result err = drv::memMap(node->virtualAddress, allocSize, realHandle);
+  if (err != drv::kSuccess)
+    return err;
+  *realMapped = true;
+
+  err = drv::memMap(shadowAddress, shadowSize, shadowHandle);
+  if (err != drv::kSuccess)
+    return err;
+  *shadowMapped = true;
+
+  err = drv::memSetAccess(node->virtualAddress, allocSize, device);
+  if (err != drv::kSuccess)
+    return err;
+
+  err = drv::memSetAccess(shadowAddress, shadowSize, device);
+  if (err != drv::kSuccess)
+    return err;
+
+  node->allocSize = allocSize;
+  node->realHandle = realHandle;
+  node->shadowHandle = shadowHandle;
+  return drv::kSuccess;
+}
+
+void unmapNodeHandles(AllocNode *node, bool realMapped, bool shadowMapped) {
+  assert(node != nullptr);
+  const auto shadowAddress = gsan::getShadowAddress(node->virtualAddress);
+  const auto shadowSize = getShadowSize(node->allocSize, node->virtualAddress);
+  if (shadowMapped)
+    (void)drv::memUnmap(shadowAddress, shadowSize);
+  if (realMapped)
+    (void)drv::memUnmap(node->virtualAddress, node->allocSize);
 }
 
 } // namespace
@@ -359,28 +469,22 @@ void *gsanMallocWithGranularity(ssize_t size, int device, void *stream,
   if (gsanEnsureInit() != 0)
     return nullptr;
 
-  CUresult err = ensureContext(device);
-  if (err != CUDA_SUCCESS) {
-    printCUDAError(err);
+  drv::Result err = drv::ensureCurrentDevice(device);
+  if (err != drv::kSuccess) {
+    printDriverError(err);
     return nullptr;
   }
   err = ensureRuntimeStateMapped(device);
-  if (err != CUDA_SUCCESS) {
-    printCUDAError(err);
+  if (err != drv::kSuccess) {
+    printDriverError(err);
     return nullptr;
   }
 
-  CUmemAllocationProp prop = {};
-  prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
-  prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-  prop.location.id = device;
-  prop.requestedHandleTypes = getRequestedShareableHandleType();
-
+  const auto handleType = getRequestedShareableHandleType();
   size_t granularity = 0;
-  err = cuMemGetAllocationGranularity(&granularity, &prop,
-                                      CU_MEM_ALLOC_GRANULARITY_MINIMUM);
-  if (err != CUDA_SUCCESS) {
-    printCUDAError(err);
+  err = drv::allocationGranularity(device, handleType, &granularity);
+  if (err != drv::kSuccess) {
+    printDriverError(err);
     return nullptr;
   }
   // Scale real allocation alignment so fractional shadow-to-real ratios
@@ -395,18 +499,44 @@ void *gsanMallocWithGranularity(ssize_t size, int device, void *stream,
   if (node == nullptr)
     return nullptr;
 
-  err = createAllocation(node, allocSize,
-                         gsan::getShadowAddress(node->virtualAddress),
-                         getShadowSize(allocSize, node->virtualAddress), prop,
-                         reinterpret_cast<CUstream>(stream));
-  if (err != CUDA_SUCCESS) {
-    printCUDAError(err);
-    freeNode(node);
-    return nullptr;
-  }
+  drv::Handle realHandle = 0;
+  drv::Handle shadowHandle = 0;
+  bool realMapped = false;
+  bool shadowMapped = false;
+  auto drvStream = reinterpret_cast<drv::Stream>(stream);
+  auto shadowAddress = gsan::getShadowAddress(node->virtualAddress);
+  auto shadowSize = getShadowSize(allocSize, node->virtualAddress);
+  err = drv::memCreate(&realHandle, allocSize, device, handleType);
+  if (err != drv::kSuccess)
+    goto error;
+
+  err = drv::memCreate(&shadowHandle, shadowSize, device, handleType);
+  if (err != drv::kSuccess)
+    goto error;
+
+  err = mapNodeHandles(node, realHandle, shadowHandle, allocSize, device,
+                       &realMapped, &shadowMapped);
+  if (err != drv::kSuccess)
+    goto error;
+
+  // Zero-initialize shadow memory
+  err = drv::memsetD8Async(shadowAddress, shadowSize, drvStream);
+  if (err != drv::kSuccess)
+    goto error;
+
   LOGF("gsanMalloc: %p, 0x%zxu", reinterpret_cast<void *>(node->virtualAddress),
        size);
   return reinterpret_cast<void *>(node->virtualAddress);
+
+error:
+  printDriverError(err);
+  unmapNodeHandles(node, realMapped, shadowMapped);
+  if (shadowHandle != 0)
+    (void)drv::memRelease(shadowHandle);
+  if (realHandle != 0)
+    (void)drv::memRelease(realHandle);
+  freeNode(node);
+  return nullptr;
 }
 
 extern "C" void *gsanMalloc(ssize_t size, int device, void *stream) {
@@ -452,7 +582,7 @@ extern "C" void *gsanMalloc16(ssize_t size, int device, void *stream) {
 extern "C" void gsanFree(void *void_ptr, [[maybe_unused]] ssize_t size,
                          [[maybe_unused]] int device, void *stream) {
   LOGF("gsanFree: %p, 0x%zx", void_ptr, size);
-  auto ptr = reinterpret_cast<CUdeviceptr>(void_ptr);
+  auto ptr = reinterpret_cast<uintptr_t>(void_ptr);
   if (!ptr)
     return;
 
@@ -467,9 +597,33 @@ extern "C" void gsanFree(void *void_ptr, [[maybe_unused]] ssize_t size,
     return;
   }
 
-  releaseAllocation(node, gsan::getShadowAddress(node->virtualAddress),
-                    getShadowSize(node->allocSize, node->virtualAddress),
-                    reinterpret_cast<CUstream>(stream));
+  // Wait for outstanding work on the deallocation stream, including the
+  // allocator's own async shadow memset from gsanMalloc, before unmapping.
+  auto drvStream = reinterpret_cast<drv::Stream>(stream);
+  drv::Result err = drv::streamSynchronize(drvStream);
+  if (err != drv::kSuccess)
+    printDriverError(err);
+
+  const auto shadowAddress = gsan::getShadowAddress(node->virtualAddress);
+  const auto shadowSize = getShadowSize(node->allocSize, node->virtualAddress);
+
+  err = drv::memUnmap(node->virtualAddress, node->allocSize);
+  if (err != drv::kSuccess)
+    printDriverError(err);
+
+  err = drv::memUnmap(shadowAddress, shadowSize);
+  if (err != drv::kSuccess)
+    printDriverError(err);
+
+  err = drv::memRelease(node->realHandle);
+  if (err != drv::kSuccess)
+    printDriverError(err);
+
+  err = drv::memRelease(node->shadowHandle);
+  if (err != drv::kSuccess)
+    printDriverError(err);
+
+  freeNode(node);
 }
 
 void *gsanGetReservePointer() {
@@ -480,20 +634,19 @@ void *gsanGetReservePointer() {
 }
 
 int gsanExportAllocationHandles(void *void_ptr,
-                                ShareableHandle *realShareableHandle,
-                                ShareableHandle *shadowShareableHandle,
-                                size_t *allocSize,
-                                CUmemAllocationHandleType handleType,
+                                GSanShareableHandle *realShareableHandle,
+                                GSanShareableHandle *shadowShareableHandle,
+                                size_t *allocSize, drv::HandleType handleType,
                                 bool includeGranularity) {
   if (realShareableHandle == nullptr || shadowShareableHandle == nullptr ||
-      allocSize == nullptr || !isSupportedShareableHandleType(handleType)) {
+      allocSize == nullptr || !drv::isSupportedHandleType(handleType)) {
     return -1;
   }
   *realShareableHandle = {};
   *shadowShareableHandle = {};
   *allocSize = 0;
 
-  const auto ptr = reinterpret_cast<CUdeviceptr>(void_ptr);
+  const auto ptr = reinterpret_cast<uintptr_t>(void_ptr);
   if (ptr == 0)
     return -1;
 
@@ -509,15 +662,25 @@ int gsanExportAllocationHandles(void *void_ptr,
             "gsanExportAllocationHandles called with invalid pointer\n");
     return -1;
   }
-  int defaultGranularity = gsan::isWriteOnceAddress(ptr) ? 1 : 4;
-  if (!includeGranularity &&
-      gsan::getShadowGranularity(ptr) != defaultGranularity)
+  if (!includeGranularity && gsan::getShadowGranularity(ptr) !=
+                                 (gsan::isWriteOnceAddress(ptr) ? 1 : 4))
     return -2;
 
-  CUresult err = exportAllocation(node, realShareableHandle,
-                                  shadowShareableHandle, handleType);
-  if (err != CUDA_SUCCESS) {
-    printCUDAError(err);
+  drv::Result err = drv::exportHandle(
+      getShareableHandleExportArg(realShareableHandle, handleType),
+      node->realHandle, handleType);
+  if (err != drv::kSuccess) {
+    printDriverError(err);
+    return -1;
+  }
+
+  err = drv::exportHandle(
+      getShareableHandleExportArg(shadowShareableHandle, handleType),
+      node->shadowHandle, handleType);
+  if (err != drv::kSuccess) {
+    printDriverError(err);
+    if (handleType == drv::HandleType::PosixFileDescriptor)
+      close(realShareableHandle->fd);
     return -1;
   }
 
@@ -537,7 +700,7 @@ int gsanExportAllocationMemhandleRegions(void *void_ptr, uintptr_t *realPtr,
   *shadowPtr = 0;
   *shadowSize = 0;
 
-  const auto ptr = reinterpret_cast<CUdeviceptr>(void_ptr);
+  const auto ptr = reinterpret_cast<uintptr_t>(void_ptr);
   if (ptr == 0)
     return -1;
 
@@ -563,11 +726,12 @@ int gsanExportAllocationMemhandleRegions(void *void_ptr, uintptr_t *realPtr,
   return 0;
 }
 
-int gsanExportRuntimeStateHandle(int device, ShareableHandle *shareableHandle,
+int gsanExportRuntimeStateHandle(int device,
+                                 GSanShareableHandle *shareableHandle,
                                  size_t *allocSize,
-                                 CUmemAllocationHandleType handleType) {
+                                 drv::HandleType handleType) {
   if (shareableHandle == nullptr || allocSize == nullptr ||
-      !isSupportedShareableHandleType(handleType)) {
+      !drv::isSupportedHandleType(handleType)) {
     return -1;
   }
   *shareableHandle = {};
@@ -579,14 +743,14 @@ int gsanExportRuntimeStateHandle(int device, ShareableHandle *shareableHandle,
   std::lock_guard lg(mut);
   if (gsanEnsureInit() != 0)
     return -1;
-  CUresult err = ensureContext(device);
-  if (err != CUDA_SUCCESS) {
-    printCUDAError(err);
+  drv::Result err = drv::ensureCurrentDevice(device);
+  if (err != drv::kSuccess) {
+    printDriverError(err);
     return -1;
   }
   err = ensureRuntimeStateMapped(device);
-  if (err != CUDA_SUCCESS) {
-    printCUDAError(err);
+  if (err != drv::kSuccess) {
+    printDriverError(err);
     return -1;
   }
 
@@ -596,11 +760,11 @@ int gsanExportRuntimeStateHandle(int device, ShareableHandle *shareableHandle,
   if (handle == 0 || size == 0)
     return -1;
 
-  err = cuMemExportToShareableHandle(
+  err = drv::exportHandle(
       getShareableHandleExportArg(shareableHandle, handleType), handle,
-      handleType, 0);
-  if (err != CUDA_SUCCESS) {
-    printCUDAError(err);
+      handleType);
+  if (err != drv::kSuccess) {
+    printDriverError(err);
     return -1;
   }
 
@@ -608,17 +772,17 @@ int gsanExportRuntimeStateHandle(int device, ShareableHandle *shareableHandle,
   return 0;
 }
 
-void *gsanImportAllocationHandles(const ShareableHandle *realShareableHandle,
-                                  const ShareableHandle *shadowShareableHandle,
-                                  CUmemAllocationHandleType handleType,
-                                  size_t allocSize, int device,
-                                  int shadowGranularity,
-                                  bool writeOnce = false) {
+void *
+gsanImportAllocationHandles(const GSanShareableHandle *realShareableHandle,
+                            const GSanShareableHandle *shadowShareableHandle,
+                            drv::HandleType handleType, size_t allocSize,
+                            int device, int shadowGranularity,
+                            bool writeOnce = false) {
   if (realShareableHandle == nullptr || shadowShareableHandle == nullptr ||
-      !isSupportedShareableHandleType(handleType) || allocSize == 0 ||
+      !drv::isSupportedHandleType(handleType) || allocSize == 0 ||
       !gsan::isValidShadowGranularity(shadowGranularity))
     return nullptr;
-  if (handleType == CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR &&
+  if (handleType == drv::HandleType::PosixFileDescriptor &&
       (realShareableHandle->fd < 0 || shadowShareableHandle->fd < 0)) {
     return nullptr;
   }
@@ -626,14 +790,14 @@ void *gsanImportAllocationHandles(const ShareableHandle *realShareableHandle,
   std::lock_guard lg(mut);
   if (gsanEnsureInit() != 0)
     return nullptr;
-  CUresult err = ensureContext(device);
-  if (err != CUDA_SUCCESS) {
-    printCUDAError(err);
+  drv::Result err = drv::ensureCurrentDevice(device);
+  if (err != drv::kSuccess) {
+    printDriverError(err);
     return nullptr;
   }
   err = ensureRuntimeStateMapped(device);
-  if (err != CUDA_SUCCESS) {
-    printCUDAError(err);
+  if (err != drv::kSuccess) {
+    printDriverError(err);
     return nullptr;
   }
 
@@ -643,25 +807,48 @@ void *gsanImportAllocationHandles(const ShareableHandle *realShareableHandle,
   if (node == nullptr)
     return nullptr;
 
-  err = importAllocation(
-      node, allocSize, gsan::getShadowAddress(node->virtualAddress),
-      getShadowSize(allocSize, node->virtualAddress), *realShareableHandle,
-      *shadowShareableHandle, handleType, device);
-  if (err != CUDA_SUCCESS) {
-    printCUDAError(err);
-    freeNode(node);
-    return nullptr;
-  }
+  drv::Handle realHandle = 0;
+  drv::Handle shadowHandle = 0;
+  bool realMapped = false;
+  bool shadowMapped = false;
+  err = drv::importHandle(
+      &realHandle, getShareableHandleImportArg(realShareableHandle, handleType),
+      handleType);
+  if (err != drv::kSuccess)
+    goto error;
+
+  err = drv::importHandle(
+      &shadowHandle,
+      getShareableHandleImportArg(shadowShareableHandle, handleType),
+      handleType);
+  if (err != drv::kSuccess)
+    goto error;
+
+  err = mapNodeHandles(node, realHandle, shadowHandle, allocSize, device,
+                       &realMapped, &shadowMapped);
+  if (err != drv::kSuccess)
+    goto error;
+
   return reinterpret_cast<void *>(node->virtualAddress);
+
+error:
+  printDriverError(err);
+  unmapNodeHandles(node, realMapped, shadowMapped);
+  if (shadowHandle != 0)
+    (void)drv::memRelease(shadowHandle);
+  if (realHandle != 0)
+    (void)drv::memRelease(realHandle);
+  freeNode(node);
+  return nullptr;
 }
 
-int gsanImportRuntimeStateHandle(const ShareableHandle *shareableHandle,
-                                 CUmemAllocationHandleType handleType,
-                                 size_t allocSize, int peerDevice, int device) {
-  if (shareableHandle == nullptr ||
-      !isSupportedShareableHandleType(handleType) || allocSize == 0)
+int gsanImportRuntimeStateHandle(const GSanShareableHandle *shareableHandle,
+                                 drv::HandleType handleType, size_t allocSize,
+                                 int peerDevice, int device) {
+  if (shareableHandle == nullptr || !drv::isSupportedHandleType(handleType) ||
+      allocSize == 0)
     return -1;
-  if (handleType == CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR &&
+  if (handleType == drv::HandleType::PosixFileDescriptor &&
       shareableHandle->fd < 0) {
     return -1;
   }
@@ -671,9 +858,9 @@ int gsanImportRuntimeStateHandle(const ShareableHandle *shareableHandle,
   std::lock_guard lg(mut);
   if (gsanEnsureInit() != 0)
     return -1;
-  CUresult err = ensureContext(device);
-  if (err != CUDA_SUCCESS) {
-    printCUDAError(err);
+  drv::Result err = drv::ensureCurrentDevice(device);
+  if (err != drv::kSuccess) {
+    printDriverError(err);
     return -1;
   }
 
@@ -682,46 +869,89 @@ int gsanImportRuntimeStateHandle(const ShareableHandle *shareableHandle,
   if (allocSize != alloc->perDeviceStateSize)
     return -1;
 
-  CUmemGenericAllocationHandle importedHandle = 0;
+  drv::Handle importedHandle = 0;
   bool mapped = false;
-  CUmemAccessDesc accessDesc = {};
-  CUdeviceptr deviceAddr =
+  uintptr_t deviceAddr =
       alloc->globalStateAddress + peerDevice * gsan::kPerDeviceStateStride;
 
-  err = cuMemImportFromShareableHandle(
+  err = drv::importHandle(
       &importedHandle, getShareableHandleImportArg(shareableHandle, handleType),
       handleType);
-  if (err != CUDA_SUCCESS)
+  if (err != drv::kSuccess)
     goto error;
 
-  err = cuMemMap(deviceAddr, allocSize, /*offset*/ 0, importedHandle,
-                 /*flags*/ 0);
-  if (err != CUDA_SUCCESS)
+  err = drv::memMap(deviceAddr, allocSize, importedHandle);
+  if (err != drv::kSuccess)
     goto error;
   mapped = true;
 
-  accessDesc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-  accessDesc.location.id = device;
-  accessDesc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-  err = cuMemSetAccess(deviceAddr, allocSize, &accessDesc, 1);
-  if (err != CUDA_SUCCESS)
+  err = drv::memSetAccess(deviceAddr, allocSize, device);
+  if (err != drv::kSuccess)
     goto error;
 
   alloc->perDeviceHandles[peerDevice] = importedHandle;
   return 0;
 
 error:
-  printCUDAError(err);
+  printDriverError(err);
   if (mapped)
-    cuMemUnmap(deviceAddr, allocSize);
+    (void)drv::memUnmap(deviceAddr, allocSize);
   if (importedHandle != 0)
-    cuMemRelease(importedHandle);
+    (void)drv::memRelease(importedHandle);
   return -1;
 }
 
 namespace {
 
 constexpr const char *kModuleName = "gsan_allocator";
+
+bool parseShareableHandleTypeArg(PyObject *obj, const char *name,
+                                 drv::HandleType *out) {
+  int handleType = 0;
+  if (!parseIntArg(obj, name, &handleType))
+    return false;
+  if (!drv::isSupportedHandleType(static_cast<drv::HandleType>(handleType))) {
+    PyErr_Format(PyExc_ValueError, "%s has unsupported value %d", name,
+                 handleType);
+    return false;
+  }
+  *out = static_cast<drv::HandleType>(handleType);
+  return true;
+}
+
+bool parseShareableHandleArg(PyObject *obj, const char *name,
+                             drv::HandleType handleType,
+                             GSanShareableHandle *out) {
+  if (handleType == drv::HandleType::PosixFileDescriptor)
+    return parseIntArg(obj, name, &out->fd);
+
+  if (!PyBytes_Check(obj)) {
+    PyErr_Format(PyExc_TypeError, "%s must be bytes", name);
+    return false;
+  }
+
+  char *data = nullptr;
+  Py_ssize_t size = 0;
+  if (PyBytes_AsStringAndSize(obj, &data, &size) != 0)
+    return false;
+  if (size != static_cast<Py_ssize_t>(sizeof(out->fabricHandle))) {
+    PyErr_Format(PyExc_ValueError, "%s must contain exactly %zu bytes, got %zd",
+                 name, sizeof(out->fabricHandle), size);
+    return false;
+  }
+
+  memcpy(&out->fabricHandle, data, sizeof(out->fabricHandle));
+  return true;
+}
+
+PyObject *shareableHandleToPyObject(const GSanShareableHandle &handle,
+                                    drv::HandleType handleType) {
+  if (handleType == drv::HandleType::PosixFileDescriptor)
+    return PyLong_FromLong(handle.fd);
+  return PyBytes_FromStringAndSize(
+      reinterpret_cast<const char *>(&handle.fabricHandle),
+      sizeof(handle.fabricHandle));
+}
 
 bool parseUInt32Arg(PyObject *obj, const char *name, uint32_t *out) {
   unsigned long long value = PyLong_AsUnsignedLongLong(obj);
@@ -903,17 +1133,18 @@ PyObject *pyConfigure([[maybe_unused]] PyObject *self, PyObject *const *args,
   if (clockBufferSizeRequested) {
     if (!parseIntArg(args[3], "clock_buffer_size", &requestedClockBufferSize))
       return nullptr;
-    if (requestedClockBufferSize <= 0) {
+    if (requestedClockBufferSize <= 0 ||
+        requestedClockBufferSize > kMaxClockBufferSize) {
       PyErr_Format(PyExc_ValueError,
-                   "clock_buffer_size must be positive, got %d",
-                   requestedClockBufferSize);
+                   "clock_buffer_size must be in [1, %d], got %d",
+                   kMaxClockBufferSize, requestedClockBufferSize);
       return nullptr;
     }
   }
 
   const bool shareableHandleTypeRequested = args[4] != Py_None;
-  CUmemAllocationHandleType requestedShareableHandleType =
-      CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
+  drv::HandleType requestedShareableHandleType =
+      drv::HandleType::PosixFileDescriptor;
   if (shareableHandleTypeRequested &&
       !parseShareableHandleTypeArg(args[4], "handle_type",
                                    &requestedShareableHandleType)) {
@@ -961,9 +1192,9 @@ PyObject *pyFreezeConfig([[maybe_unused]] PyObject *self, PyObject *const *args,
   }
 
   std::lock_guard lg(mut);
-  CUresult err = ensureTopologyConfigured();
-  if (err != CUDA_SUCCESS) {
-    printCUDAError(err);
+  drv::Result err = ensureTopologyConfigured();
+  if (err != drv::kSuccess) {
+    printDriverError(err);
     PyErr_SetString(PyExc_RuntimeError,
                     "failed to configure the default GSan topology");
     return nullptr;
@@ -992,20 +1223,12 @@ PyObject *pySupportsFabricHandles([[maybe_unused]] PyObject *self,
   if (!parseIntArg(args[0], "device", &device))
     return nullptr;
 
-  CUdevice cuDevice = 0;
-  CUresult err = cuDeviceGet(&cuDevice, device);
-  if (err != CUDA_SUCCESS) {
-    printCUDAError(err);
-    PyErr_SetString(PyExc_RuntimeError, "cuDeviceGet failed.");
-    return nullptr;
-  }
-
-  int supported = 0;
-  err = cuDeviceGetAttribute(
-      &supported, CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED, cuDevice);
-  if (err != CUDA_SUCCESS) {
-    printCUDAError(err);
-    PyErr_SetString(PyExc_RuntimeError, "cuDeviceGetAttribute failed.");
+  bool supported = false;
+  drv::Result err = drv::supportsFabricHandles(device, &supported);
+  if (err != drv::kSuccess) {
+    printDriverError(err);
+    PyErr_SetString(PyExc_RuntimeError,
+                    "failed to query fabric handle support.");
     return nullptr;
   }
   return PyBool_FromLong(supported);
@@ -1030,15 +1253,6 @@ PyObject *pyReset([[maybe_unused]] PyObject *self, PyObject *const *args,
     return nullptr;
   }
 
-  CUcontext originalContext = nullptr;
-  CUresult err = cuCtxGetCurrent(&originalContext);
-  if (err != CUDA_SUCCESS) {
-    printCUDAError(err);
-    PyErr_SetString(PyExc_RuntimeError,
-                    "failed to get the current CUDA context for GSan reset");
-    return nullptr;
-  }
-
   for (int device = 0; device < static_cast<int>(gsan::kMaxGPUs); ++device) {
     if (!config.configuredDeviceRanks[device])
       continue;
@@ -1047,29 +1261,22 @@ PyObject *pyReset([[maybe_unused]] PyObject *self, PyObject *const *args,
     if (alloc->perDeviceHandles[deviceRank] == 0)
       continue;
 
-    CUcontext deviceContext = nullptr;
-    err = cuDevicePrimaryCtxRetain(&deviceContext, device);
-    if (err == CUDA_SUCCESS)
-      err = cuCtxSetCurrent(deviceContext);
-    if (err == CUDA_SUCCESS)
-      err = cuCtxSynchronize();
-    if (err == CUDA_SUCCESS) {
-      CUdeviceptr deviceAddr =
+    drv::DeviceGuard guard;
+    drv::Result err = guard.enter(device);
+    if (err == drv::kSuccess)
+      err = guard.synchronize();
+    if (err == drv::kSuccess) {
+      uintptr_t deviceAddr =
           alloc->globalStateAddress + deviceRank * gsan::kPerDeviceStateStride;
       err = initializeRuntimeState(deviceAddr, alloc->perDeviceStateSize);
     }
 
-    CUresult restoreErr = cuCtxSetCurrent(originalContext);
-    if (err == CUDA_SUCCESS)
-      err = restoreErr;
-    if (deviceContext != nullptr) {
-      CUresult releaseErr = cuDevicePrimaryCtxRelease(device);
-      if (err == CUDA_SUCCESS)
-        err = releaseErr;
-    }
+    drv::Result exitErr = guard.exit();
+    if (err == drv::kSuccess)
+      err = exitErr;
 
-    if (err != CUDA_SUCCESS) {
-      printCUDAError(err);
+    if (err != drv::kSuccess) {
+      printDriverError(err);
       PyErr_SetString(PyExc_RuntimeError,
                       "failed to reinitialize GSan runtime state");
       return nullptr;
@@ -1123,9 +1330,9 @@ PyObject *pyGetDeviceRank([[maybe_unused]] PyObject *self,
     return nullptr;
 
   std::lock_guard lg(mut);
-  CUresult err = ensureTopologyConfigured();
-  if (err != CUDA_SUCCESS) {
-    printCUDAError(err);
+  drv::Result err = ensureTopologyConfigured();
+  if (err != drv::kSuccess) {
+    printDriverError(err);
     PyErr_SetString(PyExc_RuntimeError,
                     "failed to configure the default GSan topology");
     return nullptr;
@@ -1177,9 +1384,7 @@ PyObject *pyGetRuntimeStateLayout([[maybe_unused]] PyObject *self,
       roundUp(globalStateAddress + sizeof(gsan::GlobalState),
               alignof(gsan::ThreadState));
   size_t threadStateStride =
-      sizeof(gsan::ThreadState) +
-      sizeof(gsan::epoch_t) * config.numThreads * (1 + config.clockBufferSize);
-  threadStateStride = roundUp(threadStateStride, alignof(gsan::ThreadState));
+      getPerSMStateSize(config.numThreads, config.clockBufferSize);
 
   return Py_BuildValue(
       "{s:K,s:K,s:K,s:K,s:i,s:i,s:i}", "global_state_ptr",
@@ -1220,8 +1425,7 @@ PyObject *pyExportAllocationHandles(PyObject *self, PyObject *const *args,
   }
 
   void *ptr = nullptr;
-  CUmemAllocationHandleType handleType =
-      CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
+  drv::HandleType handleType = drv::HandleType::PosixFileDescriptor;
   if (!parseVoidPtrArg(args[0], &ptr) ||
       !parseShareableHandleTypeArg(args[1], "handle_type", &handleType))
     return nullptr;
@@ -1239,8 +1443,8 @@ PyObject *pyExportAllocationHandles(PyObject *self, PyObject *const *args,
   if (includeGranularity < 0)
     return nullptr;
 
-  ShareableHandle realShareableHandle = {};
-  ShareableHandle shadowShareableHandle = {};
+  GSanShareableHandle realShareableHandle = {};
+  GSanShareableHandle shadowShareableHandle = {};
   size_t allocSize = 0;
   int rc = gsanExportAllocationHandles(ptr, &realShareableHandle,
                                        &shadowShareableHandle, &allocSize,
@@ -1312,11 +1516,10 @@ PyObject *pyImportAllocationHandles(PyObject *self, PyObject *const *args,
     return nullptr;
   }
 
-  ShareableHandle realShareableHandle = {};
-  ShareableHandle shadowShareableHandle = {};
+  GSanShareableHandle realShareableHandle = {};
+  GSanShareableHandle shadowShareableHandle = {};
   int device = 0;
-  CUmemAllocationHandleType handleType =
-      CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
+  drv::HandleType handleType = drv::HandleType::PosixFileDescriptor;
   if (!parseIntArg(args[3], "device", &device) ||
       !parseShareableHandleTypeArg(args[4], "handle_type", &handleType) ||
       !parseShareableHandleArg(args[0], "real_handle", handleType,
@@ -1360,13 +1563,12 @@ PyObject *pyExportRuntimeStateHandle(PyObject *self, PyObject *const *args,
   }
 
   int device = 0;
-  CUmemAllocationHandleType handleType =
-      CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
+  drv::HandleType handleType = drv::HandleType::PosixFileDescriptor;
   if (!parseIntArg(args[0], "device", &device) ||
       !parseShareableHandleTypeArg(args[1], "handle_type", &handleType))
     return nullptr;
 
-  ShareableHandle shareableHandle = {};
+  GSanShareableHandle shareableHandle = {};
   size_t allocSize = 0;
   int rc = gsanExportRuntimeStateHandle(device, &shareableHandle, &allocSize,
                                         handleType);
@@ -1391,11 +1593,10 @@ PyObject *pyImportRuntimeStateHandle(PyObject *self, PyObject *const *args,
     return nullptr;
   }
 
-  ShareableHandle shareableHandle = {};
+  GSanShareableHandle shareableHandle = {};
   int peerDevice = 0;
   int device = 0;
-  CUmemAllocationHandleType handleType =
-      CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
+  drv::HandleType handleType = drv::HandleType::PosixFileDescriptor;
   if (!parseIntArg(args[2], "peer_device", &peerDevice) ||
       !parseIntArg(args[3], "device", &device) ||
       !parseShareableHandleTypeArg(args[4], "handle_type", &handleType) ||
