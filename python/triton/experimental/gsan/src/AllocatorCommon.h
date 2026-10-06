@@ -6,42 +6,18 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <cuda.h>
 #include <memory>
 #include <unistd.h>
 
-// CUDA VMM mechanics shared by the independent race and profiling allocators.
+// Includes <cuda.h>, or the HIP runtime API when GSAN_BACKEND_HIP is defined.
+#include "GSanDriver.h"
+
+// Allocator mechanics shared by the independent race and profiling allocators.
 // No reservation, configuration, or allocation state is shared here.
+// The address tree is backend-neutral. The VMM helpers below it use the CUDA
+// driver API and are not available when building the race allocator for HIP,
+// which uses gsan::drv directly.
 namespace triton::cuda_allocator {
-
-union ShareableHandle {
-  int fd;
-  CUmemFabricHandle fabricHandle;
-};
-
-inline bool
-isSupportedShareableHandleType(CUmemAllocationHandleType handleType) {
-  return handleType == CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR ||
-         handleType == CU_MEM_HANDLE_TYPE_FABRIC;
-}
-
-inline void *getShareableHandleImportArg(const ShareableHandle *handle,
-                                         CUmemAllocationHandleType handleType) {
-  if (handleType == CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR)
-    return reinterpret_cast<void *>(static_cast<uintptr_t>(handle->fd));
-  if (handleType == CU_MEM_HANDLE_TYPE_FABRIC)
-    return const_cast<CUmemFabricHandle *>(&handle->fabricHandle);
-  return nullptr;
-}
-
-inline void *getShareableHandleExportArg(ShareableHandle *handle,
-                                         CUmemAllocationHandleType handleType) {
-  if (handleType == CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR)
-    return &handle->fd;
-  if (handleType == CU_MEM_HANDLE_TYPE_FABRIC)
-    return &handle->fabricHandle;
-  return nullptr;
-}
 
 // We use a tree structure to manage virtual address allocations.
 //
@@ -57,7 +33,7 @@ inline void *getShareableHandleExportArg(ShareableHandle *handle,
 // of the hard parts for us and only asks us to allocate large blocks that it
 // will divide up as needed.
 struct AllocNode {
-  CUdeviceptr virtualAddress = 0;
+  uintptr_t virtualAddress = 0;
   AllocNode *parent = nullptr;
   std::unique_ptr<AllocNode> leftChild;
   std::unique_ptr<AllocNode> rightChild;
@@ -65,16 +41,10 @@ struct AllocNode {
   size_t maxFreeBlockSize = 0;
 
   // Allocation handles, used only by leaf nodes
-  CUmemGenericAllocationHandle realHandle = 0;
-  CUmemGenericAllocationHandle shadowHandle = 0;
+  gsan::drv::Handle realHandle = 0;
+  gsan::drv::Handle shadowHandle = 0;
   size_t allocSize = 0;
 };
-
-inline void printCUDAError(CUresult err) {
-  const char *errs = "<unknown error>";
-  cuGetErrorString(err, &errs);
-  fprintf(stderr, "CUDA allocator encountered an unexpected error: %s\n", errs);
-}
 
 inline size_t cdiv(size_t num, size_t den) { return (num + (den - 1)) / den; }
 
@@ -172,7 +142,7 @@ inline AllocNode *allocateNode(AllocNode *root, size_t allocSize) {
   return allocateNode(next, allocSize);
 }
 
-inline AllocNode *findNodeByAddress(AllocNode *root, CUdeviceptr address) {
+inline AllocNode *findNodeByAddress(AllocNode *root, uintptr_t address) {
   AllocNode *node = root;
   while (node != nullptr) {
     if (address < node->virtualAddress ||
@@ -225,6 +195,43 @@ inline void freeNode(AllocNode *leaf) {
   leaf->shadowHandle = 0;
   leaf->maxFreeBlockSize = leaf->size;
   coalesceUp(leaf->parent);
+}
+
+#if !defined(GSAN_BACKEND_HIP)
+
+union ShareableHandle {
+  int fd;
+  CUmemFabricHandle fabricHandle;
+};
+
+inline bool
+isSupportedShareableHandleType(CUmemAllocationHandleType handleType) {
+  return handleType == CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR ||
+         handleType == CU_MEM_HANDLE_TYPE_FABRIC;
+}
+
+inline void *getShareableHandleImportArg(const ShareableHandle *handle,
+                                         CUmemAllocationHandleType handleType) {
+  if (handleType == CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR)
+    return reinterpret_cast<void *>(static_cast<uintptr_t>(handle->fd));
+  if (handleType == CU_MEM_HANDLE_TYPE_FABRIC)
+    return const_cast<CUmemFabricHandle *>(&handle->fabricHandle);
+  return nullptr;
+}
+
+inline void *getShareableHandleExportArg(ShareableHandle *handle,
+                                         CUmemAllocationHandleType handleType) {
+  if (handleType == CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR)
+    return &handle->fd;
+  if (handleType == CU_MEM_HANDLE_TYPE_FABRIC)
+    return &handle->fabricHandle;
+  return nullptr;
+}
+
+inline void printCUDAError(CUresult err) {
+  const char *errs = "<unknown error>";
+  cuGetErrorString(err, &errs);
+  fprintf(stderr, "CUDA allocator encountered an unexpected error: %s\n", errs);
 }
 
 inline CUresult ensureContext(int device) {
@@ -385,5 +392,7 @@ inline void releaseAllocation(AllocNode *node, uintptr_t shadowAddress,
   check(cuMemRelease(node->shadowHandle));
   freeNode(node);
 }
+
+#endif // !defined(GSAN_BACKEND_HIP)
 
 } // namespace triton::cuda_allocator
