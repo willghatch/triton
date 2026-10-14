@@ -199,16 +199,10 @@ PyGlobalState toPyGlobalState(const gsan::GlobalState &state) {
 
 constexpr size_t kThreadStateHeaderSize =
     offsetof(gsan::ThreadState, vectorClock);
-constexpr size_t kThreadStateSize = sizeof(gsan::ThreadState);
-
-inline uintptr_t roundUp(uintptr_t ptr, uintptr_t align) {
-  return (ptr % align) == 0 ? ptr : ptr + align - (ptr % align);
-}
-
+// Same layout as the device runtime and allocator (GSan.h), including the
+// padding of each thread state to ThreadState alignment.
 size_t threadStateStrideBytes(uint16_t numThreads, uint16_t clockBufferSize) {
-  auto clocksPerThread = static_cast<size_t>(1) + clockBufferSize;
-  auto clockWords = static_cast<size_t>(numThreads) * clocksPerThread;
-  return kThreadStateSize + sizeof(gsan::epoch_t) * clockWords;
+  return gsan::getThreadStateStrideBytes(numThreads, clockBufferSize);
 }
 
 PyGSanThreadState decodeThreadStateBytes(const char *bytes, size_t size,
@@ -400,9 +394,8 @@ void init_gsan_testing(py::module_ &m) {
       "thread_state_address",
       [](uint64_t globalStateAddress, uint64_t numThreads,
          uint64_t clockBufferSize, uint64_t smid) -> uint64_t {
-        uintptr_t base = static_cast<uintptr_t>(globalStateAddress);
-        base = roundUp(base + sizeof(gsan::GlobalState),
-                       alignof(gsan::ThreadState));
+        uintptr_t base = gsan::getThreadStateBaseAddress(
+            static_cast<uintptr_t>(globalStateAddress));
         uintptr_t stride = static_cast<uintptr_t>(
             threadStateStrideBytes(static_cast<uint16_t>(numThreads),
                                    static_cast<uint16_t>(clockBufferSize)));
