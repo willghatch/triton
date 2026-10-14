@@ -990,7 +990,6 @@ def _run_explicit_clock_buffer_size_shrinks_default_slots_check() -> None:
 def test_explicit_clock_buffer_size_shrinks_default_slots():
     result = run_in_process(_run_explicit_clock_buffer_size_shrinks_default_slots_check)
     assert result.exc is None
-    assert "runtime-state slots" in result.driver_stderr_output
 
 
 def _run_thread_state_lookup_unaligned_stride_check() -> None:

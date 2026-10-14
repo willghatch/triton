@@ -18,6 +18,7 @@ from triton.backends.driver import (
 )
 from triton.runtime import _allocation
 from triton.runtime.build import compile_module_from_src
+from triton._C.libtriton.gsan_testing import PER_DEVICE_STATE_STRIDE_BYTES as GSAN_PER_DEVICE_STATE_STRIDE
 
 dirname = os.path.dirname(os.path.realpath(__file__))
 include_dirs = [os.path.join(dirname, "include")]
@@ -26,8 +27,6 @@ PyKernelArg = None
 ARG_CONSTEXPR = None
 ARG_KERNEL = None
 ARG_TUPLE = None
-# Must match gsan::kPerDeviceStateStride in GSan.h.
-GSAN_PER_DEVICE_STATE_STRIDE = 1 << 30
 
 
 def _find_already_mmapped_dylib_on_linux(lib_name):
