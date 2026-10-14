@@ -288,8 +288,8 @@ class HIPLauncher(object):
         self.gsan_enabled = is_enabled(metadata, "gsan")
         if self.gsan_enabled:
             signature["_gsan_globals_ptr"] = "*i8"
-            signature["_gsan_stream_clock_ptr"] = "*i32"
-            signature["_gsan_kernel_id"] = "i64"
+            signature["_gsan_launch_table_ptr"] = "*i8"
+            signature["_gsan_launch_index"] = "i64"
 
         tensordesc_abi = TensorDescABI.HIP_TDM if tensordesc_meta else TensorDescABI.DECOMPOSED
         utils = triton.runtime.driver.active.utils
@@ -349,8 +349,9 @@ class HIPLauncher(object):
             device = active_driver.get_current_device()
             device_rank = gsan_allocator.get_device_rank(device)
             gsan_state_ptr = gsan_allocator.get_global_state_pointer() + device_rank * GSAN_PER_DEVICE_STATE_STRIDE
-            stream_clock, kernel_id = gsan_stream_sync.get_launch_stream_clock(device, stream)
-            kernel_args = (*args, gsan_state_ptr, stream_clock, kernel_id)
+            # AMD kernels never use PDL; the compiler sets tti.gsan_launch_pdl = 0.
+            launch_table, launch_index = gsan_stream_sync.get_launch_state(device, stream)
+            kernel_args = (*args, gsan_state_ptr, launch_table, launch_index)
 
         self.launch(self.launch_cooperative_grid, gridX, gridY, gridZ, stream, function, global_scratch,
                     profile_scratch, kernel_metadata, launch_metadata, launch_enter_hook, launch_exit_hook,
