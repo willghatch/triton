@@ -388,4 +388,21 @@ def TritonAMDGPUFpSanitizer : Pass<"tritonamdgpu-fp-sanitizer", "mlir::ModuleOp"
   let dependentDialects = ["mlir::triton::amdgpu::TritonAMDGPUDialect"];
 }
 
+def TritonAMDGPUGSanRejectUnsupported : Pass<"tritonamdgpu-gsan-reject-unsupported", "mlir::ModuleOp"> {
+  let summary = "Reject operations that the global sanitizer (GSan) cannot check on AMD";
+  let description = [{
+    GSan instruments `tt.load`, `tt.store`, and the `tt.atomic_*` operations.
+    Any other operation that reads or writes global memory (AMD buffer ops,
+    async copies, TDM copies, tensor descriptor ops, ...) would silently escape
+    race checking, so this pass reports an error for it instead.
+    It also rejects features the AMD GSan prototype does not model or has not
+    been validated with: warp specialization, warp pipelining, mbarrier,
+    cluster, and conditional barriers (block pingpong), `num_ctas > 1`, and
+    warp sizes other than 64.
+    Operations with unspecified memory effects (non-pure inline assembly or
+    external calls) get a warning, since their accesses are not checked, and
+    their count is recorded in the module attribute `tti.gsan_unchecked_ops`.
+  }];
+}
+
 #endif

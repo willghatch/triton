@@ -119,3 +119,52 @@ We may want to consider adding more memory primitives:
 3. Atomic reduce operations e.g. `tl.reduce_add(ptr, 1, sem=”release”, scope=”sys”)`
 
 These would allow more efficient communication patterns by minimizing the synchronization effects of operations. For example, fence \+ relaxed atomic store allows more memory ops to be placed in-between without causing over-synchronization.
+
+# **5\. AMD gfx950 prototype**
+
+GSan also runs, as a prototype, on AMD gfx950 (MI350-series, wave64) with a single GPU.
+It supports ordinary global `tl.load`/`tl.store`, atomic RMW/CAS, atomic load/store/poll, and launches on ordinary streams with memory from the GSan allocator.
+Buffer-op conversion, async copies, and ping-pong scheduling are disabled under GSan; Gluon buffer ops, async copies, TDM, warp specialization, `num_ctas > 1`, other AMD targets, combining GSan with AddressSanitizer, and HIP graph capture are rejected with an error.
+A detected race prints `GSan device assertion failed: '<kind> race detected' at <file>:<line>` and aborts the process (device trap), so run failing cases in a subprocess.
+
+Known limitations:
+
+* Shadow state has 4-byte granularity: unsynchronized writes to different bytes of one 4-byte word are reported as a race.
+* Only same-stream launch order creates happens-before between kernels; event waits (e.g. `wait_stream`) and host synchronization do not, so cross-stream accesses ordered only by them are reported.
+* Blocks are identified by slots of a fixed table (`TRITON_GSAN_NUM_SLOTS`, default up to 512). A block that takes over a slot from an earlier block, in any kernel or stream, shares that block's identity (its epoch), so the earlier block's accesses look like its own and are treated as ordered. Slots are chosen by hash, so a race between two blocks that do not run concurrently is missed with probability about 1/num_slots per racing pair; grids larger than the slot count have many such pairs.
+* Instrumented kernels are about three to four orders of magnitude slower and reserve the maximum LDS, so one block runs per CU.
+
+## **5.1 Build and test from a fresh checkout**
+
+These commands assume a gfx950 machine with a ROCm build of PyTorch whose bundled HIP runtime Triton uses (validated with `torch 2.15.0a0+rocm10.1.0a20260822`).
+The AMD build compiles the GSan device library (`third_party/amd/backend/lib/gsan.bc`) with the `clang++` from Triton's LLVM; the host allocator is compiled on first use with the system C++ compiler.
+
+```bash
+git clone https://github.com/triton-lang/triton.git && cd triton
+# In a fresh virtualenv; the validated PyTorch build came from:
+pip install --index-url https://rocm.nightlies.amd.com/whl-multi-arch/ "torch[device-gfx950]==2.15.0a0+rocm10.1.0a20260822"
+pip install -r python/requirements.txt
+pip install -e . --no-build-isolation
+pip install -r python/test-requirements.txt
+export HIP_VISIBLE_DEVICES=0
+# Without this, every reported race writes a large GPU core dump into the cwd.
+export HSA_DISABLE_COREDUMP_ON_EXCEPTION=1
+pytest -s --tb=short python/test/gsan/
+# Compiler-only tests (no GPU); run from the CMake build directory.
+cd build/cmake.linux-x86_64-cpython-3.*
+lit -v test/TritonGPU/amd/amd-gsan-reject-unsupported.mlir test/Conversion/amd/tritongpu_to_llvm_gsan.mlir \
+    test/TritonGPU/gsan.mlir test/Conversion/tritongpu_to_llvm_gsan.mlir
+```
+
+To sanitize your own kernels, allocate their tensors from a GSan memory pool and enable the instrumentation mode:
+
+```python
+import torch, triton
+from triton.experimental.gsan import create_mem_pool
+
+triton.knobs.compilation.instrumentation_mode = "gsan"  # or TRITON_INSTRUMENTATION_MODE=gsan
+with torch.cuda.use_mem_pool(create_mem_pool()):
+    x = torch.zeros(1024, device="cuda")
+    my_kernel[grid](x, ...)
+    torch.cuda.synchronize()
+```

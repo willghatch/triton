@@ -6,6 +6,7 @@ import triton
 from pathlib import Path
 from triton import knobs
 from triton._C.libtriton import amd
+from triton._instrumentation import is_enabled
 from triton.backends.compiler import GPUTarget
 from triton.backends.driver import (
     GPUDriver,
@@ -25,6 +26,8 @@ PyKernelArg = None
 ARG_CONSTEXPR = None
 ARG_KERNEL = None
 ARG_TUPLE = None
+# Must match gsan::kPerDeviceStateStride in GSan.h.
+GSAN_PER_DEVICE_STATE_STRIDE = 1 << 30
 
 
 def _find_already_mmapped_dylib_on_linux(lib_name):
@@ -166,6 +169,7 @@ class HIPUtils(object):
         self.create_tdm_descriptor = mod.create_tdm_descriptor
         self.launch = mod.launch
         self.build_signature_metadata = mod.build_signature_metadata
+        self.is_stream_capturing = mod.is_stream_capturing
         global PyTDMDescriptor
         global PyKernelArg
         global ARG_CONSTEXPR
@@ -278,6 +282,15 @@ class HIPLauncher(object):
     def __init__(self, src, metadata):
         signature = dict(src.signature)
         tensordesc_meta = getattr(metadata, "tensordesc_meta", None)
+
+        # GSan-instrumented kernels take three extra arguments after the user
+        # arguments (and before the scratch pointers), as on NVIDIA.
+        self.gsan_enabled = is_enabled(metadata, "gsan")
+        if self.gsan_enabled:
+            signature["_gsan_globals_ptr"] = "*i8"
+            signature["_gsan_stream_clock_ptr"] = "*i32"
+            signature["_gsan_kernel_id"] = "i64"
+
         tensordesc_abi = TensorDescABI.HIP_TDM if tensordesc_meta else TensorDescABI.DECOMPOSED
         utils = triton.runtime.driver.active.utils
         expanded_signature = expand_signature(signature.values(), tensordesc_abi)
@@ -326,9 +339,22 @@ class HIPLauncher(object):
         else:
             profile_scratch = allocate_default_profile_scratch(self.profile_scratch_size, self.profile_scratch_align)
 
+        kernel_args = args
+        if self.gsan_enabled:
+            if active_driver.utils.is_stream_capturing(stream):
+                raise RuntimeError("GSan does not support HIP graph capture")
+
+            import triton.experimental.gsan._allocator as gsan_allocator
+            import triton.experimental.gsan._stream_sync as gsan_stream_sync
+            device = active_driver.get_current_device()
+            device_rank = gsan_allocator.get_device_rank(device)
+            gsan_state_ptr = gsan_allocator.get_global_state_pointer() + device_rank * GSAN_PER_DEVICE_STATE_STRIDE
+            stream_clock, kernel_id = gsan_stream_sync.get_launch_stream_clock(device, stream)
+            kernel_args = (*args, gsan_state_ptr, stream_clock, kernel_id)
+
         self.launch(self.launch_cooperative_grid, gridX, gridY, gridZ, stream, function, global_scratch,
                     profile_scratch, kernel_metadata, launch_metadata, launch_enter_hook, launch_exit_hook,
-                    self.warp_size, self.arg_annotations, self.kernel_signature, args)
+                    self.warp_size, self.arg_annotations, self.kernel_signature, kernel_args)
 
 
 class HIPDriver(GPUDriver):

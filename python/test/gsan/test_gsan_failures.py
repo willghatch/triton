@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import functools
 import inspect
+import os
 from pathlib import Path
 
 import pytest
@@ -18,12 +19,22 @@ from triton.experimental.gluon.language.nvidia.blackwell import (
     tcgen05_mma,
 )
 
-from triton._internal_testing import is_blackwell, is_cuda, is_hopper_or_newer, run_in_process
+from triton._internal_testing import is_blackwell, is_cuda, is_hip, is_hip_cdna4, is_hopper_or_newer, run_in_process
 from triton.experimental.gsan import create_mem_pool
 from triton.experimental.gsan._testing_utils import atomic_poll, shadow_cell_from_address
 from triton.tools.tensor_descriptor import TensorDescriptor
 
-pytestmark = pytest.mark.skipif(not is_cuda(), reason="requires CUDA backend")
+pytestmark = pytest.mark.skipif(not (is_cuda() or is_hip_cdna4()), reason="requires CUDA or AMD gfx950 backend")
+
+# On AMD, a GSan race report traps on the device, which aborts the whole
+# process and by default writes a large, slow GPU core dump into the cwd.
+# The runtime reads this knob when HSA initializes, which happens while the
+# subprocess imports this module, so it must already be in the environment the
+# subprocess (forkserver) inherits. This changes the environment of the whole
+# pytest session, which only affects HSA exception handling.
+if is_hip():
+    os.environ.setdefault("HSA_DISABLE_COREDUMP_ON_EXCEPTION", "1")
+HIP_DEFAULT_PROCESS_TIMEOUT_S = "300"
 
 RELEASE_ACQUIRE_SYNC_CASES = (
     pytest.param("release", "acquire", id="release-acquire"),
@@ -82,6 +93,40 @@ def _waw_kernel(ptr, scratch_ptr, counter_ptr, WIDTH: gl.constexpr):
         while gl.atomic_add(counter_ptr, 0, sem="relaxed") != 1:
             pass
         gl.store(ptr + offsets, 2)
+
+
+@triton.jit
+def _store_after_all_blocks_arrive_kernel(ptr, value, arrived_ptr, BLOCK: tl.constexpr):
+    # Keep every block resident until all have started, so the blocks of a
+    # launch hold distinct GSan identities; relaxed atomics add no ordering.
+    tl.atomic_add(arrived_ptr, 1, sem="relaxed")
+    atomic_poll(arrived_ptr, tl.num_programs(0))
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    tl.store(ptr + offsets, value)
+
+
+@triton.jit
+def _release_loop_kernel(flag_ptr, num_iters):
+    for _ in range(num_iters):
+        tl.atomic_add(flag_ptr, 1, sem="release")
+
+
+@triton.jit
+def _relaxed_cas_handoff_kernel(payload_ptr, flag_ptr, arrived_ptr, out_ptr):
+    pid = tl.program_id(0)
+    if pid == 0:
+        # Wait until the consumer is resident, so it cannot take over this
+        # block's GSan identity (slot) after it exits and miss the race.
+        atomic_poll(arrived_ptr, 1)
+        tl.store(payload_ptr, 42)
+        tl.atomic_cas(flag_ptr, 0, 1, sem="release")
+    else:
+        tl.atomic_add(arrived_ptr, 1, sem="relaxed")
+        # A relaxed CAS observes the flag but does not acquire the payload.
+        seen = tl.atomic_cas(flag_ptr, 1, 1, sem="relaxed")
+        while seen != 1:
+            seen = tl.atomic_cas(flag_ptr, 1, 1, sem="relaxed")
+        tl.store(out_ptr, tl.load(payload_ptr))
 
 
 @triton.jit
@@ -499,6 +544,42 @@ def _run_pdl_persistent_state_without_wait_case() -> None:
 
 
 @run_with_gsan
+def _run_independent_streams_waw_case() -> None:
+    num_blocks = 4
+    target = torch.zeros(num_blocks, dtype=torch.int32, device="cuda")
+    arrived = torch.zeros(2, dtype=torch.int32, device="cuda")
+    # The side streams do not wait for the zero fills (which GSan does not see).
+    torch.cuda.synchronize()
+    # Nothing orders the two side streams, whichever kernel runs first.
+    with torch.cuda.stream(torch.cuda.Stream()):
+        _store_after_all_blocks_arrive_kernel[(1, )](target, 1, arrived[0:1], BLOCK=num_blocks, num_warps=1)
+    # A block that takes over the first launch's GSan identity (slot) shares
+    # its epoch, so the earlier store looks like its own and is not reported.
+    # The co-resident blocks of this launch hold distinct slots, so at most
+    # one of them can (this needs at least 4 free slots; with fewer, slot
+    # acquisition fails after 20 s).
+    with torch.cuda.stream(torch.cuda.Stream()):
+        _store_after_all_blocks_arrive_kernel[(num_blocks, )](target, 2, arrived[1:2], BLOCK=1, num_warps=1)
+
+
+@run_with_gsan
+def _run_relaxed_cas_handoff_case() -> None:
+    payload = torch.zeros(1, dtype=torch.int32, device="cuda")
+    flag = torch.zeros(1, dtype=torch.int32, device="cuda")
+    arrived = torch.zeros(1, dtype=torch.int32, device="cuda")
+    out = torch.zeros(1, dtype=torch.int32, device="cuda")
+    _relaxed_cas_handoff_kernel[(2, )](payload, flag, arrived, out, num_warps=1)
+
+
+@run_with_gsan
+def _run_release_epoch_overflow_case() -> None:
+    flag = torch.zeros(1, dtype=torch.int32, device="cuda")
+    # Every release advances the block's 16-bit epoch; wrapping it silently
+    # would make later accesses look ordered.
+    _release_loop_kernel[(1, )](flag, 70000, num_warps=1)
+
+
+@run_with_gsan
 def _run_mixed_scope_release_rmw_case() -> None:
     counter = torch.zeros(1, dtype=torch.int32, device="cuda")
     ready = torch.zeros(1, dtype=torch.int32, device="cuda")
@@ -721,11 +802,25 @@ def _run_failure_case(case: str, shadow_granularity: int | None = None, *, runne
 
     if shadow_granularity is not None:
         runner_kwargs = {**(runner_kwargs or {}), "shadow_granularity": shadow_granularity}
-    result = run_in_process(runner, runner_args, runner_kwargs)
+    if runner_kwargs is None:
+        runner_kwargs = {}
+
+    if is_hip():
+        # A hang (e.g. a lock-progress bug) must fail the test, not block it.
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setenv("TRITON_TEST_PROCESS_TIMEOUT",
+                      os.environ.get("TRITON_TEST_PROCESS_TIMEOUT", HIP_DEFAULT_PROCESS_TIMEOUT_S))
+            result = run_in_process(runner, runner_args, runner_kwargs, allow_abort=True)
+    else:
+        result = run_in_process(runner, runner_args, runner_kwargs)
     print(result.driver_stderr_output)
     assert isinstance(result.exc, RuntimeError), (f"case={case} completed without the expected GSan failure\n"
                                                   f"exc={result.exc!r}\n"
                                                   f"driver stderr:\n{result.driver_stderr_output}")
+    if is_hip():
+        # The device trap aborts the process with a signal; a Python-level
+        # failure would exit normally with a nonzero code.
+        assert getattr(result.exc, "exitcode", 0) < 0, f"case={case} did not abort via a signal: {result.exc!r}"
     assert "GSanLibrary.cu" not in result.driver_stderr_output
     assert Path(inspect.getsourcefile(source_function)).name in result.driver_stderr_output
     assert _expected_file_line(source_function, marker) in result.driver_stderr_output
@@ -895,6 +990,24 @@ def test_explicit_graph_programmatic_edge_requires_wait(missing_wait):
         runner_args=("missing_wait" if missing_wait else "before_wait", ), source_function=source.fn,
         marker="def _pdl_conditional_wait_kernel" if missing_wait else "values = tl.load(payload_ptr + offsets)",
         error="did not call gdc_wait" if missing_wait else "Read after write race detected")
+
+
+def test_independent_streams_write_after_write():
+    _run_failure_case("independent_streams_waw", runner=_run_independent_streams_waw_case,
+                      source_function=_store_after_all_blocks_arrive_kernel.fn, marker="tl.store(ptr + offsets, value)",
+                      error="Write after write race detected")
+
+
+def test_release_epoch_overflow_is_reported():
+    _run_failure_case("release_epoch_overflow", runner=_run_release_epoch_overflow_case,
+                      source_function=_release_loop_kernel.fn, marker="tl.atomic_add(flag_ptr, 1",
+                      error="Vector clock overflowed")
+
+
+def test_relaxed_cas_handoff_read_after_write():
+    _run_failure_case("relaxed_cas_handoff", runner=_run_relaxed_cas_handoff_case,
+                      source_function=_relaxed_cas_handoff_kernel.fn, marker="tl.store(out_ptr, tl.load(payload_ptr))",
+                      error="Read after write race detected")
 
 
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="PDL requires SM90 or newer")

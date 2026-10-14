@@ -3,6 +3,7 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
+from triton.language import target_info
 
 from ._allocator import get_global_state_pointer
 from triton._C.libtriton.gsan_testing import is_write_once_address, shadow_cell_size, shadow_granularity, thread_state_address, PER_DEVICE_STATE_STRIDE_BYTES, GLOBAL_STATE_SIZE_BYTES, shadow_cell_address, thread_state_stride_bytes
@@ -13,7 +14,13 @@ from ._utils import uint8_cuda_tensor_from_ptr
 @triton.jit
 def nanosleep(duration):
     duration = tl.to_tensor(duration)
-    tl.inline_asm_elementwise("nanosleep.u32 $1; mov.b32 $0, 0;", "=r, r", [duration], tl.int32, is_pure=False, pack=1)
+    if target_info.is_hip():
+        # s_sleep takes an immediate (units of 64 clocks), so the duration is
+        # only a hint here.
+        tl.inline_asm_elementwise("s_sleep 2\nv_mov_b32 $0, 0", "=v, v", [duration], tl.int32, is_pure=False, pack=1)
+    else:
+        tl.inline_asm_elementwise("nanosleep.u32 $1; mov.b32 $0, 0;", "=r, r", [duration], tl.int32, is_pure=False,
+                                  pack=1)
 
 
 @triton.jit

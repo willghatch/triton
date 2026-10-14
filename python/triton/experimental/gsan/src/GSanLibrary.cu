@@ -2,6 +2,73 @@
 #include "Hash.cuh"
 #include "TMA.cuh"
 
+// The algorithm below is shared between targets. Target-specific primitives
+// live in the adapter sections guarded by GSAN_AMDGPU:
+// - NVIDIA: built as CUDA device code (one identity per SM).
+// - AMD: built as freestanding amdgcn C++ (identity = slot table entry, see
+//   SlotEntry in GSan.h). Lanes of a wave cannot spin on each other's locks,
+//   so load/store checks lock wave-cooperatively (tensorAccessCooperative)
+//   and other per-lane locking paths run lane by lane (forEachLaneSerially,
+//   and compiler-emitted atomics).
+#if defined(__AMDGCN__)
+#define GSAN_AMDGPU 1
+#else
+#define GSAN_AMDGPU 0
+#endif
+
+#if GSAN_AMDGPU
+extern "C" {
+GSAN_DEVICE __UINT64_TYPE__ __ockl_fprintf_stderr_begin();
+GSAN_DEVICE __UINT64_TYPE__
+__ockl_printf_append_string_n(__UINT64_TYPE__ msgDesc, const char *data,
+                              __UINT64_TYPE__ length, __UINT32_TYPE__ isLast);
+GSAN_DEVICE __UINT64_TYPE__ __ockl_printf_append_args(
+    __UINT64_TYPE__ msgDesc, __UINT32_TYPE__ numArgs, __UINT64_TYPE__ value0,
+    __UINT64_TYPE__ value1, __UINT64_TYPE__ value2, __UINT64_TYPE__ value3,
+    __UINT64_TYPE__ value4, __UINT64_TYPE__ value5, __UINT64_TYPE__ value6,
+    __UINT32_TYPE__ isLast);
+// No clang builtins exist for these (s_memrealtime needs -mcpu); the generic
+// bitcode calls the intrinsics directly.
+GSAN_DEVICE __UINT64_TYPE__ gsanDispatchId() __asm("llvm.amdgcn.dispatch.id");
+GSAN_DEVICE __UINT64_TYPE__ gsanRealtime() __asm("llvm.amdgcn.s.memrealtime");
+}
+
+static GSAN_DEVICE __UINT64_TYPE__ gsanStrlenWithNul(const char *s) {
+  __UINT64_TYPE__ n = 0;
+  while (s[n] != '\0')
+    ++n;
+  return n + 1;
+}
+
+static GSAN_DEVICE inline __UINT32_TYPE__ gsanLaneId() {
+  return __builtin_amdgcn_mbcnt_hi(~0u, __builtin_amdgcn_mbcnt_lo(~0u, 0u));
+}
+
+// Kept out of line so the hostcall code is not duplicated at every check.
+__attribute__((noinline, cold)) static GSAN_DEVICE void
+gsanPrintAssert(const char *assertion, const char *file, unsigned line) {
+  const char *fmt = "GSan device assertion failed: '%s' at %s:%u\n";
+  auto desc = __ockl_fprintf_stderr_begin();
+  desc = __ockl_printf_append_string_n(desc, fmt, gsanStrlenWithNul(fmt), 0);
+  desc = __ockl_printf_append_string_n(desc, assertion,
+                                       gsanStrlenWithNul(assertion), 0);
+  desc = __ockl_printf_append_string_n(desc, file, gsanStrlenWithNul(file), 0);
+  __ockl_printf_append_args(desc, 1, line, 0, 0, 0, 0, 0, 0, 1);
+}
+
+// Print the failure once per wave (lowest active lane) via hostcall, then
+// trap. The trap aborts the process (HSA exception), so a failure is fatal.
+// "s_trap 2" is used instead of __builtin_trap, which is noreturn and lets
+// StructurizeCFG move the trap past the waterfall convergence points.
+static GSAN_DEVICE void __assert_fail(const char *assertion, const char *file,
+                                      unsigned line, const char *function) {
+  (void)function;
+  __UINT64_TYPE__ exec = __builtin_amdgcn_read_exec();
+  if (gsanLaneId() == static_cast<__UINT32_TYPE__>(__builtin_ctzll(exec)))
+    gsanPrintAssert(assertion, file, line);
+  __asm__ volatile("s_trap 2" ::: "memory");
+}
+#else
 extern "C" GSAN_DEVICE void __assertfail(const char *assertion,
                                          const char *file, unsigned line,
                                          const char *function,
@@ -12,6 +79,7 @@ static GSAN_DEVICE inline void __assert_fail(const char *assertion,
                                              const char *function) {
   __assertfail(assertion, file, line, function, sizeof(char));
 }
+#endif
 
 namespace gsan {
 
@@ -95,7 +163,149 @@ GSAN_DEVICE inline uintptr_t roundUp(uintptr_t ptr, uintptr_t align) {
   return ptr % align == 0 ? ptr : ptr + align - (ptr % align);
 }
 
-GSAN_DEVICE uint32_t getSmId() { return __nvvm_read_ptx_sreg_smid(); }
+////////////////////////////////////////////
+// Target adapter
+////////////////////////////////////////////
+
+#if GSAN_AMDGPU
+
+static constexpr uint32_t kWaveSize = 64;
+
+// Shadow-cell locks use agent scope when the runtime manages one GPU: on
+// gfx950, system-scope acquire/release adds L2 writeback/invalidate to every
+// cell access. With several GPUs, peers may lock the same cells, so system
+// scope is required. Multi-GPU use is unverified on AMD: system scope is
+// necessary, but peer CAS coherence on VMM shadow memory is untested (the
+// host allocator warns once).
+GSAN_DEVICE bool useSystemScopeShadowLocks(ThreadState *state) {
+  return getGlobalState(state)->numDevices > 1;
+}
+
+GSAN_DEVICE uint32_t getLaneId() { return gsanLaneId(); }
+
+// Whole-workgroup barrier; AMD has no named or partial barriers. The fences
+// are agent scope so that the slot hand-off at kernel exit also publishes
+// thread-state writes of all waves (the next owner may run on another XCD).
+GSAN_DEVICE void syncThreads(uint32_t barrierId, uint32_t numThreads) {
+  (void)barrierId;
+  (void)numThreads;
+  __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
+  __builtin_amdgcn_s_barrier();
+  __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+}
+
+GSAN_DEVICE void atomicMaxRelaxedGpu(uint32_t *ptr, uint32_t value) {
+  __scoped_atomic_fetch_max(ptr, value, __ATOMIC_RELAXED,
+                            __MEMORY_SCOPE_DEVICE);
+}
+
+// Run f() for every active lane, one lane at a time (a "waterfall"). Used for
+// entry points whose code takes blocking per-lane shadow/state locks (the
+// descriptor checks; not reachable on AMD in M1). If lanes of one wave spun
+// on a lock held by another lane of the same wave, the wave would deadlock (no
+// independent forward progress of lanes on AMD). Only the leader lane runs,
+// so it may spin. The leader is derived from a ballot, so it is wave-uniform.
+template <typename F> GSAN_DEVICE void forEachLaneSerially(F &&f) {
+  uint32_t laneId = getLaneId();
+  bool pending = true;
+  while (true) {
+    uint64_t mask = __builtin_amdgcn_ballot_w64(pending);
+    if (mask == 0)
+      break;
+    if (laneId == static_cast<uint32_t>(__builtin_ctzll(mask))) {
+      f();
+      pending = false;
+    }
+  }
+}
+
+// Workgroup-uniform hash of a key that is unique among live blocks (AQL
+// packet address, dispatch ID, workgroup ID). It only spreads blocks over the
+// slot table; ownership comes from the CAS in acquireSlot.
+GSAN_DEVICE uint32_t getSlotHint(uint32_t numSlots) {
+  uint32_t h = 0x9747b28cu;
+  h = hash_combine32(h, __builtin_amdgcn_workgroup_id_x());
+  h = hash_combine32(h, __builtin_amdgcn_workgroup_id_y());
+  h = hash_combine32(h, __builtin_amdgcn_workgroup_id_z());
+  h = hash_combine32(
+      h, static_cast<uint32_t>(
+             reinterpret_cast<uint64_t>(__builtin_amdgcn_dispatch_ptr()) >> 6));
+  h = hash_combine32(h, static_cast<uint32_t>(gsanDispatchId()));
+  return hash_finalize32(h) % numSlots;
+}
+
+// The block's slot index, written by __triton_gsan_init before its final
+// barrier and read by every later runtime call of the block. LDS is per
+// workgroup, so all waves agree, and it moves with the block under CWSR.
+// This is the only static LDS the runtime uses (4 bytes; the static segment
+// is padded to 16 bytes when the kernel also uses Triton's dynamic LDS).
+[[clang::loader_uninitialized]] static
+    __attribute__((address_space(3))) uint32_t gsanBlockSlot;
+
+static constexpr uint64_t kSlotAcquireTimeoutTicks =
+    20ull * 100 * 1000 * 1000; // 20 s of the 100 MHz s_memrealtime clock
+
+// Called by one thread of the block at kernel entry. Waits while all slots
+// are taken: slots are released by blocks that finish, which is enough as
+// long as no kernel needs more co-resident blocks than there are slots. A
+// kernel that does (e.g. blocks spinning on each other) fails with a
+// diagnostic instead of hanging.
+GSAN_DEVICE void acquireSlot(GlobalState *globals, Location loc) {
+  auto *table = getSlotTable(globals);
+  uint32_t numSlots = globals->numSms;
+  uint32_t idx = getSlotHint(numSlots);
+  uint64_t start = gsanRealtime();
+  for (uint32_t probes = 1;; ++probes) {
+    uint32_t expected = kSlotFree;
+    if (__scoped_atomic_load_n(&table[idx].state, __ATOMIC_RELAXED,
+                               __MEMORY_SCOPE_DEVICE) == kSlotFree &&
+        __scoped_atomic_compare_exchange_n(
+            &table[idx].state, &expected, kSlotTaken, false, __ATOMIC_ACQUIRE,
+            __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE))
+      break;
+    idx = idx + 1 == numSlots ? 0 : idx + 1;
+    if (probes % 64 == 0) {
+      __builtin_amdgcn_s_sleep(8);
+      assert_msg(loc, gsanRealtime() - start < kSlotAcquireTimeoutTicks,
+                 "GSan slot table exhausted: no free slot for 20 s; more "
+                 "co-resident blocks than TRITON_GSAN_NUM_SLOTS (kernels that "
+                 "wait on other blocks are not supported)");
+    }
+  }
+  // Diagnostic only (not used for lookup): record the owner.
+  auto &entry = table[idx];
+  entry.workgroupId[0] = __builtin_amdgcn_workgroup_id_x();
+  entry.workgroupId[1] = __builtin_amdgcn_workgroup_id_y();
+  entry.workgroupId[2] = __builtin_amdgcn_workgroup_id_z();
+  entry.dispatchPtr =
+      reinterpret_cast<uint64_t>(__builtin_amdgcn_dispatch_ptr());
+  entry.dispatchId = gsanDispatchId();
+  gsanBlockSlot = idx;
+}
+
+// Called by one thread of the block after the final barrier at kernel exit.
+// The release store hands the slot's thread state to the next owner.
+GSAN_DEVICE void releaseSlot(GlobalState *globals) {
+  __scoped_atomic_store_n(&getSlotTable(globals)[gsanBlockSlot].state,
+                          kSlotFree, __ATOMIC_RELEASE, __MEMORY_SCOPE_DEVICE);
+}
+
+// Identity index of the calling block within its device. NVIDIA: the SM id.
+// AMD: the slot acquired at kernel entry.
+GSAN_DEVICE uint32_t getSmId(GlobalState *) { return gsanBlockSlot; }
+
+#else // NVIDIA
+
+static constexpr uint32_t kWaveSize = 32;
+
+GSAN_DEVICE bool useSystemScopeShadowLocks(ThreadState *) { return true; }
+
+GSAN_DEVICE uint32_t getLaneId() { return __nvvm_read_ptx_sreg_laneid(); }
+
+// Identity index of the calling block within its device: the SM id.
+GSAN_DEVICE uint32_t getSmId(GlobalState *) {
+  return __nvvm_read_ptx_sreg_smid();
+}
 
 GSAN_DEVICE void syncThreads(uint32_t barrierId, uint32_t numThreads) {
   asm volatile("barrier.sync %0, %1;"
@@ -104,23 +314,24 @@ GSAN_DEVICE void syncThreads(uint32_t barrierId, uint32_t numThreads) {
                : "memory");
 }
 
-GSAN_DEVICE uintptr_t getThreadStateStrideBytes(GlobalState *globals) {
-  auto clocksPerThread = 1u + globals->clockBufferSize;
-  return sizeof(ThreadState) +
-         sizeof(epoch_t) * globals->numThreads * clocksPerThread;
+GSAN_DEVICE void atomicMaxRelaxedGpu(uint32_t *ptr, uint32_t value) {
+  asm volatile("red.relaxed.gpu.max.u32 [%0], %1;"
+               :
+               : "l"(ptr), "r"(value)
+               : "memory");
 }
+
+// Lanes of a warp make independent forward progress, so per-lane locking is
+// safe as is.
+template <typename F> GSAN_DEVICE void forEachLaneSerially(F &&f) { f(); }
+
+#endif
 
 GSAN_DEVICE thread_id_t getDeviceThreadId(GlobalState *globals, uint32_t smid) {
   auto globalsBase = static_cast<uintptr_t>(globals->globalsBase);
   auto deviceBase = reinterpret_cast<uintptr_t>(globals);
   auto deviceIdx = (deviceBase - globalsBase) / kPerDeviceStateStride;
   return static_cast<thread_id_t>(deviceIdx * globals->numSms + smid);
-}
-
-GSAN_DEVICE uintptr_t getThreadStateBaseAddress(uintptr_t globalsAddr) {
-  uintptr_t stateBase = globalsAddr;
-  stateBase = roundUp(stateBase + sizeof(GlobalState), alignof(ThreadState));
-  return stateBase;
 }
 
 GSAN_DEVICE ThreadState *getThreadStateById(GlobalState *globals,
@@ -135,7 +346,7 @@ GSAN_DEVICE ThreadState *getThreadStateById(GlobalState *globals,
 }
 
 GSAN_DEVICE ThreadState *getThreadState(GlobalState *globals) {
-  uint32_t smid = getSmId();
+  uint32_t smid = getSmId(globals);
   uintptr_t stateBase =
       getThreadStateBaseAddress(reinterpret_cast<uintptr_t>(globals));
   auto stateStride = getThreadStateStrideBytes(globals);
@@ -288,10 +499,7 @@ GSAN_DEVICE void publishLaunchClock(ThreadState *state,
   auto *globals = getGlobalState(state);
   for (int i = threadIdx; i < globals->numThreads; i += numThreads) {
     uint32_t current = state->vectorClock[i];
-    asm volatile("red.relaxed.gpu.max.u32 [%0], %1;"
-                 :
-                 : "l"(completionClock + i), "r"(current)
-                 : "memory");
+    atomicMaxRelaxedGpu(completionClock + i, current);
   }
 
   syncThreads(barrierId, numThreads);
@@ -302,6 +510,15 @@ GSAN_DEVICE void publishLaunchClock(ThreadState *state,
 GSAN_DEVICE void initThread(GlobalState *globals, const LaunchState &launch,
                             uint32_t threadIdx, uint32_t numThreads,
                             uint32_t barrierId, Location loc) {
+#if GSAN_AMDGPU
+  // The runtime is built as generic amdgcn bitcode but assumes wave64.
+  assert_msg(loc, __builtin_amdgcn_wavefrontsize() == kWaveSize,
+             "GSan on AMD requires wave64");
+  // Take exclusive ownership of an identity before touching its state.
+  if (threadIdx == 0)
+    acquireSlot(globals, loc);
+  syncThreads(barrierId, numThreads);
+#endif
   auto *state = getThreadState(globals);
   if (threadIdx == 0) {
     rwLockAcquireWrite(state->lock);
@@ -314,7 +531,7 @@ GSAN_DEVICE void initThread(GlobalState *globals, const LaunchState &launch,
       state->clockBufferDirty = 0;
       state->gdcWaitCalled = 0;
       state->clockBufferHead = 0;
-      state->threadId = getDeviceThreadId(globals, getSmId());
+      state->threadId = getDeviceThreadId(globals, getSmId(globals));
       __scoped_atomic_store_n(&state->globals, globals, __ATOMIC_RELEASE,
                               __MEMORY_SCOPE_DEVICE);
     }
@@ -377,18 +594,36 @@ GSAN_DEVICE void checkAtomicGranularity(int granularity, int bytesPerElem,
              "GSan shadow granularity exceeds atomic access size");
 }
 
-GSAN_DEVICE ShadowCell *acquireShadow(uintptr_t shadowAddr) {
+template <int Scope> GSAN_DEVICE bool tryAcquireShadowScoped(ShadowCell *cell) {
+  return (__scoped_atomic_fetch_or(&cell->readCountAndLock,
+                                   ShadowCell::kLockBit, __ATOMIC_ACQUIRE,
+                                   Scope) &
+          ShadowCell::kLockBit) == 0;
+}
+
+// One attempt to lock the cell with a 32-bit CAS on the (numReads, lock) word.
+GSAN_DEVICE bool tryAcquireShadow(ShadowCell *cell, bool systemScope) {
+  return systemScope ? tryAcquireShadowScoped<__MEMORY_SCOPE_SYSTEM>(cell)
+                     : tryAcquireShadowScoped<__MEMORY_SCOPE_DEVICE>(cell);
+}
+
+// Blocking lock. On AMD, callers must not spin here while another lane of the
+// same wave holds a shadow lock (no independent lane progress); see
+// forEachLaneSerially and tensorAccessCooperative.
+GSAN_DEVICE ShadowCell *acquireShadow(uintptr_t shadowAddr, bool systemScope) {
   auto cell = reinterpret_cast<ShadowCell *>(shadowAddr);
-  while (__scoped_atomic_fetch_or(&cell->readCountAndLock, ShadowCell::kLockBit,
-                                  __ATOMIC_ACQUIRE, __MEMORY_SCOPE_SYSTEM) &
-         ShadowCell::kLockBit) {
+  while (!tryAcquireShadow(cell, systemScope)) {
   }
   return cell;
 }
 
-GSAN_DEVICE void releaseShadow(ShadowCell *cell) {
-  __scoped_atomic_fetch_and(&cell->readCountAndLock, ~ShadowCell::kLockBit,
-                            __ATOMIC_RELEASE, __MEMORY_SCOPE_SYSTEM);
+GSAN_DEVICE void releaseShadow(ShadowCell *cell, bool systemScope) {
+  if (systemScope)
+    __scoped_atomic_fetch_and(&cell->readCountAndLock, ~ShadowCell::kLockBit,
+                              __ATOMIC_RELEASE, __MEMORY_SCOPE_SYSTEM);
+  else
+    __scoped_atomic_fetch_and(&cell->readCountAndLock, ~ShadowCell::kLockBit,
+                              __ATOMIC_RELEASE, __MEMORY_SCOPE_DEVICE);
 }
 
 GSAN_DEVICE epoch_t appendClockBufferSnapshot(ThreadState *state,
@@ -868,15 +1103,16 @@ GSAN_DEVICE void writeRange(ThreadState *state, uintptr_t write_addr,
     return;
   checkCoarseAccess(write_addr, nBytes, granularity, loc);
 
+  bool systemScope = useSystemScopeShadowLocks(state);
   for (uintptr_t addr = range.start; addr < range.end; addr += granularity) {
     auto shadowAddr = getShadowAddress(addr);
     if (writeOnce) {
       doWrite(state, reinterpret_cast<WriteOnceShadowCell *>(shadowAddr), loc);
       continue;
     }
-    auto cell = acquireShadow(shadowAddr);
+    auto cell = acquireShadow(shadowAddr, systemScope);
     doWrite(state, cell, loc);
-    releaseShadow(cell);
+    releaseShadow(cell, systemScope);
   }
 }
 
@@ -901,6 +1137,99 @@ GSAN_DEVICE void tensorStore(ThreadState *state, const char *stackPtr,
     rwLockReleaseRead(state->lock);
 }
 
+#if GSAN_AMDGPU
+GSAN_DEVICE void doRead(ThreadState *state, ShadowCell *cell, Location loc);
+
+// Wave-cooperative tl.load/tl.store check (AMD). Each lane walks its own
+// shadow cells; in every round each lane makes one try-lock attempt and, on
+// success, checks, updates, and releases the cell in the same round. The loop
+// runs until no lane of the wave has work left (wave-uniform exit), so a lane
+// never waits for a lock held by a lane of its own wave across rounds, and
+// lanes on distinct cells proceed in parallel. (Lane-serial waterfalling
+// would also be deadlock-free but costs one full lock round trip per lane.)
+//
+// Hot cells (e.g. every lane loading one scalar): in each round, lanes whose
+// current cell is the first active lane's cell do not compete; they skip
+// that cell once the leader has processed it. Repeating the same check and
+// update of one cell by the same identity within one access has no effect
+// (apart from inflating numReads). Rounds where no lane got a lock back off.
+template <bool IsStore>
+GSAN_DEVICE void tensorAccessCooperative(ThreadState *state,
+                                         const char *stackPtr, int nElems,
+                                         int bytesPerElem, Location loc) {
+  const uintptr_t *ptrsPtr = reinterpret_cast<const uintptr_t *>(stackPtr);
+  const char *maskPtr = stackPtr + nElems * sizeof(uintptr_t);
+  uintptr_t reserveBase = state->reserveBase;
+  uintptr_t reserveEnd = reserveBase + kReserveSize;
+  int elem = 0;
+  uintptr_t addr = 0;
+  uintptr_t end = 0;
+  // Advance to the next masked element with GSan-managed cells.
+  auto nextElement = [&]() {
+    while (elem < nElems) {
+      int i = elem++;
+      if (!maskPtr[i])
+        continue;
+      int granularity = isGsanManaged(ptrsPtr[i], reserveBase)
+                            ? getShadowGranularity(ptrsPtr[i])
+                            : kShadowMemGranularityBytes;
+      auto range = roundRange(
+          Range{ptrsPtr[i], ptrsPtr[i] + bytesPerElem}, granularity);
+      addr = range.start < reserveBase ? reserveBase : range.start;
+      end = range.end < reserveEnd ? range.end : reserveEnd;
+      if (addr < end)
+        return true;
+    }
+    return false;
+  };
+  bool active = nextElement();
+  // Lanes hold no shadow locks while waiting for the state read lock.
+  bool acquired = active;
+  if (acquired)
+    rwLockAcquireRead(state->lock);
+  bool systemScope = useSystemScopeShadowLocks(state);
+  uint32_t laneId = getLaneId();
+  while (true) {
+    uint64_t activeMask = __builtin_amdgcn_ballot_w64(active);
+    if (activeMask == 0)
+      break;
+    // Wave-uniform leader and its current address.
+    int leader = __builtin_ctzll(activeMask);
+    uintptr_t leaderAddr =
+        static_cast<uintptr_t>(static_cast<uint32_t>(__builtin_amdgcn_readlane(
+            static_cast<int>(static_cast<uint32_t>(addr)), leader))) |
+        (static_cast<uintptr_t>(static_cast<uint32_t>(__builtin_amdgcn_readlane(
+             static_cast<int>(static_cast<uint32_t>(addr >> 32)), leader)))
+         << 32);
+    bool follower =
+        active && laneId != static_cast<uint32_t>(leader) && addr == leaderAddr;
+    bool locked = false;
+    if (active && !follower) {
+      auto *cell = reinterpret_cast<ShadowCell *>(getShadowAddress(addr));
+      if (tryAcquireShadow(cell, systemScope)) {
+        if (IsStore)
+          doWrite(state, cell, loc);
+        else
+          doRead(state, cell, loc);
+        releaseShadow(cell, systemScope);
+        locked = true;
+      }
+    }
+    uint64_t lockedMask = __builtin_amdgcn_ballot_w64(locked);
+    bool leaderLocked = (lockedMask >> leader) & 1;
+    if (locked || (follower && leaderLocked)) {
+      addr += kShadowMemGranularityBytes;
+      if (addr >= end)
+        active = nextElement();
+    }
+    if (lockedMask == 0)
+      __builtin_amdgcn_s_sleep(1);
+  }
+  if (acquired)
+    rwLockReleaseRead(state->lock);
+}
+#endif
+
 GSAN_DEVICE void doRead(ThreadState *state, ShadowCell *cell, Location loc) {
   assertOrderedOrCompatible(state, AtomicScope::NonAtomic, cell->writeClock,
                             loc, "Read after write race detected");
@@ -922,15 +1251,16 @@ GSAN_DEVICE void readRange(ThreadState *state, uintptr_t read_addr, int nBytes,
     return;
   checkCoarseAccess(read_addr, nBytes, granularity, loc);
 
+  bool systemScope = useSystemScopeShadowLocks(state);
   for (uintptr_t addr = range.start; addr < range.end; addr += granularity) {
     auto shadowAddr = getShadowAddress(addr);
     if (writeOnce) {
       doRead(state, reinterpret_cast<WriteOnceShadowCell *>(shadowAddr), loc);
       continue;
     }
-    auto cell = acquireShadow(shadowAddr);
+    auto cell = acquireShadow(shadowAddr, systemScope);
     doRead(state, cell, loc);
-    releaseShadow(cell);
+    releaseShadow(cell, systemScope);
   }
 }
 
@@ -957,8 +1287,8 @@ GSAN_DEVICE void tensorLoad(ThreadState *state, const char *stackPtr,
 
 template <typename ElementHandler>
 GSAN_DEVICE void tensorAccessRow(uintptr_t rowPtr, int rowBytes,
-                                 int elementGranularity,
-                                 ElementHandler &handleElement) {
+                                  int elementGranularity,
+                                  ElementHandler &handleElement) {
   uintptr_t reserveBase = handleElement.reserveBase;
   if (!isGsanManaged(rowPtr, reserveBase))
     return;
@@ -973,9 +1303,9 @@ GSAN_DEVICE void tensorAccessRow(uintptr_t rowPtr, int rowBytes,
     elementGranularity = roundUp(elementGranularity, granularity);
   }
   auto range = roundRange(Range{rowPtr, rowPtr + rowBytes}, granularity);
-  uint32_t laneId = __nvvm_read_ptx_sreg_laneid();
+  uint32_t laneId = getLaneId();
   for (uintptr_t addr = range.start + laneId * elementGranularity;
-       addr < range.end; addr += 32 * elementGranularity)
+       addr < range.end; addr += kWaveSize * elementGranularity)
     handleElement(addr);
 }
 
@@ -1106,9 +1436,10 @@ template <typename ShadowCellHandler> struct NonAtomicElementHandler {
       handleShadowCell(state, cell, loc);
       return;
     }
-    auto cell = acquireShadow(getShadowAddress(address));
+    bool systemScope = useSystemScopeShadowLocks(state);
+    auto cell = acquireShadow(getShadowAddress(address), systemScope);
     handleShadowCell(state, cell, loc);
-    releaseShadow(cell);
+    releaseShadow(cell, systemScope);
   }
 };
 
@@ -1184,7 +1515,8 @@ GSAN_DEVICE void acquireAtomicShadowRange(ThreadState *state,
   for (uintptr_t addr = range.start; addr < range.end; addr += granularity) {
     if (!isGsanManaged(addr, reserveBase))
       continue;
-    event->cells[event->numCells++] = acquireShadow(getShadowAddress(addr));
+    event->cells[event->numCells++] =
+        acquireShadow(getShadowAddress(addr), useSystemScopeShadowLocks(state));
   }
 }
 
@@ -1192,7 +1524,8 @@ GSAN_DEVICE void releaseAtomicShadowRange(AtomicEventState *event) {
   if (event->threadState == nullptr)
     return;
   for (uint8_t i = 0; i < event->numCells; ++i)
-    releaseShadow(event->cells[i]);
+    releaseShadow(event->cells[i],
+                  useSystemScopeShadowLocks(event->threadState));
   rwLockReleaseWrite(event->threadState->lock);
   initAtomicEventState(event);
 }
@@ -1326,7 +1659,12 @@ __triton_gsan_load_tensor(void *globalState, const char *stackPtr, int numElems,
   auto loc = gsan::Location{file, line};
   auto *threadState =
       gsan::getThreadState(reinterpret_cast<gsan::GlobalState *>(globalState));
+#if GSAN_AMDGPU
+  gsan::tensorAccessCooperative<false>(threadState, stackPtr, numElems,
+                                       bytesPerElem, loc);
+#else
   gsan::tensorLoad(threadState, stackPtr, numElems, bytesPerElem, loc);
+#endif
 }
 
 extern "C" GSAN_DEVICE void __triton_gsan_load_tensor_desc(
@@ -1338,9 +1676,11 @@ extern "C" GSAN_DEVICE void __triton_gsan_load_tensor_desc(
   auto loc = gsan::Location{file, line};
   auto *threadState =
       gsan::getThreadState(reinterpret_cast<gsan::GlobalState *>(globalState));
-  gsan::tensorNonAtomicDesc(threadState, descriptor, coords, rank, blockShape,
-                            bytesPerElem, warpId, numWarps, loc,
-                            gsan::ReadShadowCellHandler{});
+  gsan::forEachLaneSerially([&] {
+    gsan::tensorNonAtomicDesc(threadState, descriptor, coords, rank, blockShape,
+                              bytesPerElem, warpId, numWarps, loc,
+                              gsan::ReadShadowCellHandler{});
+  });
 }
 
 extern "C" GSAN_DEVICE void __triton_gsan_load_indexed_tensor_desc(
@@ -1350,9 +1690,11 @@ extern "C" GSAN_DEVICE void __triton_gsan_load_indexed_tensor_desc(
   auto loc = gsan::Location{file, line};
   auto *threadState =
       gsan::getThreadState(reinterpret_cast<gsan::GlobalState *>(globalState));
-  gsan::tensorNonAtomicIndexedDesc(threadState, descriptor, indices, numIndices,
-                                   yOffset, numCols, bytesPerElem, pred, loc,
-                                   gsan::ReadShadowCellHandler{});
+  gsan::forEachLaneSerially([&] {
+    gsan::tensorNonAtomicIndexedDesc(threadState, descriptor, indices,
+                                     numIndices, yOffset, numCols, bytesPerElem,
+                                     pred, loc, gsan::ReadShadowCellHandler{});
+  });
 }
 
 extern "C" GSAN_DEVICE void
@@ -1375,6 +1717,12 @@ extern "C" GSAN_DEVICE void __triton_gsan_kernel_exit(
   auto *state = gsan::getThreadState(globals);
   gsan::publishLaunchClock(state, launchTable[launchIndex].completionClock,
                            threadIdx, numThreads, barrierId, loc);
+#if GSAN_AMDGPU
+  // publishStreamClock ends with a barrier after the last state use of all
+  // waves, and thread 0 released its read lock before this.
+  if (threadIdx == 0)
+    gsan::releaseSlot(globals);
+#endif
 }
 
 extern "C" GSAN_DEVICE void __triton_gsan_grid_dependency_wait(
@@ -1452,7 +1800,12 @@ __triton_gsan_store_tensor(void *globalState, const char *stackPtr,
   auto loc = gsan::Location{file, line};
   auto *threadState =
       gsan::getThreadState(reinterpret_cast<gsan::GlobalState *>(globalState));
+#if GSAN_AMDGPU
+  gsan::tensorAccessCooperative<true>(threadState, stackPtr, numElems,
+                                      bytesPerElem, loc);
+#else
   gsan::tensorStore(threadState, stackPtr, numElems, bytesPerElem, loc);
+#endif
 }
 
 extern "C" GSAN_DEVICE void __triton_gsan_store_tensor_desc(
@@ -1464,9 +1817,11 @@ extern "C" GSAN_DEVICE void __triton_gsan_store_tensor_desc(
   auto loc = gsan::Location{file, line};
   auto *threadState =
       gsan::getThreadState(reinterpret_cast<gsan::GlobalState *>(globalState));
-  gsan::tensorNonAtomicDesc(threadState, descriptor, coords, rank, blockShape,
-                            bytesPerElem, warpId, numWarps, loc,
-                            gsan::WriteShadowCellHandler{});
+  gsan::forEachLaneSerially([&] {
+    gsan::tensorNonAtomicDesc(threadState, descriptor, coords, rank, blockShape,
+                              bytesPerElem, warpId, numWarps, loc,
+                              gsan::WriteShadowCellHandler{});
+  });
 }
 
 extern "C" GSAN_DEVICE void __triton_gsan_store_indexed_tensor_desc(
@@ -1476,9 +1831,11 @@ extern "C" GSAN_DEVICE void __triton_gsan_store_indexed_tensor_desc(
   auto loc = gsan::Location{file, line};
   auto *threadState =
       gsan::getThreadState(reinterpret_cast<gsan::GlobalState *>(globalState));
-  gsan::tensorNonAtomicIndexedDesc(threadState, descriptor, indices, numIndices,
-                                   yOffset, numCols, bytesPerElem, pred, loc,
-                                   gsan::WriteShadowCellHandler{});
+  gsan::forEachLaneSerially([&] {
+    gsan::tensorNonAtomicIndexedDesc(threadState, descriptor, indices,
+                                     numIndices, yOffset, numCols, bytesPerElem,
+                                     pred, loc, gsan::WriteShadowCellHandler{});
+  });
 }
 
 extern "C" GSAN_DEVICE void __triton_gsan_atomic_tensor_desc(
@@ -1487,8 +1844,10 @@ extern "C" GSAN_DEVICE void __triton_gsan_atomic_tensor_desc(
     int warpId, int numWarps, const char *file, unsigned line) {
   auto loc = gsan::Location{file, line};
   auto *globals = reinterpret_cast<gsan::GlobalState *>(globalState);
-  gsan::tensorAtomicDesc(globals, descriptor, coords, rank, blockShape,
-                         bytesPerElem, sem, scope, warpId, numWarps, loc);
+  gsan::forEachLaneSerially([&] {
+    gsan::tensorAtomicDesc(globals, descriptor, coords, rank, blockShape,
+                           bytesPerElem, sem, scope, warpId, numWarps, loc);
+  });
 }
 
 extern "C" GSAN_DEVICE void
