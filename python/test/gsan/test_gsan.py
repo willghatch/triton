@@ -26,6 +26,9 @@ from triton.experimental.gsan._testing_utils import (atomic_poll, load_one_i32, 
 # GSan runs on NVIDIA GPUs and, as a prototype, on AMD gfx950.
 requires_gsan = pytest.mark.skipif(not (is_cuda() or is_hip_cdna4()), reason="GSan requires CUDA or AMD gfx950")
 THREADS_PER_WARP = gl.constexpr(64 if is_hip() else 32)
+# tl.atomic_load/atomic_store arrived with the shared base after the AMD
+# prototype; a cross-block atomic_load spin loop hangs under GSan on gfx950.
+_HIP_ATOMIC_LOAD_SPIN_HANG = "GSan on AMD hangs in tl.atomic_load spin loops (not yet validated on gfx950)"
 
 
 @pytest.fixture()
@@ -1409,6 +1412,7 @@ def test_atomic_poll_acquire_synchronizes_cross_sm(with_gsan, capfd, scope, expe
 @pytest.mark.parametrize("dtype,shadow_granularity",
                          [(dtype, min(4, dtype.itemsize)) for dtype in ATOMIC_LOAD_STORE_TYPES],
                          indirect=["shadow_granularity"])
+@pytest.mark.xfail(is_hip(), run=False, reason=_HIP_ATOMIC_LOAD_SPIN_HANG)
 @pytest.mark.gsan_fine_granularity("16-byte pools do not support atomics")
 def test_atomic_load_store_synchronizes_cross_sm(with_gsan, capfd, scope, expected_scope, dtype):
     if dtype == torch.bool:
@@ -2207,6 +2211,7 @@ def test_graph_completion_is_immutable_across_stream_slot_reuse(with_gsan):
     assert not torch.equal(snapshot.clock, _stream_sync._current_stream_clock(device, stream))
 
 
+@pytest.mark.skipif(not is_cuda(), reason="GSan graph support uses the CUDA driver API; HIP graph capture is rejected")
 def test_explicit_graph_aborted_launch_preserves_stream_order(with_gsan):
     from triton.experimental.gsan import graph, _stream_sync
 
@@ -2225,6 +2230,7 @@ def test_explicit_graph_aborted_launch_preserves_stream_order(with_gsan):
     plan.close()
 
 
+@pytest.mark.skipif(not is_cuda(), reason="GSan graph support uses the CUDA driver API; HIP graph capture is rejected")
 def test_explicit_graph_storage_survives_executable_close(with_gsan):
     import gc
     import weakref

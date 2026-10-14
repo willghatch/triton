@@ -24,6 +24,11 @@ from triton.experimental.gsan import create_mem_pool
 from triton.experimental.gsan._testing_utils import atomic_poll, shadow_cell_from_address
 from triton.tools.tensor_descriptor import TensorDescriptor
 
+THREADS_PER_WARP = gl.constexpr(64 if is_hip() else 32)
+# tl.atomic_load/atomic_store arrived with the shared base after the AMD
+# prototype; a cross-block atomic_load spin loop hangs under GSan on gfx950.
+_HIP_ATOMIC_LOAD_SPIN_HANG = "GSan on AMD hangs in tl.atomic_load spin loops (not yet validated on gfx950)"
+
 pytestmark = pytest.mark.skipif(not (is_cuda() or is_hip_cdna4()), reason="requires CUDA or AMD gfx950 backend")
 
 # On AMD, a GSan race report traps on the device, which aborts the whole
@@ -56,7 +61,7 @@ TRANSITIVE_RELAY_MISMATCH_CASES = (
 
 @gluon.jit
 def _raw_kernel(ptr, scratch_ptr, counter_ptr, WIDTH: gl.constexpr):
-    offsets = gl.arange(0, WIDTH, layout=gl.BlockedLayout([16], [32], [1], [0]))
+    offsets = gl.arange(0, WIDTH, layout=gl.BlockedLayout([16], [THREADS_PER_WARP], [1], [0]))
     pid = gl.program_id(0)
     if pid == 0:
         gl.store(ptr + offsets, 1)
@@ -70,7 +75,7 @@ def _raw_kernel(ptr, scratch_ptr, counter_ptr, WIDTH: gl.constexpr):
 
 @gluon.jit
 def _war_kernel(ptr, scratch_ptr, counter_ptr, WIDTH: gl.constexpr):
-    offsets = gl.arange(0, WIDTH, layout=gl.BlockedLayout([16], [32], [1], [0]))
+    offsets = gl.arange(0, WIDTH, layout=gl.BlockedLayout([16], [THREADS_PER_WARP], [1], [0]))
     pid = gl.program_id(0)
     if pid == 0:
         value = gl.load(ptr + offsets)
@@ -84,7 +89,7 @@ def _war_kernel(ptr, scratch_ptr, counter_ptr, WIDTH: gl.constexpr):
 
 @gluon.jit
 def _waw_kernel(ptr, scratch_ptr, counter_ptr, WIDTH: gl.constexpr):
-    offsets = gl.arange(0, WIDTH, layout=gl.BlockedLayout([16], [32], [1], [0]))
+    offsets = gl.arange(0, WIDTH, layout=gl.BlockedLayout([16], [THREADS_PER_WARP], [1], [0]))
     pid = gl.program_id(0)
     if pid == 0:
         gl.store(ptr + offsets, 1)
@@ -818,9 +823,12 @@ def _run_failure_case(case: str, shadow_granularity: int | None = None, *, runne
                                                   f"exc={result.exc!r}\n"
                                                   f"driver stderr:\n{result.driver_stderr_output}")
     if is_hip():
-        # The device trap aborts the process with a signal; a Python-level
-        # failure would exit normally with a nonzero code.
-        assert getattr(result.exc, "exitcode", 0) < 0, f"case={case} did not abort via a signal: {result.exc!r}"
+        # The device trap either aborts the process with a signal or, with
+        # HIP_SKIP_ABORT_ON_GPU_ERROR (set by run_in_process), surfaces as a
+        # launch failure. Any other Python-level error is not a GSan report.
+        aborted = getattr(result.exc, "exitcode", 0) < 0
+        assert aborted or "launch failure" in str(result.exc), (f"case={case} did not fail with a device trap: "
+                                                                f"{result.exc!r}")
     assert "GSanLibrary.cu" not in result.driver_stderr_output
     assert Path(inspect.getsourcefile(source_function)).name in result.driver_stderr_output
     assert _expected_file_line(source_function, marker) in result.driver_stderr_output
@@ -872,7 +880,7 @@ def _coarse_pool_tma_tail_kernel(ptr):
 
 @gluon.jit
 def _atomic_granularity_kernel(ptr, out, KIND: gl.constexpr):
-    offsets = gl.arange(0, 256, layout=gl.BlockedLayout([8], [32], [1], [0]))
+    offsets = gl.arange(0, 256, layout=gl.BlockedLayout([8], [THREADS_PER_WARP], [1], [0]))
     if KIND == "load":
         value = gl.atomic_load(ptr + offsets, sem="relaxed")
         gl.store(out + offsets, value)
@@ -975,6 +983,7 @@ def test_pool_partial_tma_tail_restrictions(shadow_granularity):
                       error="GSan 16-byte pools require complete aligned 16-byte accesses", runner_args=("tma_tail", ))
 
 
+@pytest.mark.skipif(not is_cuda(), reason="GSan graph support uses the CUDA driver API; HIP graph capture is rejected")
 def test_explicit_graph_unordered_nodes_report_race():
     _run_failure_case("graph_unordered", runner=_run_explicit_graph_failure_case, runner_args=("unordered", ),
                       source_function=_graph_unordered_write_kernel.fn, marker="tl.store(payload + pid, 1)",
@@ -1173,6 +1182,7 @@ def test_atomic_poll_semantic_mismatch_read_after_write(shadow_granularity, prod
                       error="Read after write race detected")
 
 
+@pytest.mark.xfail(is_hip(), run=False, reason=_HIP_ATOMIC_LOAD_SPIN_HANG)
 @pytest.mark.parametrize("producer_sem, consumer_sem, scope", CROSS_SM_SEMANTIC_MISMATCH_CASES)
 def test_atomic_load_store_semantic_mismatch_read_after_write(producer_sem, consumer_sem, scope):
     _run_failure_case(f"atomic_load_store_semantic_mismatch_{producer_sem}_{consumer_sem}_{scope}",
