@@ -129,10 +129,12 @@ A detected race prints `GSan device assertion failed: '<kind> race detected' at 
 
 Known limitations:
 
-* Shadow state has 4-byte granularity: unsynchronized writes to different bytes of one 4-byte word are reported as a race.
+* Default pools have 4-byte shadow granularity: unsynchronized writes to different bytes of one 4-byte word are reported as a race. Pools from `create_mem_pool(shadow_granularity=1)` (or 2) track finer cells.
 * Only same-stream launch order creates happens-before between kernels; event waits (e.g. `wait_stream`) and host synchronization do not, so cross-stream accesses ordered only by them are reported.
 * Blocks are identified by slots of a fixed table (`num_slots` or `TRITON_GSAN_NUM_SLOTS`, default up to 512). When the runtime state would not fit in 1 GiB per device, the default slot count shrinks, but not below the CU count; then the default clock buffer shrinks instead. The allocator prints a note when it picks fewer slots than CUs or fewer than 1024 clock-buffer entries. A block that takes over a slot from an earlier block, in any kernel or stream, shares that block's identity (its epoch), so the earlier block's accesses look like its own and are treated as ordered. Slots are chosen by hash, so a race between two blocks that do not run concurrently is missed with probability about 1/num_slots per racing pair; grids larger than the slot count have many such pairs.
 * Instrumented kernels are about three to four orders of magnitude slower and reserve the maximum LDS, so one block runs per CU.
+* A block that spins on `tl.atomic_load` waiting for another block hangs under GSan; the cause is not yet known. Spin with an atomic RMW (e.g. `tl.atomic_add(ptr, 0)`) or `tl.atomic_poll` instead.
+* Write-once memory pools and the explicit graph API (`triton.experimental.gsan.graph`) are untested on AMD; the graph API uses the CUDA driver.
 
 ## **5.1 Build and test from a fresh checkout**
 
