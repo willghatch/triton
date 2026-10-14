@@ -947,10 +947,16 @@ def test_gsan_amd_rejects_gluon_buffer_ops(with_gsan, capfd):
     assert "GSan on AMD cannot check global-memory operation 'amdg.buffer_load'" in captured.err
 
 
+@triton.jit
+def _gsan_empty_tl_kernel(out_ptr):
+    # Wave-size agnostic, unlike the Gluon _gsan_empty_kernel's 32-lane layout.
+    tl.store(out_ptr, 0)
+
+
 @pytest.mark.skipif(not is_hip_cdna4(), reason="AMD gfx950 GSan LDS reservation")
 def test_gsan_uses_all_available_shared_memory(with_gsan):
     out = torch.empty(4, dtype=torch.int32, device="cuda")
-    compiled = _gsan_empty_kernel.warmup(out, grid=(1, ))
+    compiled = _gsan_empty_tl_kernel.warmup(out, grid=(1, ))
 
     device = triton.runtime.driver.active.get_current_device()
     max_shared = triton.runtime.driver.active.utils.get_device_properties(device)["max_shared_mem"]
