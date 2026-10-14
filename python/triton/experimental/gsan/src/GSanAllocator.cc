@@ -80,10 +80,12 @@ struct GSanConfig {
 
 struct AllocatorState {
   // User memory + shadow memory
+  drv::Reservation reserve;
   uintptr_t reserveBaseAddress = 0;
   AllocNode treeRoots[gsan::kNumPools];
 
   // GSan global state
+  drv::Reservation globalsReserve;
   uintptr_t globalStateAddress = 0;
   drv::Handle perDeviceHandles[gsan::kMaxGPUs] = {0};
   size_t perDeviceStateSize = 0;
@@ -206,25 +208,42 @@ int gsanEnsureInit() {
   if (alloc)
     return 0;
 
-  uintptr_t reserveBase;
-  drv::Result err =
-      drv::addressReserve(&reserveBase, /*size*/ gsan::kReserveSize,
-                          /*alignment*/ gsan::kReserveSize);
+  // The shadow translation in GSan.h requires both reservations to be aligned
+  // to their size. Check rather than trust the driver.
+  drv::Reservation reserve;
+  drv::Result err = drv::addressReserve(&reserve, /*size*/ gsan::kReserveSize,
+                                        /*alignment*/ gsan::kReserveSize);
   if (err != drv::kSuccess) {
     printDriverError(err);
+    return -1;
+  }
+  if (reserve.base % gsan::kReserveSize != 0) {
+    fprintf(stderr, "gsan allocator: misaligned memory reservation\n");
+    (void)drv::addressFree(reserve);
     return -1;
   }
 
-  uintptr_t globalsBase;
-  err = drv::addressReserve(&globalsBase, /*size*/ gsan::kGlobalsReserveSize,
+  drv::Reservation globalsReserve;
+  err = drv::addressReserve(&globalsReserve,
+                            /*size*/ gsan::kGlobalsReserveSize,
                             /*alignment*/ gsan::kGlobalsReserveSize);
   if (err != drv::kSuccess) {
     printDriverError(err);
+    (void)drv::addressFree(reserve);
+    return -1;
+  }
+  if (globalsReserve.base % gsan::kGlobalsReserveSize != 0) {
+    fprintf(stderr, "gsan allocator: misaligned globals reservation\n");
+    (void)drv::addressFree(globalsReserve);
+    (void)drv::addressFree(reserve);
     return -1;
   }
   alloc = new AllocatorState();
-  alloc->reserveBaseAddress = reserveBase;
-  alloc->globalStateAddress = globalsBase;
+  alloc->reserve = reserve;
+  alloc->reserveBaseAddress = reserve.base;
+  alloc->globalsReserve = globalsReserve;
+  alloc->globalStateAddress = globalsReserve.base;
+  const uintptr_t reserveBase = reserve.base;
 
   for (int i = 0; i < gsan::kNumPools; ++i) {
     bool writeOnce = (i & 1) != 0;
@@ -413,9 +432,36 @@ error:
   return err;
 }
 
+// Grants `device` access to user memory at [addr, addr + size). With
+// `hostAccess`, also tries to grant host access where the backend supports
+// it, falling back to device-only access.
+drv::Result setUserMemoryAccess(uintptr_t addr, size_t size, int device,
+                                bool hostAccess) {
+  if (drv::kSupportsHostAccess && hostAccess) {
+    drv::Result err =
+        drv::memSetAccess(addr, size, device, /*hostAccess*/ true);
+    if (err == drv::kSuccess)
+      return err;
+    static bool warned = false;
+    if (!warned) {
+      warned = true;
+      fprintf(stderr,
+              "gsan allocator: cannot grant host access to GSan memory (%s); "
+              "falling back to device-only access. On large-BAR GPUs, ROCm "
+              "PyTorch may then crash in Tensor.item() on GSan tensors.\n",
+              drv::errorString(err));
+    }
+  }
+  return drv::memSetAccess(addr, size, device);
+}
+
+// Maps an allocation's real and shadow memory. `hostAccess` requests host
+// access to the real memory (see setUserMemoryAccess); imported allocations
+// never back caching-allocator tensors, and HIP rejects host access to them.
 drv::Result mapNodeHandles(AllocNode *node, drv::Handle realHandle,
                            drv::Handle shadowHandle, size_t allocSize,
-                           int device, bool *realMapped, bool *shadowMapped) {
+                           int device, bool *realMapped, bool *shadowMapped,
+                           bool hostAccess) {
   assert(node != nullptr);
   assert(realMapped != nullptr);
   assert(shadowMapped != nullptr);
@@ -433,10 +479,12 @@ drv::Result mapNodeHandles(AllocNode *node, drv::Handle realHandle,
     return err;
   *shadowMapped = true;
 
-  err = drv::memSetAccess(node->virtualAddress, allocSize, device);
+  err =
+      setUserMemoryAccess(node->virtualAddress, allocSize, device, hostAccess);
   if (err != drv::kSuccess)
     return err;
 
+  // Shadow memory stays device-only.
   err = drv::memSetAccess(shadowAddress, shadowSize, device);
   if (err != drv::kSuccess)
     return err;
@@ -469,7 +517,8 @@ void *gsanMallocWithGranularity(ssize_t size, int device, void *stream,
   if (gsanEnsureInit() != 0)
     return nullptr;
 
-  drv::Result err = drv::ensureCurrentDevice(device);
+  drv::DeviceScope deviceScope;
+  drv::Result err = deviceScope.enter(device);
   if (err != drv::kSuccess) {
     printDriverError(err);
     return nullptr;
@@ -515,7 +564,7 @@ void *gsanMallocWithGranularity(ssize_t size, int device, void *stream,
     goto error;
 
   err = mapNodeHandles(node, realHandle, shadowHandle, allocSize, device,
-                       &realMapped, &shadowMapped);
+                       &realMapped, &shadowMapped, /*hostAccess*/ true);
   if (err != drv::kSuccess)
     goto error;
 
@@ -743,7 +792,8 @@ int gsanExportRuntimeStateHandle(int device,
   std::lock_guard lg(mut);
   if (gsanEnsureInit() != 0)
     return -1;
-  drv::Result err = drv::ensureCurrentDevice(device);
+  drv::DeviceScope deviceScope;
+  drv::Result err = deviceScope.enter(device);
   if (err != drv::kSuccess) {
     printDriverError(err);
     return -1;
@@ -790,7 +840,8 @@ gsanImportAllocationHandles(const GSanShareableHandle *realShareableHandle,
   std::lock_guard lg(mut);
   if (gsanEnsureInit() != 0)
     return nullptr;
-  drv::Result err = drv::ensureCurrentDevice(device);
+  drv::DeviceScope deviceScope;
+  drv::Result err = deviceScope.enter(device);
   if (err != drv::kSuccess) {
     printDriverError(err);
     return nullptr;
@@ -825,7 +876,7 @@ gsanImportAllocationHandles(const GSanShareableHandle *realShareableHandle,
     goto error;
 
   err = mapNodeHandles(node, realHandle, shadowHandle, allocSize, device,
-                       &realMapped, &shadowMapped);
+                       &realMapped, &shadowMapped, /*hostAccess*/ false);
   if (err != drv::kSuccess)
     goto error;
 
@@ -858,7 +909,8 @@ int gsanImportRuntimeStateHandle(const GSanShareableHandle *shareableHandle,
   std::lock_guard lg(mut);
   if (gsanEnsureInit() != 0)
     return -1;
-  drv::Result err = drv::ensureCurrentDevice(device);
+  drv::DeviceScope deviceScope;
+  drv::Result err = deviceScope.enter(device);
   if (err != drv::kSuccess) {
     printDriverError(err);
     return -1;
