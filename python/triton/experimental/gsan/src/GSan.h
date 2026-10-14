@@ -81,6 +81,8 @@ struct GlobalState {
 
   uint32_t rngSeed;
 
+  // Number of execution identities per device. On NVIDIA, one per SM. On AMD,
+  // the number of entries in the slot table (see SlotEntry).
   thread_id_t numSms;
   thread_id_t numDevices;
   // numThreads = numSms * numDevices
@@ -115,6 +117,30 @@ struct ThreadState {
 
 // The widest supported scalar atomic is eight bytes, including in byte pools.
 static constexpr int kMaxAtomicShadowCells = 8;
+
+// AMD only: explicit execution-identity slots.
+//
+// AMD hardware placement IDs do not give a block exclusive ownership of its
+// state, since compute-wave save/restore can migrate a live block to another
+// CU. Instead, each block acquires a free slot at kernel entry and releases it
+// at kernel exit; the slot index is the block's identity (ThreadState index).
+//
+// The device runtime keeps the acquired slot index in a 4-byte static LDS
+// variable (padded to 16 bytes next to Triton's dynamic LDS) for the rest of
+// the block. Probing starts at a hash of the block's
+// dispatch and workgroup ID to spread blocks over the table.
+struct alignas(8) SlotEntry {
+  // kSlotFree or kSlotTaken; only this field synchronizes ownership.
+  uint32_t state;
+  // Last owner, for debugging only: written after acquisition, never read by
+  // the runtime.
+  uint32_t workgroupId[3];
+  uint64_t dispatchPtr;
+  uint64_t dispatchId;
+};
+static_assert(sizeof(SlotEntry) == 32);
+static constexpr uint32_t kSlotFree = 0;
+static constexpr uint32_t kSlotTaken = 1;
 
 struct AtomicEventState {
   ThreadState *threadState;
@@ -207,6 +233,45 @@ inline GSAN_HOST_DEVICE int getPoolIndex(uintptr_t address) {
 inline GSAN_HOST_DEVICE int getShadowGranularity(uintptr_t address) {
   int pool = getPoolIndex(address);
   return 1 << (pool >> 1);
+}
+
+inline GSAN_HOST_DEVICE uintptr_t roundUpTo(uintptr_t value, uintptr_t align) {
+  return value % align == 0 ? value : value + align - (value % align);
+}
+
+// Per-device state layout: GlobalState, numSms ThreadStates (each followed by
+// its vector clock and clock buffer), then (AMD) numSms SlotEntries.
+inline GSAN_HOST_DEVICE uintptr_t
+getThreadStateBaseAddress(uintptr_t globalsAddr) {
+  return roundUpTo(globalsAddr + sizeof(GlobalState), alignof(ThreadState));
+}
+
+inline GSAN_HOST_DEVICE uintptr_t
+getThreadStateStrideBytes(uint32_t numThreads, uint32_t clockBufferSize) {
+  auto clocksPerThread = 1u + clockBufferSize;
+  return roundUpTo(sizeof(ThreadState) +
+                       sizeof(epoch_t) * numThreads * clocksPerThread,
+                   alignof(ThreadState));
+}
+
+inline GSAN_HOST_DEVICE uintptr_t
+getThreadStateStrideBytes(const GlobalState *globals) {
+  return getThreadStateStrideBytes(globals->numThreads,
+                                   globals->clockBufferSize);
+}
+
+inline GSAN_HOST_DEVICE uintptr_t
+getSlotTableAddress(uintptr_t globalsAddr, uint32_t numSms, uint32_t numThreads,
+                    uint32_t clockBufferSize) {
+  auto end = getThreadStateBaseAddress(globalsAddr) +
+             numSms * getThreadStateStrideBytes(numThreads, clockBufferSize);
+  return roundUpTo(end, alignof(SlotEntry));
+}
+
+inline GSAN_HOST_DEVICE SlotEntry *getSlotTable(GlobalState *globals) {
+  return reinterpret_cast<SlotEntry *>(
+      getSlotTableAddress(reinterpret_cast<uintptr_t>(globals), globals->numSms,
+                          globals->numThreads, globals->clockBufferSize));
 }
 
 inline GSAN_HOST_DEVICE uintptr_t getRealBaseAddress(

@@ -398,7 +398,7 @@ class ReplenishingProcessPool:
         self.worker = None
         self.spare = None
 
-    def run(self, client_fn, args=(), kwargs=None, env=None):
+    def run(self, client_fn, args=(), kwargs=None, env=None, allow_abort=False):
         if kwargs is None:
             kwargs = {}
         self.start()
@@ -412,6 +412,11 @@ class ReplenishingProcessPool:
                 process.join()
                 with open(stderr_file, "r") as f:
                     stderr = f.read()
+                if allow_abort:
+                    task_pipe.close()
+                    self.worker = self.spare
+                    self.spare = self._start_process()
+                    return ProcessResult(_ChildProcessAbort(process.exitcode), stderr)
                 print(stderr, file=sys.stderr)
                 raise RuntimeError(
                     f"child process exited with code {process.exitcode} without returning a result") from None
@@ -439,11 +444,28 @@ def use_process_pool(preload_module):
         _PROCESS_POOL = None
 
 
-def run_in_process(client_fn, args=(), kwargs=None, env=None):
+class _ChildProcessAbort(RuntimeError):
+    """A run_in_process child died without reporting a result (e.g. a device trap aborted it)."""
+
+    def __init__(self, exitcode):
+        super().__init__(f"child process exited with code {exitcode} without returning a result")
+        self.exitcode = exitcode
+
+
+def run_in_process(client_fn, args=(), kwargs=None, env=None, allow_abort=False):
+    """Run client_fn in a subprocess and return its exception and captured stderr.
+
+    With allow_abort, a child that dies without reporting a result (for example,
+    an AMD device assert aborts the whole process) yields a ProcessResult whose
+    exc is a RuntimeError carrying the exit code, instead of raising.
+    Only the default (non-pool) path honors TRITON_TEST_PROCESS_TIMEOUT, and
+    with DISABLE_SUBPROCESS or compile warmup client_fn runs in this process,
+    so an abort kills the caller.
+    """
     if is_compile_warmup() or os.environ.get("DISABLE_SUBPROCESS"):
         return client_fn(*args, **(kwargs or {}))
     if _PROCESS_POOL is not None:
-        return _PROCESS_POOL.run(client_fn, args, kwargs, env)
+        return _PROCESS_POOL.run(client_fn, args, kwargs, env, allow_abort)
     if kwargs is None:
         kwargs = {}
 
@@ -470,6 +492,8 @@ def run_in_process(client_fn, args=(), kwargs=None, env=None):
             process.join()
             with open(stderr_file, "r") as f:
                 stderr = f.read()
+            if allow_abort:
+                return ProcessResult(_ChildProcessAbort(process.exitcode), stderr)
             print(stderr, file=sys.stderr)
             raise RuntimeError(
                 f"child process exited with code {process.exitcode} without returning a result") from None

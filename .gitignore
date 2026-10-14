@@ -76,6 +76,7 @@ third_party/nvidia/backend/lib/gsan-profile.ll
 third_party/amd/backend/lib/libtriton_amd_codegen.dylib
 third_party/amd/backend/lib/libtriton_amd_codegen.so
 third_party/amd/backend/lib/triton_amd_codegen.dll
+third_party/amd/backend/lib/gsan.bc
 
 # Docs
 docs/_build/

@@ -271,7 +271,9 @@ static const char *hipLibSearchPaths[] = {"/*py_libhip_search_path*/"};
                   unsigned int sharedMemBytes, hipStream_t stream,             \
                   void **kernelParams, void **extra)                           \
   FOR_EACH_ERR_FN(hipPointerGetAttribute, true, void *data,                    \
-                  hipPointer_attribute attribute, hipDeviceptr_t ptr)
+                  hipPointer_attribute attribute, hipDeviceptr_t ptr)          \
+  FOR_EACH_ERR_FN(hipStreamIsCapturing, false, hipStream_t stream,             \
+                  hipStreamCaptureStatus *pCaptureStatus)
 
 // HIP driver version format: HIP_VERSION_MAJOR * 10000000 + HIP_VERSION_MINOR *
 // 100000 + HIP_VERSION_PATCH.
@@ -460,6 +462,22 @@ static PyObject *getDeviceProperties(PyObject *self, PyObject *args) {
       props.memoryBusWidth, "arch", props.gcnArchName, "warpSize",
       props.warpSize, "max_threads_per_sm", props.maxThreadsPerMultiProcessor,
       "cooperativeLaunch", props.cooperativeLaunch);
+}
+
+static PyObject *isStreamCapturing(PyObject *self, PyObject *args) {
+  uint64_t stream;
+  if (!PyArg_ParseTuple(args, "K", &stream))
+    return NULL;
+  if (hipSymbolTable.hipStreamIsCapturing == NULL) {
+    PyErr_SetString(PyExc_RuntimeError,
+                    "hipStreamIsCapturing is not available in libamdhip64.so");
+    return NULL;
+  }
+
+  hipStreamCaptureStatus status;
+  HIP_CHECK_AND_RETURN_NULL(
+      hipSymbolTable.hipStreamIsCapturing((hipStream_t)stream, &status));
+  return PyBool_FromLong(status != hipStreamCaptureStatusNone);
 }
 
 static PyObject *loadBinary(PyObject *self, PyObject *args) {
@@ -1134,6 +1152,8 @@ static PyMethodDef ModuleMethods[] = {
      "unload provided module to free memory"},
     {"get_device_properties", getDeviceProperties, METH_VARARGS,
      "Get the properties for a given device"},
+    {"is_stream_capturing", isStreamCapturing, METH_VARARGS,
+     "Return whether a stream is capturing a HIP graph"},
     {"create_tdm_descriptor", createTDMDescriptor, METH_VARARGS,
      "create a host-side TDM descriptor"},
     {"build_signature_metadata", buildSignatureMetadata, METH_VARARGS,

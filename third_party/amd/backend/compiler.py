@@ -354,6 +354,34 @@ def is_consan_supported(base_arch):
     return base_arch == "gfx1250"
 
 
+# Per-workgroup LDS limit (bytes) of the architectures GSan supports. The
+# GSan device library is target-generic, but only gfx950 (wave64) has been
+# validated.
+_GSAN_LDS_LIMIT = {"gfx950": 160 * 1024}
+
+
+def is_gsan_supported(arch):
+    return arch in _GSAN_LDS_LIMIT
+
+
+def file_hash(path):
+    # Keyed on mtime so a rebuilt library is rehashed in a long-lived process.
+    return _file_hash(path, os.stat(path).st_mtime_ns)
+
+
+@functools.lru_cache(None)
+def _file_hash(path, mtime_ns):
+    with open(path, "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()
+
+
+def get_static_lds_size(amdgcn):
+    """Static LDS bytes of the kernel in an AMDGCN assembly listing."""
+    sizes = re.findall(r"\.amdhsa_group_segment_fixed_size\s+(\d+)", amdgcn)
+    assert len(sizes) == 1, "expected exactly one kernel descriptor"
+    return int(sizes[0])
+
+
 def _parse_llvm_key_values(attrs, bare_value=""):
     if not isinstance(attrs, str):
         return tuple(attrs)
@@ -364,12 +392,6 @@ def _parse_llvm_key_values(attrs, bare_value=""):
         if name:
             parsed.append((name, value.strip() if sep else bare_value))
     return tuple(parsed)
-
-
-@functools.lru_cache(None)
-def file_hash(path):
-    with open(path, "rb") as f:
-        return hashlib.sha256(f.read()).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -401,6 +423,10 @@ class HIPOptions:
     fpsan_homomorphic_casts: bool = False
     # WGP/CU execution mode for gfx11 and gfx120x; ignored on other targets.
     wgp_cu_mode: str = "wgp"
+    # GSan: total LDS each workgroup reserves, so that at most one GSan
+    # workgroup is resident per CU (bounds the number of live GSan slots).
+    # Always the target's per-workgroup LDS limit under GSan.
+    min_shared_mem: int = 0
 
     # Experimental hint for how the AMD backend schedules a kernel's instructions. The only
     # recognized value is "mfma-schedule" (gfx942 and gfx950): run the MFMA scheduler on the optimized
@@ -444,7 +470,27 @@ class HIPOptions:
         object.__setattr__(self, 'llvm_cl_opts', _parse_llvm_key_values(self.llvm_cl_opts, bare_value="true"))
 
         extern_libs = {} if self.extern_libs is None else dict(self.extern_libs)
+        if is_enabled(self, "gsan"):
+            if not is_gsan_supported(self.base_arch):
+                raise ValueError(f"GSan is not supported on {self.arch}; only gfx950 is supported")
+            if knobs.compilation.enable_asan:
+                raise ValueError("GSan cannot be combined with AddressSanitizer (TRITON_ENABLE_ASAN)")
+            if self.num_ctas > 1:
+                raise ValueError("GSan on AMD does not support num_ctas > 1")
+            # Derived from the target (not the current device) so AOT and
+            # arch-override compiles reserve the right amount.
+            object.__setattr__(self, 'min_shared_mem', _GSAN_LDS_LIMIT[self.base_arch])
+            # Built by Triton itself, so it is not affected by the bitcode path knob.
+            gsan_lib = Path(__file__).parent / "lib" / "gsan.bc"
+            if not gsan_lib.exists():
+                raise FileNotFoundError(f"GSan device library is missing at {gsan_lib}. "
+                                        "Rebuild Triton to generate it.")
+            # Must precede ocml/ockl: GSan calls into ockl, and libraries are
+            # linked in order with LinkOnlyNeeded.
+            extern_libs['gsan'] = str(gsan_lib)
         for lib in ["ocml", "ockl"]:
+            # Re-insert so they follow gsan even if the caller provided them.
+            extern_libs.pop(lib, None)
             extern_libs[lib] = get_amd_bitcode_path(lib)
         object.__setattr__(self, 'extern_libs', tuple(extern_libs.items()))
 
@@ -609,8 +655,14 @@ class HIPBackend(BaseBackend):
         passes.ttir.add_triton_licm(pm)
         passes.common.add_canonicalizer(pm)
 
-        use_async_copy = is_async_copy_enabled(options.base_arch)
-        use_block_pingpong = is_pingpong_schedule_enabled(options.arch, use_async_copy)
+        # The AMD GSan lowering checks tt.load/tt.store/atomics only; it does
+        # not model AMD buffer ops or async copies (no issue/completion window),
+        # so those lowerings are disabled under GSan. Block pingpong
+        # phase-shifts warps with conditional barriers, which GSan has not been
+        # validated with.
+        gsan = is_enabled(options, "gsan")
+        use_async_copy = is_async_copy_enabled(options.base_arch) and not gsan
+        use_block_pingpong = is_pingpong_schedule_enabled(options.base_arch, use_async_copy) and not gsan
         amd.passes.ttgpuir.add_optimize_descriptor_encoding(pm)
         amd.passes.ttgpuir.add_schedule_loops(pm, options.num_stages)
         amd.passes.ttgpuir.add_pipeline(pm, use_async_copy, use_block_pingpong)
@@ -627,7 +679,7 @@ class HIPBackend(BaseBackend):
         if use_block_pingpong and options.num_stages > 1:
             amd.passes.ttgpuir.add_block_pingpong(pm, options.num_stages)
 
-        if knobs.amd.use_buffer_ops:
+        if knobs.amd.use_buffer_ops and not gsan:
             amd.passes.ttgpuir.add_canonicalize_pointers(pm)
             passes.common.add_canonicalizer(pm)
             amd.passes.ttgpuir.add_convert_to_buffer_ops(
@@ -683,6 +735,22 @@ class HIPBackend(BaseBackend):
         # TritonGPU -> LLVM-IR (MLIR)
         pm = ir.pass_manager(mod.context)
         pm.enable_debug()
+
+        if is_enabled(options, "gsan"):
+            # Instrumentation happens only here: kernels whose LLIR/AMDGCN is
+            # supplied directly (TRITON_KERNEL_OVERRIDE, stage hooks replacing
+            # this stage, compiling from .llir/.amdgcn) run unchecked, as do
+            # global accesses added later by the "ttgpuir-to-llvmir"
+            # instrumentation hook.
+            # Fail clearly on global-memory ops GSan cannot check (e.g. Gluon
+            # buffer ops/async copies) before instrumenting.
+            amd.passes.ttgpuir.add_gsan_reject_unsupported(pm)
+            # GSan introduces layout conversions and atomics needing LDS
+            # scratch, so it must run before shared-memory allocation.
+            # AMD has no programmatic dependent launch.
+            mod.set_attr("tti.gsan_launch_pdl", ir.builder(mod.context).get_int32_attr(0))
+            passes.ttgpuir.add_global_sanitizer(pm)
+
         amd.passes.ttgpuir.add_update_async_wait_count(pm, options.arch)
         amd.passes.ttgpuir.add_warp_pipeline_conversion(pm, options.arch)
         passes.convert.add_scf_to_cf(pm)
@@ -729,6 +797,12 @@ class HIPBackend(BaseBackend):
         # Cleanup leftover unrealized_conversion_casts before converted to LLVM.
         passes.convert.add_reconcile_unrealized_casts(pm)
         pm.run(mod, 'make_llir')
+
+        num_unchecked = src.get_int_attr("tti.gsan_unchecked_ops")
+        if num_unchecked:
+            warnings.warn(f"GSan: {num_unchecked} operation(s) with unspecified memory effects (e.g. non-pure inline "
+                          "assembly or extern calls) are not race-checked; set MLIR_ENABLE_DIAGNOSTICS=warnings "
+                          "to see them")
 
         if knobs.compilation.dump_ir_extract_di_local_variables:
             # comments below on why separate it
@@ -823,7 +897,13 @@ class HIPBackend(BaseBackend):
             paths = [get_amd_bitcode_path(name) for name in ("asanrtl", "ocml", "ockl")]
             llvm.link_extern_libs(llvm_mod, paths)
         elif options.extern_libs:
-            paths = [path for (name, path) in options.extern_libs if amd.need_extern_lib(llvm_mod, name)]
+            # need_extern_lib only inspects the kernel module, which does not
+            # reference ockl directly when only the GSan library needs it.
+            always_link = {"gsan", "ockl"} if is_enabled(options, "gsan") else set()
+            paths = [
+                path for (name, path) in options.extern_libs
+                if name in always_link or amd.need_extern_lib(llvm_mod, name)
+            ]
             if len(paths) > 0:
                 llvm.link_extern_libs(llvm_mod, paths)
 
@@ -928,6 +1008,17 @@ class HIPBackend(BaseBackend):
         if knobs.amd.dump_amdgcn:
             print("// -----// AMDGCN Dump //----- //")
             print(amdgcn)
+        if is_enabled(options, "gsan"):
+            # Triton's LDS is dynamic, but the static LDS also counts against
+            # the per-workgroup limit, and a launch exceeding it kills the
+            # process without an error. Reserve exactly the limit.
+            static_lds = get_static_lds_size(amdgcn)
+            dynamic_lds = metadata["shared"]
+            reserved = max(dynamic_lds, options.min_shared_mem - static_lds)
+            if reserved + static_lds > options.min_shared_mem:
+                raise RuntimeError(f"GSan: kernel needs {dynamic_lds} B dynamic + {static_lds} B static LDS, "
+                                   f"exceeding the {options.min_shared_mem} B limit")
+            metadata["shared"] = reserved
         return amdgcn
 
     @staticmethod

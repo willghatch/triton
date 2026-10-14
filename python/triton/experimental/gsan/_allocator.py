@@ -59,6 +59,7 @@ def configure(
     rng_seed: int | None = None,
     clock_buffer_size: int | None = None,
     handle_type: ShareableHandleType | None = None,
+    num_slots: int | None = None,
 ) -> None:
     """Configures the process-local GSan state.
 
@@ -84,13 +85,22 @@ def configure(
             flag cannot be read and you will need to increase the buffer size. Must be in
             ``[1, 65535]``, and small enough for the per-device runtime state to fit in 1 GiB. If
             omitted, GSan first checks ``TRITON_GSAN_CLOCK_BUFFER_SIZE`` and otherwise defaults to
-            1024, or the largest size that fits when the topology has too many SMs for 1024.
+            1024, or the largest size that fits when the topology has too many SMs (or, on HIP,
+            too many slots; see ``num_slots``) for 1024.
         handle_type (ShareableHandleType, optional): Type of shareable handle requested for GSan
             allocations. If omitted, GSan uses fabric handles when ``PYTORCH_CUDA_ALLOC_CONF``
             contains ``fabric_handles:True`` and otherwise uses POSIX file descriptors. Fabric
             handles are CUDA-only.
+        num_slots (int, optional): HIP only. Number of per-device runtime-state slots. Each running
+            block claims a slot at kernel entry and releases it at exit; it takes the place of the
+            per-SM state used on NVIDIA. ``num_devices * num_slots`` must not exceed 4096, and state
+            memory grows quadratically with it and must fit in 1 GiB per device. If omitted, GSan
+            first checks ``TRITON_GSAN_NUM_SLOTS`` and otherwise uses the largest count up to 512
+            that fits with the clock buffer size. Without an explicit clock buffer size, slots
+            shrink no further than the device's CU count; below that, the clock buffer shrinks
+            instead.
     """
-    _load_gsan_module().configure(device_ranks, num_devices, rng_seed, clock_buffer_size, handle_type)
+    _load_gsan_module().configure(device_ranks, num_devices, rng_seed, clock_buffer_size, handle_type, num_slots)
 
 
 def freeze_config() -> None:

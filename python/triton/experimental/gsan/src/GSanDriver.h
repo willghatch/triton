@@ -5,6 +5,26 @@
 // produced only at the call boundary. Allocation properties are always the
 // same (pinned, on `device`, exportable as `handleType`), so they are built
 // here rather than at every call site.
+//
+// HIP differences handled here:
+// - hipMemAddressReserve ignores its alignment argument, so addressReserve
+//   over-reserves and aligns the result manually; Reservation remembers the
+//   raw range so addressFree can release all of it.
+// - Some device is always current on HIP, so DeviceScope selects the target
+//   device around work on a device's memory (memsets, copies) and restores
+//   the previous device afterwards; another device cannot access that memory.
+// - A failing HIP call leaves a sticky "last error" that makes PyTorch's next
+//   launch check fail. Every HIP wrapper clears it on failure and returns the
+//   error instead. This also discards any earlier error the application had
+//   not yet observed.
+// - ROCm PyTorch may read user memory directly from the host, so memSetAccess
+//   can also grant host access (kSupportsHostAccess).
+// - Fabric handles are not supported.
+//
+// Not handled: the HIP 7.2.x VMM bugs found during GSan's AMD bring-up
+// (hipMemSetAccess failing on reservations with mixed mapping sizes, and
+// hipMemMap reporting success on failure). Use a HIP runtime with those fixes
+// (e.g. 7.16).
 
 #include <cstddef>
 #include <cstdint>
@@ -70,7 +90,28 @@ inline bool isSupportedHandleType(HandleType type) {
          (kHasFabricHandles && type == HandleType::Fabric);
 }
 
+// A virtual address reservation. `base` is the usable, aligned address; the
+// raw range is what the driver actually reserved and what addressFree
+// releases. They differ on HIP, which over-reserves to align `base`.
+struct Reservation {
+  uintptr_t base = 0;
+  uintptr_t rawBase = 0;
+  size_t rawSize = 0;
+};
+
 #if defined(GSAN_BACKEND_HIP)
+
+// Whether memSetAccess can also grant host access. ROCm PyTorch reads small
+// caching-allocator tensors (e.g. Tensor.item()) directly from the host on
+// large-BAR GPUs, assuming device memory is host-mapped as with hipMalloc.
+inline constexpr bool kSupportsHostAccess = true;
+
+// Clears HIP's sticky last error after a failed call; see the header comment.
+inline Result check(Result err) {
+  if (err != kSuccess)
+    (void)hipGetLastError();
+  return err;
+}
 
 inline void *ptr(uintptr_t addr) { return reinterpret_cast<void *>(addr); }
 
@@ -85,11 +126,13 @@ inline hipMemAllocationProp makeProp(int device, HandleType type) {
 
 inline const char *errorString(Result err) { return hipGetErrorString(err); }
 
-inline Result deviceCount(int *count) { return hipGetDeviceCount(count); }
+inline Result deviceCount(int *count) {
+  return check(hipGetDeviceCount(count));
+}
 
 inline Result multiprocessorCount(int device, int *count) {
-  return hipDeviceGetAttribute(count, hipDeviceAttributeMultiprocessorCount,
-                               device);
+  return check(hipDeviceGetAttribute(
+      count, hipDeviceAttributeMultiprocessorCount, device));
 }
 
 inline Result supportsFabricHandles(int /*device*/, bool *supported) {
@@ -100,70 +143,86 @@ inline Result supportsFabricHandles(int /*device*/, bool *supported) {
 inline Result allocationGranularity(int device, HandleType type,
                                     size_t *granularity) {
   auto prop = makeProp(device, type);
-  return hipMemGetAllocationGranularity(granularity, &prop,
-                                        hipMemAllocationGranularityMinimum);
+  return check(hipMemGetAllocationGranularity(
+      granularity, &prop, hipMemAllocationGranularityMinimum));
 }
 
 // ROCm accepts but ignores the alignment argument, while GSan's address math
-// relies on size-aligned reservations. Over-reserve and return the aligned
-// subrange; reservations are never freed, so the slack is harmless.
-inline Result addressReserve(uintptr_t *addr, size_t size, size_t alignment) {
-  void *base = nullptr;
-  Result err =
-      hipMemAddressReserve(&base, size + alignment, alignment, nullptr, 0);
-  auto raw = reinterpret_cast<uintptr_t>(base);
-  *addr = alignment ? (raw + alignment - 1) & ~(uintptr_t(alignment) - 1) : raw;
-  return err;
+// relies on size-aligned reservations. Over-reserve and use the aligned
+// subrange. `alignment` must be zero or a power of two.
+inline Result addressReserve(Reservation *out, size_t size, size_t alignment) {
+  void *raw = nullptr;
+  Result err = check(
+      hipMemAddressReserve(&raw, size + alignment, alignment, nullptr, 0));
+  if (err != kSuccess)
+    return err;
+  auto rawBase = reinterpret_cast<uintptr_t>(raw);
+  out->rawBase = rawBase;
+  out->rawSize = size + alignment;
+  out->base = alignment
+                  ? (rawBase + alignment - 1) & ~(uintptr_t(alignment) - 1)
+                  : rawBase;
+  return kSuccess;
+}
+
+inline Result addressFree(const Reservation &reservation) {
+  return check(
+      hipMemAddressFree(ptr(reservation.rawBase), reservation.rawSize));
 }
 
 inline Result memCreate(Handle *handle, size_t size, int device,
                         HandleType type) {
   auto prop = makeProp(device, type);
-  return hipMemCreate(handle, size, &prop, 0);
+  return check(hipMemCreate(handle, size, &prop, 0));
 }
 
 inline Result memMap(uintptr_t addr, size_t size, Handle handle) {
-  return hipMemMap(ptr(addr), size, /*offset*/ 0, handle, /*flags*/ 0);
+  return check(hipMemMap(ptr(addr), size, /*offset*/ 0, handle, /*flags*/ 0));
 }
 
-inline Result memSetAccess(uintptr_t addr, size_t size, int device) {
-  hipMemAccessDesc desc = {};
-  desc.location.type = hipMemLocationTypeDevice;
-  desc.location.id = device;
-  desc.flags = hipMemAccessFlagsProtReadWrite;
-  return hipMemSetAccess(ptr(addr), size, &desc, 1);
+// Grants `device` read/write access, and also the host if `hostAccess`.
+inline Result memSetAccess(uintptr_t addr, size_t size, int device,
+                           bool hostAccess = false) {
+  hipMemAccessDesc descs[2] = {};
+  descs[0].location.type = hipMemLocationTypeDevice;
+  descs[0].location.id = device;
+  descs[0].flags = hipMemAccessFlagsProtReadWrite;
+  descs[1] = descs[0];
+  descs[1].location.type = hipMemLocationTypeHost;
+  descs[1].location.id = 0;
+  return check(hipMemSetAccess(ptr(addr), size, descs, hostAccess ? 2 : 1));
 }
 
 inline Result memUnmap(uintptr_t addr, size_t size) {
-  return hipMemUnmap(ptr(addr), size);
+  return check(hipMemUnmap(ptr(addr), size));
 }
 
-inline Result memRelease(Handle handle) { return hipMemRelease(handle); }
+inline Result memRelease(Handle handle) { return check(hipMemRelease(handle)); }
 
 inline Result exportHandle(void *out, Handle handle, HandleType type) {
-  return hipMemExportToShareableHandle(
-      out, handle, static_cast<hipMemAllocationHandleType>(type), 0);
+  return check(hipMemExportToShareableHandle(
+      out, handle, static_cast<hipMemAllocationHandleType>(type), 0));
 }
 
 inline Result importHandle(Handle *handle, void *osHandle, HandleType type) {
-  return hipMemImportFromShareableHandle(
-      handle, osHandle, static_cast<hipMemAllocationHandleType>(type));
+  return check(hipMemImportFromShareableHandle(
+      handle, osHandle, static_cast<hipMemAllocationHandleType>(type)));
 }
 
 inline Result memsetD8(uintptr_t addr, size_t size) {
-  return hipMemsetD8(ptr(addr), 0, size);
+  return check(hipMemsetD8(ptr(addr), 0, size));
 }
 
 inline Result memsetD8Async(uintptr_t addr, size_t size, Stream stream) {
-  return hipMemsetD8Async(ptr(addr), 0, size, stream);
+  return check(hipMemsetD8Async(ptr(addr), 0, size, stream));
 }
 
 inline Result memcpyHtoD(uintptr_t dst, const void *src, size_t size) {
-  return hipMemcpyHtoD(ptr(dst), src, size);
+  return check(hipMemcpyHtoD(ptr(dst), const_cast<void *>(src), size));
 }
 
 inline Result streamSynchronize(Stream stream) {
-  return hipStreamSynchronize(stream);
+  return check(hipStreamSynchronize(stream));
 }
 
 // Makes `device` current for the guard's lifetime and restores the previous
@@ -171,18 +230,18 @@ inline Result streamSynchronize(Stream stream) {
 class DeviceGuard {
 public:
   Result enter(int device) {
-    Result err = hipGetDevice(&previous);
+    Result err = check(hipGetDevice(&previous));
     if (err != kSuccess)
       return err;
     entered = true;
-    return hipSetDevice(device);
+    return check(hipSetDevice(device));
   }
-  Result synchronize() { return hipDeviceSynchronize(); }
+  Result synchronize() { return check(hipDeviceSynchronize()); }
   Result exit() {
     if (!entered)
       return kSuccess;
     entered = false;
-    return hipSetDevice(previous);
+    return check(hipSetDevice(previous));
   }
   ~DeviceGuard() { (void)exit(); }
 
@@ -191,12 +250,21 @@ private:
   bool entered = false;
 };
 
-// HIP has no "no current context" state and every VMM call above names its
-// device explicitly, so only make sure the runtime is initialized. Unlike
-// hipSetDevice, this leaves the caller's current device alone.
-inline Result ensureCurrentDevice(int /*device*/) { return hipInit(0); }
+// Prepares `device` for allocator work (memsets, copies) until the scope ends.
+// HIP always has a current device, which may be another one, so select
+// `device` and restore the previous device afterwards.
+class DeviceScope {
+public:
+  Result enter(int device) { return guard.enter(device); }
+
+private:
+  DeviceGuard guard;
+};
 
 #else // CUDA
+
+// CUDA user memory is device-only; ROCm-specific host access is not needed.
+inline constexpr bool kSupportsHostAccess = false;
 
 inline CUmemAllocationProp makeProp(int device, HandleType type) {
   CUmemAllocationProp prop = {};
@@ -243,11 +311,18 @@ inline Result allocationGranularity(int device, HandleType type,
                                        CU_MEM_ALLOC_GRANULARITY_MINIMUM);
 }
 
-inline Result addressReserve(uintptr_t *addr, size_t size, size_t alignment) {
+inline Result addressReserve(Reservation *out, size_t size, size_t alignment) {
   CUdeviceptr base = 0;
   Result err = cuMemAddressReserve(&base, size, alignment, /*addr*/ 0, 0);
-  *addr = static_cast<uintptr_t>(base);
-  return err;
+  if (err != kSuccess)
+    return err;
+  out->base = out->rawBase = static_cast<uintptr_t>(base);
+  out->rawSize = size;
+  return kSuccess;
+}
+
+inline Result addressFree(const Reservation &reservation) {
+  return cuMemAddressFree(reservation.rawBase, reservation.rawSize);
 }
 
 inline Result memCreate(Handle *handle, size_t size, int device,
@@ -260,7 +335,11 @@ inline Result memMap(uintptr_t addr, size_t size, Handle handle) {
   return cuMemMap(addr, size, /*offset*/ 0, handle, /*flags*/ 0);
 }
 
-inline Result memSetAccess(uintptr_t addr, size_t size, int device) {
+// Grants `device` read/write access. Host access is not supported here.
+inline Result memSetAccess(uintptr_t addr, size_t size, int device,
+                           bool hostAccess = false) {
+  if (hostAccess)
+    return kErrorNotSupported;
   CUmemAccessDesc desc = {};
   desc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
   desc.location.id = device;
@@ -331,18 +410,23 @@ private:
   int retainedDevice = -1;
 };
 
-// Malloc may be called before anything has made a context current; adopt the
-// primary context in that case and leave an existing context alone.
-inline Result ensureCurrentDevice(int device) {
-  CUcontext ctx = nullptr;
-  Result err = cuCtxGetCurrent(&ctx);
-  if (err != kSuccess || ctx)
-    return err;
-  err = cuDevicePrimaryCtxRetain(&ctx, device);
-  if (err != kSuccess)
-    return err;
-  return cuCtxSetCurrent(ctx);
-}
+// Prepares `device` for allocator work. Malloc may be called before anything
+// has made a context current; adopt the primary context in that case and
+// leave an existing context alone. The adopted context stays current after the
+// scope ends.
+class DeviceScope {
+public:
+  Result enter(int device) {
+    CUcontext ctx = nullptr;
+    Result err = cuCtxGetCurrent(&ctx);
+    if (err != kSuccess || ctx)
+      return err;
+    err = cuDevicePrimaryCtxRetain(&ctx, device);
+    if (err != kSuccess)
+      return err;
+    return cuCtxSetCurrent(ctx);
+  }
+};
 
 #endif
 

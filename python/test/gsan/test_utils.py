@@ -1,12 +1,12 @@
 import pytest
 import torch
 
-from triton._internal_testing import is_cuda
+from triton._internal_testing import is_cuda, is_hip
 from triton.experimental.gsan import create_mem_pool
 from triton.experimental.gsan._utils import uint8_cuda_tensor_from_ptr
 
 
-@pytest.mark.skipif(not is_cuda(), reason="requires CUDA backend")
+@pytest.mark.skipif(not (is_cuda() or is_hip()), reason="requires the CUDA or HIP backend")
 def test_uint8_cuda_tensor_from_ptr_delete_tensor(shadow_granularity):
     device = torch.device("cuda:1" if torch.cuda.device_count() > 1 else "cuda:0")
     pool = create_mem_pool(shadow_granularity=shadow_granularity)

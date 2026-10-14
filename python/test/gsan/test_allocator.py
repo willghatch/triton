@@ -31,7 +31,7 @@ from triton.experimental.gsan._allocator import (
     supports_fabric_handles,
 )
 from triton.experimental.gsan._testing_utils import (global_state, shadow_cell_from_address, shadow_tensor_for,
-                                                     thread_state_from_smid)
+                                                     store_one_i32, thread_state_from_smid)
 from triton.experimental.gsan._utils import uint8_cuda_tensor_from_ptr
 
 
@@ -78,6 +78,9 @@ def _run_default_clock_buffer_fits_check() -> None:
     size = layout["clock_buffer_size"]
     num_sms, num_threads = layout["num_sms"], layout["num_threads"]
     state_end = layout["thread_state_base_ptr"] + layout["thread_state_stride_bytes"] * num_sms
+    if "slot_table_ptr" in layout:
+        # HIP: the slot table follows the thread states.
+        state_end = layout["slot_table_ptr"] + num_sms * layout["slot_entry_bytes"]
     used = state_end - layout["global_state_ptr"]
     assert 0 < size <= 1024
     assert used <= PER_DEVICE_STATE_STRIDE_BYTES
@@ -420,7 +423,9 @@ def test_default_clock_buffer_fits_runtime_state():
     assert result.exc is None
 
 
-@requires_gsan_allocator
+# On HIP, an explicit clock buffer size shrinks the automatic slot count
+# instead; see test_explicit_clock_buffer_size_shrinks_default_slots.
+@pytest.mark.skipif(not is_cuda(), reason="requires CUDA backend")
 def test_clock_buffer_size_must_fit_runtime_state():
     num_sms = torch.cuda.get_device_properties(0).multi_processor_count
     num_threads = num_sms * torch.cuda.device_count()
@@ -485,6 +490,31 @@ def test_launch_stream_clocks_use_private_pool(shadow_granularity):
 def test_default_topology_uses_cuda_device_indices():
     assert get_device_rank(0) == 0
     assert get_device_rank(1) == 1
+
+
+def _run_malloc_on_non_current_device_check() -> None:
+    torch.cuda.set_device(0)
+    ptrs = [gsan_malloc(4096, device) for device in (0, 1)]
+    try:
+        assert all(ptrs)
+        assert torch.cuda.current_device() == 0
+        with torch.cuda.device(1):
+            real = uint8_cuda_tensor_from_ptr(ptrs[1], 4096, 1)
+            real.fill_(5)
+            assert torch.all(real == 5).item()
+            del real
+    finally:
+        for device, ptr in zip((0, 1), ptrs):
+            gsan_free(ptr, device)
+
+
+@pytest.mark.xdist_group("gsan-multi-gpu")
+# CUDA keeps the caller's current context during allocation (upstream behavior),
+# so this is HIP-only.
+@pytest.mark.skipif(not is_hip() or torch.cuda.device_count() < 2, reason="requires at least two HIP GPUs")
+def test_malloc_on_non_current_device():
+    result = run_in_process(_run_malloc_on_non_current_device_check)
+    assert result.exc is None
 
 
 @pytest.mark.parametrize("shadow_granularity", [1, 2, 4, 8, 16], indirect=True)
@@ -845,3 +875,242 @@ def _run_write_once_live_allocation_check(shadow_granularity):
 def test_write_once_live_allocation_blocks_reset(shadow_granularity):
     result = run_in_process(_run_write_once_live_allocation_check, args=(shadow_granularity, ))
     assert result.exc is None, result.exc
+
+
+@requires_gsan_allocator
+def test_reserve_is_aligned_to_its_size():
+    # The shadow translation masks addresses with the reserve size, so the
+    # reservation must be size-aligned (HIP ignores the requested alignment).
+    reserve_ptr = get_reserve_pointer()
+    assert reserve_ptr != 0
+    assert reserve_ptr % get_reserve_size() == 0
+
+
+def _run_mem_pool_item_check() -> None:
+    pool = create_mem_pool()
+    with torch.cuda.use_mem_pool(pool):
+        x = torch.ones(4, device="cuda")
+        total = x.sum()
+        # ROCm PyTorch reads caching-allocator tensors directly from the host
+        # on large-BAR GPUs, so GSan memory must be host-accessible there.
+        assert total.item() == 4.0
+
+
+@requires_gsan_allocator
+def test_mem_pool_tensor_item():
+    result = run_in_process(_run_mem_pool_item_check)
+    assert result.exc is None
+
+
+def _run_num_slots_layout_check(num_slots: int | None) -> None:
+    device = torch.cuda.current_device()
+    if num_slots is not None:
+        configure(num_slots=num_slots, clock_buffer_size=8)
+    ptr = gsan_malloc(1, device)
+    assert ptr != 0
+    slot_table = None
+    try:
+        expected_slots = num_slots if num_slots is not None else int(os.environ["TRITON_GSAN_NUM_SLOTS"])
+        layout = get_runtime_state_layout(device)
+        assert layout["num_slots"] == expected_slots
+        assert layout["num_sms"] == expected_slots
+        state = global_state(device_index=device)
+        assert state.num_sms == expected_slots
+        assert state.num_threads == expected_slots * state.num_devices
+
+        thread_states_end = layout["thread_state_base_ptr"] + expected_slots * layout["thread_state_stride_bytes"]
+        slot_table_ptr = layout["slot_table_ptr"]
+        assert thread_states_end <= slot_table_ptr < thread_states_end + 8
+        assert slot_table_ptr % 8 == 0
+        slot_table_bytes = expected_slots * layout["slot_entry_bytes"]
+        slot_table = uint8_cuda_tensor_from_ptr(slot_table_ptr, slot_table_bytes, device)
+        assert torch.count_nonzero(slot_table).item() == 0
+
+        slot_table.fill_(0xFF)
+        torch.cuda.synchronize()
+    finally:
+        gsan_free(ptr, device)
+    del slot_table
+    reset()
+    slot_table = uint8_cuda_tensor_from_ptr(slot_table_ptr, slot_table_bytes, device)
+    assert torch.count_nonzero(slot_table).item() == 0
+
+
+@pytest.mark.skipif(not is_hip(), reason="slot table is HIP-only")
+def test_num_slots_configures_slot_table():
+    result = run_in_process(_run_num_slots_layout_check, args=(64, ))
+    assert result.exc is None
+
+
+@pytest.mark.skipif(not is_hip(), reason="slot table is HIP-only")
+def test_num_slots_from_environment():
+    result = run_in_process(_run_num_slots_layout_check, args=(None, ), env={"TRITON_GSAN_NUM_SLOTS": "32"})
+    assert result.exc is None
+
+
+def _state_layout_after_malloc(device: int) -> dict:
+    ptr = gsan_malloc(4096, device)
+    assert ptr != 0
+    try:
+        layout = get_runtime_state_layout(device)
+    finally:
+        gsan_free(ptr, device)
+    slot_table_end = layout["slot_table_ptr"] + layout["num_slots"] * layout["slot_entry_bytes"]
+    assert slot_table_end - layout["global_state_ptr"] <= _PER_DEVICE_STATE_STRIDE
+    return layout
+
+
+def _run_explicit_num_slots_shrinks_default_clock_check() -> None:
+    device = torch.cuda.current_device()
+    configure(device_ranks={device: 0}, num_devices=1)
+    layout = _state_layout_after_malloc(device)
+    # Explicit slots are kept; the automatic clock buffer shrinks to fit them.
+    assert layout["num_slots"] == 4096
+    assert 0 < layout["clock_buffer_size"] < 1024
+
+
+@pytest.mark.skipif(not is_hip(), reason="slot table is HIP-only")
+def test_explicit_num_slots_shrinks_default_clock_buffer():
+    result = run_in_process(_run_explicit_num_slots_shrinks_default_clock_check, env={"TRITON_GSAN_NUM_SLOTS": "4096"})
+    assert result.exc is None
+    assert "clock buffer size" in result.driver_stderr_output
+
+
+def _run_explicit_clock_buffer_size_shrinks_default_slots_check() -> None:
+    device = torch.cuda.current_device()
+    configure(device_ranks={device: 0}, num_devices=1, clock_buffer_size=65535)
+    layout = _state_layout_after_malloc(device)
+    # The explicit clock buffer is kept; the automatic slot count shrinks
+    # (below the 512 default, and on gfx950 below the CU count) to fit it.
+    assert layout["clock_buffer_size"] == 65535
+    assert 0 < layout["num_slots"] < 512
+
+
+@pytest.mark.skipif(not is_hip(), reason="slot table is HIP-only")
+def test_explicit_clock_buffer_size_shrinks_default_slots():
+    result = run_in_process(_run_explicit_clock_buffer_size_shrinks_default_slots_check)
+    assert result.exc is None
+
+
+def _run_thread_state_lookup_unaligned_stride_check() -> None:
+    device = torch.cuda.current_device()
+    # 511 slots x 9 clocks x 2 B is not a multiple of 8, so thread states are
+    # padded to their alignment. With several visible GPUs, the default slot
+    # count gives such strides too (e.g. 2 GPUs: 511 slots, 1022 threads).
+    # One device, so the thread count (and thus the stride) is as computed above.
+    configure(device_ranks={device: 0}, num_devices=1, num_slots=511, clock_buffer_size=8)
+    ptr = gsan_malloc(4, device)
+    target = uint8_cuda_tensor_from_ptr(ptr, 4, device).view(torch.int32)
+    try:
+        with triton.knobs.compilation.scope():
+            triton.knobs.compilation.instrumentation_mode = "gsan"
+            # Several launches, so blocks land in slots other than 0.
+            for _ in range(8):
+                store_one_i32[(1, )](target, num_warps=1)
+                torch.cuda.synchronize()
+                write = shadow_cell_from_address(ptr).write_clock
+                # The writer's own vector-clock entry, read through the test
+                # helpers, is the epoch the device recorded for the write.
+                assert thread_state_from_smid(write.thread_id).vector_clock[write.thread_id] == write.epoch
+    finally:
+        del target
+        gsan_free(ptr, device)
+
+
+@pytest.mark.skipif(not is_hip(), reason="num_slots is HIP-only")
+def test_thread_state_lookup_with_padded_thread_state_stride():
+    result = run_in_process(_run_thread_state_lookup_unaligned_stride_check)
+    assert result.exc is None, result.exc
+
+
+_PER_DEVICE_STATE_STRIDE = 1 << 30
+
+
+def _run_default_num_slots_check(num_devices: int) -> None:
+    device = torch.cuda.current_device()
+    num_cus = torch.cuda.get_device_properties(device).multi_processor_count
+    configure(device_ranks={device: 0}, num_devices=num_devices)
+    layout = _state_layout_after_malloc(device)
+    num_slots, clock_buffer_size = layout["num_slots"], layout["clock_buffer_size"]
+    assert num_slots * num_devices <= 4096
+    if num_devices == 1:
+        assert (num_slots, clock_buffer_size) == (512, 1024)
+    # Slots shrink first, but not below one per CU; only then does the clock
+    # buffer shrink.
+    assert num_slots >= min(num_cus, 4096 // num_devices)
+    if clock_buffer_size < 1024:
+        assert num_slots == min(num_cus, 4096 // num_devices)
+
+
+@pytest.mark.skipif(not is_hip(), reason="slot table is HIP-only")
+@pytest.mark.parametrize("num_devices", [1, 2, 8])
+def test_default_num_slots_fits_state_region(num_devices):
+    result = run_in_process(_run_default_num_slots_check, args=(num_devices, ))
+    assert result.exc is None
+
+
+def _run_configure_rejects_num_slots_check(num_slots: int, num_devices: int, match: str) -> None:
+    with pytest.raises(ValueError, match=match):
+        configure(device_ranks={torch.cuda.current_device(): 0}, num_devices=num_devices, num_slots=num_slots,
+                  clock_buffer_size=1024)
+
+
+@pytest.mark.skipif(not is_hip(), reason="slot table is HIP-only")
+@pytest.mark.parametrize(
+    ("num_slots", "num_devices", "match"),
+    [
+        # 1024 slots x (1 + 1024) clocks x 1024 epochs x 2 B exceeds 1 GiB.
+        pytest.param(1024, 1, "runtime state per device", id="state-size"),
+        pytest.param(2048, 4, "thread-state limit", id="thread-ids"),
+    ],
+)
+def test_configure_rejects_unusable_num_slots(num_slots, num_devices, match):
+    result = run_in_process(_run_configure_rejects_num_slots_check, args=(num_slots, num_devices, match))
+    assert result.exc is None
+
+
+def _run_env_state_too_large_check() -> None:
+    device = torch.cuda.current_device()
+    configure(device_ranks={device: 0}, num_devices=1)
+    assert gsan_malloc(4096, device) == 0
+
+
+@pytest.mark.skipif(not is_hip(), reason="slot table is HIP-only")
+def test_env_sizing_too_large_for_state_region_fails_allocation():
+    # Both sizes are explicit, so neither may shrink to fit.
+    result = run_in_process(_run_env_state_too_large_check,
+                            env={"TRITON_GSAN_NUM_SLOTS": "1024", "TRITON_GSAN_CLOCK_BUFFER_SIZE": "1024"})
+    assert result.exc is None
+    assert "does not fit" in result.driver_stderr_output
+
+
+@pytest.mark.skipif(not is_hip(), reason="fabric handles are rejected only on HIP")
+def test_fabric_handles_rejected_on_hip():
+    with pytest.raises(ValueError, match="handle_type"):
+        configure(handle_type=ShareableHandleType.FABRIC)
+
+
+def _run_graph_capture_is_rejected_check() -> None:
+    pool = create_mem_pool()
+    with torch.cuda.use_mem_pool(pool):
+        target = torch.zeros(1, dtype=torch.int32, device="cuda")
+    with triton.knobs.compilation.scope():
+        triton.knobs.compilation.instrumentation_mode = "gsan"
+        store_one_i32[(1, )](target, num_warps=1)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with pytest.raises(RuntimeError, match="GSan does not support (CUDA|HIP) graph capture"):
+            with torch.cuda.graph(graph):
+                store_one_i32[(1, )](target, num_warps=1)
+
+
+@requires_gsan_allocator
+def test_graph_capture_is_rejected():
+    result = run_in_process(_run_graph_capture_is_rejected_check)
+    assert result.exc is None
+
+
+@pytest.mark.skipif(not is_cuda(), reason="requires CUDA backend")
+def test_num_slots_rejected_on_cuda():
+    with pytest.raises(ValueError, match="num_slots is only supported on the HIP backend"):
+        configure(num_slots=64)

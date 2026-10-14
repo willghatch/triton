@@ -67,9 +67,12 @@ struct GSanConfig {
   int numSMs = 0;
   int numThreads = 0;
   int clockBufferSize = 0;
+  // HIP only: number of execution-identity slots per device; see kUsesSlots.
+  int numSlots = 0;
   uint32_t rngSeed = 0;
   drv::HandleType shareableHandleType = drv::HandleType::PosixFileDescriptor;
   bool clockBufferSizeConfigured = false;
+  bool numSlotsConfigured = false;
   bool rngSeedConfigured = false;
   bool shareableHandleTypeConfigured = false;
   int deviceRanks[gsan::kMaxGPUs] = {};
@@ -80,10 +83,12 @@ struct GSanConfig {
 
 struct AllocatorState {
   // User memory + shadow memory
+  drv::Reservation reserve;
   uintptr_t reserveBaseAddress = 0;
   AllocNode treeRoots[gsan::kNumPools];
 
   // GSan global state
+  drv::Reservation globalsReserve;
   uintptr_t globalStateAddress = 0;
   drv::Handle perDeviceHandles[gsan::kMaxGPUs] = {0};
   size_t perDeviceStateSize = 0;
@@ -162,37 +167,207 @@ size_t getShadowSize(size_t realMemSize, uintptr_t realAddress) {
 constexpr int kMaxClockBufferSize = std::numeric_limits<uint16_t>::max();
 constexpr int kDefaultClockBufferSize = 1024;
 
-size_t getPerSMStateSize(int numThreads, int clockBufferSize) {
-  auto clockSizeBytes = sizeof(gsan::epoch_t) * numThreads;
-  // 1 local clock + the circular clock buffer
-  auto clocksPerThread = 1 + static_cast<size_t>(clockBufferSize);
-  return roundUp(sizeof(gsan::ThreadState) + clockSizeBytes * clocksPerThread,
-                 alignof(gsan::ThreadState));
-}
+#if defined(GSAN_BACKEND_HIP)
+// On AMD, blocks may migrate between CUs (CWSR), so per-CU state is not
+// exclusively owned. Each block instead claims an execution-identity slot from
+// a slot table at kernel entry (see gsan::SlotEntry); GlobalState::numSms and
+// config.numSMs hold the slot count.
+constexpr bool kUsesSlots = true;
+#else
+constexpr bool kUsesSlots = false;
+#endif
+// Upper bound for the default slot count. 512 slots is 2x the 256 CUs of an
+// MI350X, where GSan's LDS reservation limits residency to one block per CU.
+constexpr int kMaxDefaultNumSlots = 512;
 
-// Each device has a local copy of the constant global state, followed by one
-// thread state per SM.
+// Bytes of runtime state per device: GlobalState, one ThreadState (with its
+// vector clock and clock buffer) per SM/slot, and with slots the slot table.
+// See the layout helpers in GSan.h.
 size_t getPerDeviceStateSize(int numSMs, int numThreads, int clockBufferSize) {
   static_assert(alignof(gsan::GlobalState) >= alignof(gsan::ThreadState));
   static_assert(alignof(gsan::ThreadState) >= alignof(gsan::epoch_t));
-  return sizeof(gsan::GlobalState) +
-         numSMs * getPerSMStateSize(numThreads, clockBufferSize);
+  // Offsets from a (maximally aligned) per-device base of 0.
+  if (kUsesSlots)
+    return gsan::getSlotTableAddress(0, numSMs, numThreads, clockBufferSize) +
+           static_cast<size_t>(numSMs) * sizeof(gsan::SlotEntry);
+  return gsan::getThreadStateBaseAddress(0) +
+         static_cast<size_t>(numSMs) *
+             gsan::getThreadStateStrideBytes(numThreads, clockBufferSize);
 }
 
-// Largest clock buffer whose per-device state fits in its fixed-stride slot of
-// the globals reservation, or 0 if not even one entry fits.
-int getMaxClockBufferSize(int numSMs, int numThreads) {
-  size_t perSMBudget =
-      (gsan::kPerDeviceStateStride - sizeof(gsan::GlobalState)) / numSMs;
-  perSMBudget -= perSMBudget % alignof(gsan::ThreadState);
-  if (perSMBudget < sizeof(gsan::ThreadState))
-    return 0;
-  size_t clocksPerThread = (perSMBudget - sizeof(gsan::ThreadState)) /
-                           (sizeof(gsan::epoch_t) * numThreads);
-  if (clocksPerThread < 2)
-    return 0;
-  return static_cast<int>(
-      std::min<size_t>(clocksPerThread - 1, kMaxClockBufferSize));
+bool fitsPerDeviceState(int numSMs, int numGPUs, int clockBufferSize) {
+  return getPerDeviceStateSize(numSMs, numSMs * numGPUs, clockBufferSize) <=
+         gsan::kPerDeviceStateStride;
+}
+
+// Largest value in [lo, hi] satisfying `fits`, which must be monotonically
+// non-increasing; lo - 1 if none does.
+template <typename Fits> int largestFitting(int lo, int hi, Fits fits) {
+  int best = lo - 1;
+  while (lo <= hi) {
+    int mid = lo + (hi - lo) / 2;
+    if (fits(mid)) {
+      best = mid;
+      lo = mid + 1;
+    } else {
+      hi = mid - 1;
+    }
+  }
+  return best;
+}
+
+// Largest clock buffer size whose per-device state fits, or 0 if none does.
+int getMaxClockBufferSize(int numSMs, int numGPUs) {
+  return std::max(0, largestFitting(1, kMaxClockBufferSize, [&](int clock) {
+                    return fitsPerDeviceState(numSMs, numGPUs, clock);
+                  }));
+}
+
+// Parses TRITON_GSAN_CLOCK_BUFFER_SIZE into *clockBufferSize, or 0 if unset.
+// Returns false and prints an error if the variable is invalid.
+bool getClockBufferSizeFromEnv(int *clockBufferSize) {
+  *clockBufferSize = 0;
+  auto userClockSize = getenv("TRITON_GSAN_CLOCK_BUFFER_SIZE");
+  if (userClockSize == nullptr)
+    return true;
+  int value = 0;
+  const char *userClockSizeEnd = userClockSize + strlen(userClockSize);
+  auto res = std::from_chars(userClockSize, userClockSizeEnd, value);
+  if (res.ec != std::errc() || res.ptr != userClockSizeEnd || value <= 0 ||
+      value > kMaxClockBufferSize) {
+    fprintf(stderr,
+            "Invalid TRITON_GSAN_CLOCK_BUFFER_SIZE value '%s': must be an "
+            "integer in [1, %d]\n",
+            userClockSize, kMaxClockBufferSize);
+    return false;
+  }
+  *clockBufferSize = value;
+  return true;
+}
+
+// Parses TRITON_GSAN_NUM_SLOTS into *numSlots, or 0 if unset. Returns false
+// and prints an error if the variable is invalid.
+bool getNumSlotsFromEnv(int *numSlots) {
+  *numSlots = 0;
+  auto userSlots = getenv("TRITON_GSAN_NUM_SLOTS");
+  if (userSlots == nullptr)
+    return true;
+  int value = 0;
+  const char *userSlotsEnd = userSlots + strlen(userSlots);
+  auto res = std::from_chars(userSlots, userSlotsEnd, value);
+  if (res.ec != std::errc() || res.ptr != userSlotsEnd || value <= 0) {
+    fprintf(stderr,
+            "Invalid TRITON_GSAN_NUM_SLOTS value '%s': must be a positive "
+            "integer\n",
+            userSlots);
+    return false;
+  }
+  *numSlots = value;
+  return true;
+}
+
+struct StateSizing {
+  // Execution identities per device: SMs on CUDA, slots on HIP.
+  int numSMs = 0;
+  int clockBufferSize = 0;
+};
+
+// Chooses the per-device execution-identity count and clock buffer size.
+// `requestedSMs` and `requestedClockBufferSize` are explicit values (from
+// configure(), the environment, or on CUDA the SM count), or 0 to choose
+// automatically. `minAutoSMs` is the device's CU count, used with automatic
+// slots. Limits, in priority order:
+//   1. numGPUs * numSMs <= kMaxThreads.
+//   2. clockBufferSize in [1, kMaxClockBufferSize] (a u16 in GlobalState).
+//   3. The per-device state, including any slot table, fits in
+//      kPerDeviceStateStride.
+// Explicit values are never changed; violating a limit is an error. Automatic
+// values default to kDefaultClockBufferSize entries and
+// min(kMaxDefaultNumSlots, kMaxThreads / numGPUs) slots. When the state does
+// not fit, automatic slots shrink first, but not below the CU count, so every
+// resident block can hold a slot; then the automatic clock buffer shrinks. An
+// explicit clock buffer size may push automatic slots below the CU count.
+// Returns false and fills `error` on failure.
+bool chooseStateSizing(int numGPUs, int requestedSMs, int minAutoSMs,
+                       int requestedClockBufferSize, StateSizing *out,
+                       char *error, size_t errorSize) {
+  const size_t stateMiB = gsan::kPerDeviceStateStride >> 20;
+  if (requestedSMs > 0) {
+    if (static_cast<int64_t>(requestedSMs) * numGPUs > gsan::kMaxThreads) {
+      snprintf(error, errorSize,
+               "%d devices x %d SMs/slots exceeds the %d thread-state limit",
+               numGPUs, requestedSMs, gsan::kMaxThreads);
+      return false;
+    }
+    out->numSMs = requestedSMs;
+    const int maxClock = getMaxClockBufferSize(requestedSMs, numGPUs);
+    if (requestedClockBufferSize > 0) {
+      if (requestedClockBufferSize > maxClock) {
+        snprintf(error, errorSize,
+                 "GSan clock_buffer_size %d does not fit in %zu MiB of "
+                 "runtime state per device for %d devices x %d SMs/slots; "
+                 "use at most %d",
+                 requestedClockBufferSize, stateMiB, numGPUs, requestedSMs,
+                 maxClock);
+        return false;
+      }
+      out->clockBufferSize = requestedClockBufferSize;
+      return true;
+    }
+    if (maxClock == 0) {
+      snprintf(error, errorSize,
+               "GSan runtime state for %d devices x %d SMs/slots does not "
+               "fit in %zu MiB per device",
+               numGPUs, requestedSMs, stateMiB);
+      return false;
+    }
+    // Large topologies cannot afford the default for every SM, so shrink it
+    // to what fits rather than failing out of the box.
+    out->clockBufferSize = std::min(kDefaultClockBufferSize, maxClock);
+    return true;
+  }
+
+  // Automatic slots.
+  const int maxSlots =
+      std::min(kMaxDefaultNumSlots, gsan::kMaxThreads / numGPUs);
+  if (maxSlots < 1) {
+    snprintf(error, errorSize, "%d devices exceed the %d thread-state limit",
+             numGPUs, gsan::kMaxThreads);
+    return false;
+  }
+  const int minSlots = std::clamp(minAutoSMs, 1, maxSlots);
+  const int clock = requestedClockBufferSize > 0 ? requestedClockBufferSize
+                                                 : kDefaultClockBufferSize;
+  auto slotsFit = [&](int slots) {
+    return fitsPerDeviceState(slots, numGPUs, clock);
+  };
+  int slots = largestFitting(minSlots, maxSlots, slotsFit);
+  if (slots >= minSlots) {
+    *out = {slots, clock};
+    return true;
+  }
+  if (requestedClockBufferSize > 0) {
+    slots = largestFitting(1, minSlots - 1, slotsFit);
+    if (slots < 1) {
+      snprintf(error, errorSize,
+               "GSan clock_buffer_size %d does not fit in %zu MiB of runtime "
+               "state per device for %d devices even with one slot",
+               requestedClockBufferSize, stateMiB, numGPUs);
+      return false;
+    }
+    *out = {slots, clock};
+    return true;
+  }
+  const int maxClock = getMaxClockBufferSize(minSlots, numGPUs);
+  if (maxClock == 0) {
+    snprintf(error, errorSize,
+             "GSan runtime state for %d devices x %d slots does not fit in "
+             "%zu MiB per device",
+             numGPUs, minSlots, stateMiB);
+    return false;
+  }
+  *out = {minSlots, maxClock};
+  return true;
 }
 
 AllocNode *findAllocation(uintptr_t address) {
@@ -206,25 +381,42 @@ int gsanEnsureInit() {
   if (alloc)
     return 0;
 
-  uintptr_t reserveBase;
-  drv::Result err =
-      drv::addressReserve(&reserveBase, /*size*/ gsan::kReserveSize,
-                          /*alignment*/ gsan::kReserveSize);
+  // The shadow translation in GSan.h requires both reservations to be aligned
+  // to their size. Check rather than trust the driver.
+  drv::Reservation reserve;
+  drv::Result err = drv::addressReserve(&reserve, /*size*/ gsan::kReserveSize,
+                                        /*alignment*/ gsan::kReserveSize);
   if (err != drv::kSuccess) {
     printDriverError(err);
+    return -1;
+  }
+  if (reserve.base % gsan::kReserveSize != 0) {
+    fprintf(stderr, "gsan allocator: misaligned memory reservation\n");
+    (void)drv::addressFree(reserve);
     return -1;
   }
 
-  uintptr_t globalsBase;
-  err = drv::addressReserve(&globalsBase, /*size*/ gsan::kGlobalsReserveSize,
+  drv::Reservation globalsReserve;
+  err = drv::addressReserve(&globalsReserve,
+                            /*size*/ gsan::kGlobalsReserveSize,
                             /*alignment*/ gsan::kGlobalsReserveSize);
   if (err != drv::kSuccess) {
     printDriverError(err);
+    (void)drv::addressFree(reserve);
+    return -1;
+  }
+  if (globalsReserve.base % gsan::kGlobalsReserveSize != 0) {
+    fprintf(stderr, "gsan allocator: misaligned globals reservation\n");
+    (void)drv::addressFree(globalsReserve);
+    (void)drv::addressFree(reserve);
     return -1;
   }
   alloc = new AllocatorState();
-  alloc->reserveBaseAddress = reserveBase;
-  alloc->globalStateAddress = globalsBase;
+  alloc->reserve = reserve;
+  alloc->reserveBaseAddress = reserve.base;
+  alloc->globalsReserve = globalsReserve;
+  alloc->globalStateAddress = globalsReserve.base;
+  const uintptr_t reserveBase = reserve.base;
 
   for (int i = 0; i < gsan::kNumPools; ++i) {
     bool writeOnce = (i & 1) != 0;
@@ -254,29 +446,69 @@ drv::Result refreshConfigForDevice(int device) {
     return err;
 
   int deviceRank = getDeviceRankForCudaDevice(device);
-  if (device < 0)
+  if (deviceRank < 0)
     return drv::kErrorInvalidDevice;
 
-  int numSMs = 0;
-  err = drv::multiprocessorCount(device, &numSMs);
+  int numCUs = 0;
+  err = drv::multiprocessorCount(device, &numCUs);
   if (err != drv::kSuccess)
     return err;
-  if (numSMs <= 0)
+  if (numCUs <= 0)
     return drv::kErrorInvalidValue;
 
-  config.numSMs = numSMs;
-  config.numThreads = config.numGPUs * config.numSMs;
-  if (config.numThreads > gsan::kMaxThreads)
+  int requestedClockBufferSize = config.clockBufferSize;
+  if (!config.clockBufferSizeConfigured &&
+      !getClockBufferSizeFromEnv(&requestedClockBufferSize))
+    return drv::kErrorInvalidValue;
+
+  // CUDA uses one execution identity per SM; HIP uses explicit slots.
+  int requestedSMs = numCUs;
+  if (kUsesSlots) {
+    requestedSMs = config.numSlots;
+    if (!config.numSlotsConfigured && !getNumSlotsFromEnv(&requestedSMs))
+      return drv::kErrorInvalidValue;
+  }
+
+  StateSizing sizing;
+  char sizingError[256];
+  if (!chooseStateSizing(config.numGPUs, requestedSMs, numCUs,
+                         requestedClockBufferSize, &sizing, sizingError,
+                         sizeof(sizingError))) {
+    fprintf(stderr, "gsan allocator: %s\n", sizingError);
     return drv::kErrorNotSupported;
-  const int maxClockBufferSize =
-      getMaxClockBufferSize(config.numSMs, config.numThreads);
-  if (maxClockBufferSize == 0) {
+  }
+  // Report automatic choices that reduce race coverage.
+  if (kUsesSlots && ((requestedSMs == 0 && sizing.numSMs < numCUs) ||
+                     (requestedClockBufferSize == 0 &&
+                      sizing.clockBufferSize < kDefaultClockBufferSize)))
     fprintf(stderr,
-            "GSan runtime state for %d threads on %d SMs does not fit in "
-            "%zu MiB per device\n",
-            config.numThreads, config.numSMs,
-            static_cast<size_t>(gsan::kPerDeviceStateStride >> 20));
-    return drv::kErrorNotSupported;
+            "gsan allocator: using %d runtime-state slots per device (%d "
+            "CUs) and clock buffer size %d for %d devices (set num_slots, "
+            "clock_buffer_size, TRITON_GSAN_NUM_SLOTS, or "
+            "TRITON_GSAN_CLOCK_BUFFER_SIZE to override)\n",
+            sizing.numSMs, numCUs, sizing.clockBufferSize, config.numGPUs);
+
+  config.numSMs = sizing.numSMs;
+  config.numThreads = config.numGPUs * config.numSMs;
+  config.clockBufferSize = sizing.clockBufferSize;
+  config.clockBufferSizeConfigured = true;
+  if (kUsesSlots) {
+    config.numSlots = sizing.numSMs;
+    config.numSlotsConfigured = true;
+  }
+
+  // GSan on AMD is validated on one GPU only. With several GPUs in the
+  // topology (the default when several are visible), the device runtime uses
+  // system-scope shadow locks, but cross-GPU use (peer access to GSan memory,
+  // peer atomics on the VMM shadow) is untested.
+  static bool warnedMultiGpu = false;
+  if (kUsesSlots && config.numGPUs > 1 && !warnedMultiGpu) {
+    warnedMultiGpu = true;
+    fprintf(stderr,
+            "gsan: %d GPUs in the GSan topology; multi-GPU use is unverified "
+            "on AMD (single-GPU use is unaffected; set HIP_VISIBLE_DEVICES "
+            "to one GPU to silence this)\n",
+            config.numGPUs);
   }
 
   // Seed rng for stochastic read clocks.
@@ -299,39 +531,6 @@ drv::Result refreshConfigForDevice(int device) {
     config.rngSeedConfigured = true;
   }
 
-  if (!config.clockBufferSizeConfigured) {
-    auto userClockSize = getenv("TRITON_GSAN_CLOCK_BUFFER_SIZE");
-    if (userClockSize) {
-      int clockBufferSize = 0;
-      const char *userClockSizeEnd = userClockSize + strlen(userClockSize);
-      auto res =
-          std::from_chars(userClockSize, userClockSizeEnd, clockBufferSize);
-      if (res.ec != std::errc() || res.ptr != userClockSizeEnd ||
-          clockBufferSize <= 0 || clockBufferSize > kMaxClockBufferSize) {
-        fprintf(stderr,
-                "Invalid TRITON_GSAN_CLOCK_BUFFER_SIZE value '%s': must be an "
-                "integer in [1, %d]\n",
-                userClockSize, kMaxClockBufferSize);
-        return drv::kErrorInvalidValue;
-      }
-      config.clockBufferSize = clockBufferSize;
-    } else {
-      // Large topologies cannot afford the default for every SM, so shrink
-      // it to what fits rather than failing out of the box.
-      config.clockBufferSize =
-          std::min(kDefaultClockBufferSize, maxClockBufferSize);
-    }
-    config.clockBufferSizeConfigured = true;
-  }
-  if (config.clockBufferSize > maxClockBufferSize) {
-    fprintf(stderr,
-            "GSan clock_buffer_size %d does not fit in %zu MiB of runtime "
-            "state per device for %d threads on %d SMs; use at most %d\n",
-            config.clockBufferSize,
-            static_cast<size_t>(gsan::kPerDeviceStateStride >> 20),
-            config.numThreads, config.numSMs, maxClockBufferSize);
-    return drv::kErrorInvalidValue;
-  }
   if (!config.shareableHandleTypeConfigured) {
     config.shareableHandleType = getRequestedShareableHandleType();
     config.shareableHandleTypeConfigured = true;
@@ -413,9 +612,36 @@ error:
   return err;
 }
 
+// Grants `device` access to user memory at [addr, addr + size). With
+// `hostAccess`, also tries to grant host access where the backend supports
+// it, falling back to device-only access.
+drv::Result setUserMemoryAccess(uintptr_t addr, size_t size, int device,
+                                bool hostAccess) {
+  if (drv::kSupportsHostAccess && hostAccess) {
+    drv::Result err =
+        drv::memSetAccess(addr, size, device, /*hostAccess*/ true);
+    if (err == drv::kSuccess)
+      return err;
+    static bool warned = false;
+    if (!warned) {
+      warned = true;
+      fprintf(stderr,
+              "gsan allocator: cannot grant host access to GSan memory (%s); "
+              "falling back to device-only access. On large-BAR GPUs, ROCm "
+              "PyTorch may then crash in Tensor.item() on GSan tensors.\n",
+              drv::errorString(err));
+    }
+  }
+  return drv::memSetAccess(addr, size, device);
+}
+
+// Maps an allocation's real and shadow memory. `hostAccess` requests host
+// access to the real memory (see setUserMemoryAccess); imported allocations
+// never back caching-allocator tensors, and HIP rejects host access to them.
 drv::Result mapNodeHandles(AllocNode *node, drv::Handle realHandle,
                            drv::Handle shadowHandle, size_t allocSize,
-                           int device, bool *realMapped, bool *shadowMapped) {
+                           int device, bool *realMapped, bool *shadowMapped,
+                           bool hostAccess) {
   assert(node != nullptr);
   assert(realMapped != nullptr);
   assert(shadowMapped != nullptr);
@@ -433,10 +659,12 @@ drv::Result mapNodeHandles(AllocNode *node, drv::Handle realHandle,
     return err;
   *shadowMapped = true;
 
-  err = drv::memSetAccess(node->virtualAddress, allocSize, device);
+  err =
+      setUserMemoryAccess(node->virtualAddress, allocSize, device, hostAccess);
   if (err != drv::kSuccess)
     return err;
 
+  // Shadow memory stays device-only.
   err = drv::memSetAccess(shadowAddress, shadowSize, device);
   if (err != drv::kSuccess)
     return err;
@@ -469,7 +697,8 @@ void *gsanMallocWithGranularity(ssize_t size, int device, void *stream,
   if (gsanEnsureInit() != 0)
     return nullptr;
 
-  drv::Result err = drv::ensureCurrentDevice(device);
+  drv::DeviceScope deviceScope;
+  drv::Result err = deviceScope.enter(device);
   if (err != drv::kSuccess) {
     printDriverError(err);
     return nullptr;
@@ -515,7 +744,7 @@ void *gsanMallocWithGranularity(ssize_t size, int device, void *stream,
     goto error;
 
   err = mapNodeHandles(node, realHandle, shadowHandle, allocSize, device,
-                       &realMapped, &shadowMapped);
+                       &realMapped, &shadowMapped, /*hostAccess*/ true);
   if (err != drv::kSuccess)
     goto error;
 
@@ -580,7 +809,7 @@ extern "C" void *gsanMalloc16(ssize_t size, int device, void *stream) {
 }
 
 extern "C" void gsanFree(void *void_ptr, [[maybe_unused]] ssize_t size,
-                         [[maybe_unused]] int device, void *stream) {
+                         int device, void *stream) {
   LOGF("gsanFree: %p, 0x%zx", void_ptr, size);
   auto ptr = reinterpret_cast<uintptr_t>(void_ptr);
   if (!ptr)
@@ -599,8 +828,14 @@ extern "C" void gsanFree(void *void_ptr, [[maybe_unused]] ssize_t size,
 
   // Wait for outstanding work on the deallocation stream, including the
   // allocator's own async shadow memset from gsanMalloc, before unmapping.
+  // On HIP, the null stream belongs to the current device, so select the
+  // allocation's device first.
+  drv::DeviceScope deviceScope;
+  drv::Result err = deviceScope.enter(device);
+  if (err != drv::kSuccess)
+    printDriverError(err);
   auto drvStream = reinterpret_cast<drv::Stream>(stream);
-  drv::Result err = drv::streamSynchronize(drvStream);
+  err = drv::streamSynchronize(drvStream);
   if (err != drv::kSuccess)
     printDriverError(err);
 
@@ -743,7 +978,8 @@ int gsanExportRuntimeStateHandle(int device,
   std::lock_guard lg(mut);
   if (gsanEnsureInit() != 0)
     return -1;
-  drv::Result err = drv::ensureCurrentDevice(device);
+  drv::DeviceScope deviceScope;
+  drv::Result err = deviceScope.enter(device);
   if (err != drv::kSuccess) {
     printDriverError(err);
     return -1;
@@ -790,7 +1026,8 @@ gsanImportAllocationHandles(const GSanShareableHandle *realShareableHandle,
   std::lock_guard lg(mut);
   if (gsanEnsureInit() != 0)
     return nullptr;
-  drv::Result err = drv::ensureCurrentDevice(device);
+  drv::DeviceScope deviceScope;
+  drv::Result err = deviceScope.enter(device);
   if (err != drv::kSuccess) {
     printDriverError(err);
     return nullptr;
@@ -825,7 +1062,7 @@ gsanImportAllocationHandles(const GSanShareableHandle *realShareableHandle,
     goto error;
 
   err = mapNodeHandles(node, realHandle, shadowHandle, allocSize, device,
-                       &realMapped, &shadowMapped);
+                       &realMapped, &shadowMapped, /*hostAccess*/ false);
   if (err != drv::kSuccess)
     goto error;
 
@@ -858,7 +1095,8 @@ int gsanImportRuntimeStateHandle(const GSanShareableHandle *shareableHandle,
   std::lock_guard lg(mut);
   if (gsanEnsureInit() != 0)
     return -1;
-  drv::Result err = drv::ensureCurrentDevice(device);
+  drv::DeviceScope deviceScope;
+  drv::Result err = deviceScope.enter(device);
   if (err != drv::kSuccess) {
     printDriverError(err);
     return -1;
@@ -1047,9 +1285,9 @@ PyObject *pyFree([[maybe_unused]] PyObject *self, PyObject *const *args,
 
 PyObject *pyConfigure([[maybe_unused]] PyObject *self, PyObject *const *args,
                       Py_ssize_t nargs) {
-  if (nargs != 5) {
+  if (nargs != 6) {
     PyErr_Format(PyExc_TypeError,
-                 "%s.configure expected 5 positional arguments, got %zd",
+                 "%s.configure expected 6 positional arguments, got %zd",
                  kModuleName, nargs);
     return nullptr;
   }
@@ -1151,12 +1389,58 @@ PyObject *pyConfigure([[maybe_unused]] PyObject *self, PyObject *const *args,
     return nullptr;
   }
 
+  const bool numSlotsRequested = args[5] != Py_None;
+  int requestedNumSlots = 0;
+  if (numSlotsRequested) {
+    if (!kUsesSlots) {
+      PyErr_SetString(PyExc_ValueError,
+                      "num_slots is only supported on the HIP backend");
+      return nullptr;
+    }
+    if (!parseIntArg(args[5], "num_slots", &requestedNumSlots))
+      return nullptr;
+    if (requestedNumSlots <= 0) {
+      PyErr_Format(PyExc_ValueError, "num_slots must be positive, got %d",
+                   requestedNumSlots);
+      return nullptr;
+    }
+  }
+
   std::lock_guard lg(mut);
   if (config.topologyFrozen) {
     PyErr_SetString(PyExc_RuntimeError,
                     "GSan allocator configuration is already frozen and "
                     "cannot be changed");
     return nullptr;
+  }
+
+  // Reject slot counts that cannot work with the topology and clock buffer
+  // size known so far. Later configure() calls changing those are checked
+  // when the runtime state is created.
+  if (numSlotsRequested) {
+    int numDevices = topologyRequested ? requestedNumDevices : config.numGPUs;
+    if (!topologyRequested && !config.topologyConfigured &&
+        drv::deviceCount(&numDevices) != drv::kSuccess) {
+      PyErr_SetString(PyExc_RuntimeError, "failed to query the device count");
+      return nullptr;
+    }
+    int clockBufferSize = config.clockBufferSize;
+    if (clockBufferSizeRequested) {
+      clockBufferSize = requestedClockBufferSize;
+    } else if (!config.clockBufferSizeConfigured &&
+               !getClockBufferSizeFromEnv(&clockBufferSize)) {
+      PyErr_SetString(PyExc_ValueError,
+                      "invalid TRITON_GSAN_CLOCK_BUFFER_SIZE");
+      return nullptr;
+    }
+    StateSizing sizing;
+    char sizingError[256];
+    if (!chooseStateSizing(numDevices, requestedNumSlots, /*minAutoSMs*/ 0,
+                           clockBufferSize, &sizing, sizingError,
+                           sizeof(sizingError))) {
+      PyErr_SetString(PyExc_ValueError, sizingError);
+      return nullptr;
+    }
   }
 
   if (topologyRequested) {
@@ -1178,6 +1462,10 @@ PyObject *pyConfigure([[maybe_unused]] PyObject *self, PyObject *const *args,
   if (shareableHandleTypeRequested) {
     config.shareableHandleType = requestedShareableHandleType;
     config.shareableHandleTypeConfigured = true;
+  }
+  if (numSlotsRequested) {
+    config.numSlots = requestedNumSlots;
+    config.numSlotsConfigured = true;
   }
   Py_RETURN_NONE;
 }
@@ -1381,12 +1669,11 @@ PyObject *pyGetRuntimeStateLayout([[maybe_unused]] PyObject *self,
   uintptr_t globalStateAddress =
       alloc->globalStateAddress + device * gsan::kPerDeviceStateStride;
   uintptr_t threadStateBase =
-      roundUp(globalStateAddress + sizeof(gsan::GlobalState),
-              alignof(gsan::ThreadState));
-  size_t threadStateStride =
-      getPerSMStateSize(config.numThreads, config.clockBufferSize);
+      gsan::getThreadStateBaseAddress(globalStateAddress);
+  size_t threadStateStride = gsan::getThreadStateStrideBytes(
+      config.numThreads, config.clockBufferSize);
 
-  return Py_BuildValue(
+  PyObject *layout = Py_BuildValue(
       "{s:K,s:K,s:K,s:K,s:i,s:i,s:i}", "global_state_ptr",
       static_cast<unsigned long long>(globalStateAddress),
       "thread_state_base_ptr", static_cast<unsigned long long>(threadStateBase),
@@ -1396,6 +1683,25 @@ PyObject *pyGetRuntimeStateLayout([[maybe_unused]] PyObject *self,
       static_cast<unsigned long long>(kThreadStateHeaderSize), "num_sms",
       config.numSMs, "num_threads", config.numThreads, "clock_buffer_size",
       config.clockBufferSize);
+  if (kUsesSlots && layout != nullptr) {
+    uintptr_t slotTable =
+        gsan::getSlotTableAddress(globalStateAddress, config.numSMs,
+                                  config.numThreads, config.clockBufferSize);
+    PyObject *slotTablePtr =
+        PyLong_FromUnsignedLongLong(static_cast<unsigned long long>(slotTable));
+    PyObject *numSlots = PyLong_FromLong(config.numSMs);
+    PyObject *slotEntryBytes = PyLong_FromSize_t(sizeof(gsan::SlotEntry));
+    if (slotTablePtr == nullptr || numSlots == nullptr ||
+        slotEntryBytes == nullptr ||
+        PyDict_SetItemString(layout, "slot_table_ptr", slotTablePtr) != 0 ||
+        PyDict_SetItemString(layout, "num_slots", numSlots) != 0 ||
+        PyDict_SetItemString(layout, "slot_entry_bytes", slotEntryBytes) != 0)
+      Py_CLEAR(layout);
+    Py_XDECREF(slotTablePtr);
+    Py_XDECREF(numSlots);
+    Py_XDECREF(slotEntryBytes);
+  }
+  return layout;
 }
 
 PyObject *pyIsWriteOnceAllocation(PyObject *self, PyObject *arg) {

@@ -225,6 +225,8 @@ struct ConvertTritonAMDGPUToLLVM
     mlir::triton::populateInstrumentationToLLVMPatterns(typeConverter, patterns,
                                                         targetInfo);
     mlir::triton::populateFpSanToLLVMPatterns(typeConverter, patterns);
+    mlir::triton::populateGSanToLLVMPatterns(typeConverter, patterns,
+                                             axisInfoAnalysis, targetInfo);
 
     if (failed(applyPartialConversion(mod, convTarget, std::move(patterns)))) {
       return signalPassFailure();

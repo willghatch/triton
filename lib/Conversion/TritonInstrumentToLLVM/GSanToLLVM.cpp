@@ -172,11 +172,14 @@ materializeSourceLocation(ConversionPatternRewriter &rewriter, Location loc) {
 // Utility functions
 ////////////////////////////////////////////
 
-std::pair<Value, unsigned>
-prepareTensorStackArg(ConversionPatternRewriter &rewriter, Location loc,
-                      ArrayRef<Value> ptrElems, ArrayRef<Value> maskElems,
-                      uint32_t regMask, Value threadPred,
-                      unsigned elemIndexStride) {
+Value createGSanStackBuffer(ConversionPatternRewriter &rewriter, Location loc,
+                            const TargetInfoBase &targetInfo, Type ty,
+                            Value cudaArraySize = {});
+
+std::pair<Value, unsigned> prepareTensorStackArg(
+    ConversionPatternRewriter &rewriter, Location loc, ArrayRef<Value> ptrElems,
+    ArrayRef<Value> maskElems, uint32_t regMask, Value threadPred,
+    unsigned elemIndexStride, const TargetInfoBase &targetInfo) {
   auto *ctx = rewriter.getContext();
   TritonLLVMOpBuilder b(loc, rewriter);
   Value one = b.i32_val(1);
@@ -191,8 +194,8 @@ prepareTensorStackArg(ConversionPatternRewriter &rewriter, Location loc,
   auto maskArrayTy = array_ty(i8Ty, numElems);
   SmallVector<Type> argsFieldTys = {ptrArrayTy, maskArrayTy};
   auto argsTy = LLVM::LLVMStructType::getLiteral(ctx, argsFieldTys);
-  auto argsBuffer = LLVM::AllocaOp::create(rewriter, loc, ptr_ty(ctx), argsTy,
-                                           one, /*alignment=*/0);
+  auto argsBuffer =
+      createGSanStackBuffer(rewriter, loc, targetInfo, argsTy, one);
 
   unsigned packedIndex = 0;
   for (unsigned i = 0; i < ptrElems.size(); ++i) {
@@ -220,13 +223,15 @@ void emitTensorAccessRuntimeCall(ConversionPatternRewriter &rewriter,
                                  ArrayRef<Value> ptrElems,
                                  ArrayRef<Value> maskElems, uint32_t regMask,
                                  Value threadPred, int32_t bytesPerElem,
-                                 bool isStore, unsigned elemIndexStride = 1) {
+                                 bool isStore, const TargetInfoBase &targetInfo,
+                                 unsigned elemIndexStride = 1) {
   if (ptrElems.empty())
     return;
 
   TritonLLVMOpBuilder b(loc, rewriter);
-  auto [stackPtr, numElems] = prepareTensorStackArg(
-      rewriter, loc, ptrElems, maskElems, regMask, threadPred, elemIndexStride);
+  auto [stackPtr, numElems] =
+      prepareTensorStackArg(rewriter, loc, ptrElems, maskElems, regMask,
+                            threadPred, elemIndexStride, targetInfo);
   StringRef funcName =
       isStore ? kGSanStoreTensorRuntimeFn : kGSanLoadTensorRuntimeFn;
   auto runtimeFunc = getOrCreateGSanRuntimeFunction(rewriter, funcName);
@@ -251,6 +256,199 @@ Value castToGenericPointer(ConversionPatternRewriter &rewriter, Location loc,
     return ptr;
   TritonLLVMOpBuilder b(loc, rewriter);
   return b.addrspacecast(genericPtrTy, ptr);
+}
+
+////////////////////////////////////////////
+// Target hooks
+////////////////////////////////////////////
+
+// Allocate a stack buffer of type `ty` for runtime arguments and return a
+// generic pointer to it. On AMD, allocas must be in the private address space
+// and are placed in the entry block so they stay static. `cudaArraySize`
+// optionally supplies the NVIDIA alloca's existing i32 1 constant.
+Value createGSanStackBuffer(ConversionPatternRewriter &rewriter, Location loc,
+                            const TargetInfoBase &targetInfo, Type ty,
+                            Value cudaArraySize) {
+  auto *ctx = rewriter.getContext();
+  if (targetInfo.isCuda()) {
+    TritonLLVMOpBuilder b(loc, rewriter);
+    if (!cudaArraySize)
+      cudaArraySize = b.i32_val(1);
+    return LLVM::AllocaOp::create(rewriter, loc, ptr_ty(ctx), ty, cudaArraySize,
+                                  /*alignment=*/0);
+  }
+  constexpr unsigned kPrivateAddrSpace = 5;
+  Value buffer;
+  {
+    RewriterBase::InsertionGuard guard(rewriter);
+    auto funcOp = rewriter.getInsertionBlock()
+                      ->getParentOp()
+                      ->getParentOfType<FunctionOpInterface>();
+    if (!funcOp)
+      funcOp = cast<FunctionOpInterface>(
+          rewriter.getInsertionBlock()->getParentOp());
+    rewriter.setInsertionPointToStart(&funcOp.getFunctionBody().front());
+    TritonLLVMOpBuilder b(loc, rewriter);
+    buffer =
+        LLVM::AllocaOp::create(rewriter, loc, ptr_ty(ctx, kPrivateAddrSpace),
+                               ty, b.i32_val(1), /*alignment=*/0);
+  }
+  return castToGenericPointer(rewriter, loc, buffer);
+}
+
+// Named-barrier ID for the runtime's block barriers in init/exit. The AMD
+// runtime ignores it and uses a whole-workgroup s_barrier.
+Value getGSanBarrierId(ConversionPatternRewriter &rewriter, Location loc,
+                       const TargetInfoBase &targetInfo) {
+  if (targetInfo.isCuda())
+    return tt::nvgpu::WarpGroupBarrierIdOp::create(rewriter, loc);
+  TritonLLVMOpBuilder b(loc, rewriter);
+  return b.i32_val(0);
+}
+
+// Emit one per-element atomic access (atomic_begin, user atomic, atomic_end)
+// built by `bodyBuilder`, and return its results.
+//
+// The runtime takes per-lane spin locks in atomic_begin and holds them until
+// atomic_end. On NVIDIA, lanes make independent progress, so the body is
+// emitted inline. On AMD, a lane spinning on a lock held by another lane of
+// its wave would deadlock, so lanes with `pred` set run the body one at a
+// time (a "waterfall" over a ballot of pending lanes); other lanes' results
+// are unspecified. Lanes without `pred` skip the body; the body's runtime calls
+// would be no-ops for them. Callers must broadcast results from the lanes that
+// ran the body before using them as block-uniform values.
+SmallVector<Value>
+emitGSanAtomicElement(ConversionPatternRewriter &rewriter, Location loc,
+                      const TargetInfoBase &targetInfo, Value pred,
+                      TypeRange resultTys,
+                      llvm::function_ref<SmallVector<Value>()> bodyBuilder) {
+  if (targetInfo.isCuda())
+    return bodyBuilder();
+
+  auto *ctx = rewriter.getContext();
+  TritonLLVMOpBuilder b(loc, rewriter);
+  Value initPending = pred ? pred : b.true_val();
+  // Seed results with zero rather than undef. The header merges the body's
+  // result with each other lane's carried value; LLVM's uniformity analysis
+  // treats a phi of one value and undef as uniform even at a divergent join.
+  // When the body's result is itself uniform (e.g. an atomic load from a
+  // uniform address), the AMDGPU backend then deletes the caller's cross-lane
+  // broadcast, leaving the other lanes with stale registers.
+  SmallVector<Value> initResults;
+  for (Type ty : resultTys)
+    initResults.push_back(LLVM::ZeroOp::create(rewriter, loc, ty));
+
+  // prev -> header(pending, results) -> check -> crit -> header
+  //                                \-> exit(results)  \-> header
+  Block *prevBlock = rewriter.getInsertionBlock();
+  Block *exitBlock = prevBlock->splitBlock(rewriter.getInsertionPoint());
+  SmallVector<Value> results;
+  for (Type ty : resultTys)
+    results.push_back(exitBlock->addArgument(ty, loc));
+
+  SmallVector<Type> headerArgTys{i1_ty};
+  headerArgTys.append(resultTys.begin(), resultTys.end());
+  SmallVector<Location> headerArgLocs(headerArgTys.size(), loc);
+  Block *headerBlock =
+      rewriter.createBlock(exitBlock, headerArgTys, headerArgLocs);
+  Block *checkBlock = rewriter.createBlock(exitBlock);
+  Block *critBlock = rewriter.createBlock(exitBlock);
+
+  rewriter.setInsertionPointToEnd(prevBlock);
+  SmallVector<Value> initArgs{initPending};
+  initArgs.append(initResults);
+  LLVM::BrOp::create(rewriter, loc, initArgs, headerBlock);
+
+  rewriter.setInsertionPointToEnd(headerBlock);
+  Value pending = headerBlock->getArgument(0);
+  SmallVector<Value> carried(headerBlock->getArguments().drop_front());
+  unsigned waveSize = triton::gpu::lookupThreadsPerWarp(rewriter);
+  Type maskTy = IntegerType::get(ctx, waveSize);
+  Value pendingMask = targetInfo.ballot(rewriter, loc, maskTy, pending);
+  Value anyPending = b.icmp_ne(pendingMask, b.int_val(waveSize, 0));
+  LLVM::CondBrOp::create(rewriter, loc, anyPending, checkBlock, ValueRange{},
+                         exitBlock, carried);
+
+  rewriter.setInsertionPointToEnd(checkBlock);
+  Value leader = LLVM::CountTrailingZerosOp::create(rewriter, loc, maskTy,
+                                                    pendingMask, false);
+  leader = waveSize > 32 ? b.trunc(i32_ty, leader) : leader;
+  Value isLeader = b.icmp_eq(getLaneId(rewriter, loc), leader);
+  SmallVector<Value> notLeaderArgs{pending};
+  notLeaderArgs.append(carried);
+  LLVM::CondBrOp::create(rewriter, loc, isLeader, critBlock, ValueRange{},
+                         headerBlock, notLeaderArgs);
+
+  rewriter.setInsertionPointToEnd(critBlock);
+  SmallVector<Value> bodyResults = bodyBuilder();
+  assert(bodyResults.size() == resultTys.size());
+  SmallVector<Value> doneArgs{b.false_val()};
+  doneArgs.append(bodyResults);
+  LLVM::BrOp::create(rewriter, loc, doneArgs, headerBlock);
+
+  rewriter.setInsertionPointToStart(exitBlock);
+  return results;
+}
+
+// Emit the user atomic RMW for one element, predicated on `pred`.
+FailureOr<Value> emitGSanUserAtomicRMW(ConversionPatternRewriter &rewriter,
+                                       Location loc,
+                                       const TargetInfoBase &targetInfo,
+                                       Type valueElemTy, Value ptr, Value val,
+                                       tt::RMWOp rmwOp, MemSemantic sem,
+                                       MemSyncScope scope, Value pred) {
+  if (targetInfo.isCuda()) {
+    SmallVector<Value> rmwVals{val};
+    return NVIDIA::emitPtxAtomicRMW(rewriter, loc, valueElemTy, ptr, rmwVals,
+                                    rmwOp, sem, scope, pred);
+  }
+  auto binOp = matchAtomicOp(rmwOp);
+  auto ordering = getMemoryOrdering(sem);
+  if (!binOp || !ordering)
+    return emitError(loc, "unsupported GSan atomic RMW");
+  StringRef syncScope = targetInfo.getAtomicSyncScope(scope);
+  TritonLLVMOpBuilder b(loc, rewriter);
+  return emitPredicated(rewriter, loc, pred, ValueRange{b.undef(valueElemTy)},
+                        [&] {
+                          unsigned alignment =
+                              valueElemTy.getIntOrFloatBitWidth() / 8;
+                          Value old = LLVM::AtomicRMWOp::create(
+                              rewriter, loc, *binOp, ptr, val, *ordering,
+                              syncScope, alignment);
+                          return SmallVector<Value>{old};
+                        })
+      .front();
+}
+
+// Emit the user atomic CAS for one element, predicated on `pred`, returning
+// the old value.
+Value emitGSanUserAtomicCAS(ConversionPatternRewriter &rewriter, Location loc,
+                            const TargetInfoBase &targetInfo, Type valueElemTy,
+                            Value ptr, Value cmp, Value val, MemSemantic sem,
+                            MemSyncScope scope, Value pred) {
+  if (targetInfo.isCuda())
+    return NVIDIA::emitPtxAtomicCAS(rewriter, loc, valueElemTy, ptr, cmp, val,
+                                    sem, scope, pred);
+  TritonLLVMOpBuilder b(loc, rewriter);
+  StringRef syncScope = targetInfo.getAtomicSyncScope(scope);
+  auto successOrdering = *getMemoryOrdering(sem);
+  // A failed CAS still reads, so keep acquire semantics on failure.
+  bool hasAcquire =
+      sem == MemSemantic::ACQUIRE || sem == MemSemantic::ACQUIRE_RELEASE;
+  auto failureOrdering = hasAcquire ? LLVM::AtomicOrdering::acquire
+                                    : LLVM::AtomicOrdering::monotonic;
+  unsigned nBits = valueElemTy.getIntOrFloatBitWidth();
+  Type intTy = IntegerType::get(rewriter.getContext(), nBits);
+  Value cmpInt = valueElemTy == intTy ? cmp : b.bitcast(cmp, intTy);
+  Value valInt = valueElemTy == intTy ? val : b.bitcast(val, intTy);
+  Value oldInt =
+      emitPredicated(rewriter, loc, pred, ValueRange{b.undef(intTy)}, [&] {
+        auto cas = LLVM::AtomicCmpXchgOp::create(
+            rewriter, loc, ptr, cmpInt, valInt, successOrdering,
+            failureOrdering, syncScope, /*alignment=*/nBits / 8);
+        return SmallVector<Value>{b.extract_val(intTy, cas, 0)};
+      }).front();
+  return valueElemTy == intTy ? oldInt : b.bitcast(oldInt, valueElemTy);
 }
 
 void emitGSanAtomicBeginCall(ConversionPatternRewriter &rewriter, Location loc,
@@ -432,7 +630,7 @@ public:
     emitTensorAccessRuntimeCall(rewriter, loc, *gsanGlobalStatePtr, ptrElems,
                                 maskElems, freeVarMasks.lookup(kReg),
                                 threadPred, bytesPerElem, op.getIsStore(),
-                                mergeVec);
+                                *targetInfo, mergeVec);
     rewriter.eraseOp(op);
     return success();
   }
@@ -483,11 +681,9 @@ public:
     TritonLLVMOpBuilder b(loc, rewriter);
     unsigned rank = blockShape.size();
     auto coordsTy = array_ty(i32_ty, rank);
-    Value coords = LLVM::AllocaOp::create(rewriter, loc, ptr_ty(ctx), coordsTy,
-                                          b.i32_val(1), /*alignment=*/0);
+    Value coords = createGSanStackBuffer(rewriter, loc, *targetInfo, coordsTy);
     auto shapeTy = array_ty(i16_ty, rank);
-    Value shape = LLVM::AllocaOp::create(rewriter, loc, ptr_ty(ctx), shapeTy,
-                                         b.i32_val(1), /*alignment=*/0);
+    Value shape = createGSanStackBuffer(rewriter, loc, *targetInfo, shapeTy);
     for (auto [dim, coord] : llvm::enumerate(adaptor.getCoords())) {
       Value coordSlot = b.gep(ptr_ty(ctx), coordsTy, coords,
                               ValueRange{b.i32_val(0), b.i32_val(dim)});
@@ -578,8 +774,8 @@ public:
     SmallVector<Value> indexElems =
         unpackUniqueTensorElements(loc, adaptor.getIndices(), rewriter);
     auto indicesTy = array_ty(i32_ty, indexElems.size());
-    Value indices = LLVM::AllocaOp::create(rewriter, loc, ptr_ty(ctx),
-                                           indicesTy, b.i32_val(1), 0);
+    Value indices =
+        createGSanStackBuffer(rewriter, loc, *targetInfo, indicesTy);
     for (auto [index, elem] : llvm::enumerate(indexElems)) {
       Value slot = b.gep(ptr_ty(ctx), indicesTy, indices,
                          ValueRange{b.i32_val(0), b.i32_val(index)});
@@ -654,8 +850,8 @@ public:
                                                          loc, *targetInfo);
     auto sourceLoc = materializeSourceLocation(rewriter, loc);
     auto eventStateTy = getGSanAtomicEventStateType(rewriter);
-    Value eventState = LLVM::AllocaOp::create(rewriter, loc, ptr_ty(ctx),
-                                              eventStateTy, b.i32_val(1), 0);
+    Value eventState =
+        createGSanStackBuffer(rewriter, loc, *targetInfo, eventStateTy);
     SmallVector<Value> resultVals;
     resultVals.reserve(ptrElements.size());
 
@@ -670,17 +866,24 @@ public:
           maskElements.empty()
               ? threadPred
               : ttg::maybeAnd(rewriter, loc, threadPred, maskElements[i]);
-      emitGSanAtomicBeginCall(
-          rewriter, loc, *gsanGlobalStatePtr, eventState, pred, ptrElements[i],
-          bytesPerElem * vec, bytesPerElem, /*doesRead=*/true,
-          static_cast<int32_t>(sem), static_cast<int32_t>(scope), sourceLoc);
-      Value loaded = targetInfo->loadRelaxed(rewriter, loc, ptrElements[i],
-                                             loadTy, pred, op.getScope());
+      auto results = emitGSanAtomicElement(
+          rewriter, loc, *targetInfo, pred, TypeRange{loadTy}, [&] {
+            emitGSanAtomicBeginCall(
+                rewriter, loc, *gsanGlobalStatePtr, eventState, pred,
+                ptrElements[i], bytesPerElem * vec, bytesPerElem,
+                /*doesRead=*/true, static_cast<int32_t>(sem),
+                static_cast<int32_t>(scope), sourceLoc);
+            Value loaded = targetInfo->loadRelaxed(
+                rewriter, loc, ptrElements[i], loadTy, pred, op.getScope());
+            emitGSanAtomicEndCall(rewriter, loc, eventState, pred,
+                                  b.false_val(), /*isRmw=*/false,
+                                  static_cast<int32_t>(sem),
+                                  static_cast<int32_t>(scope), sourceLoc);
+            return SmallVector<Value>{loaded};
+          });
+      Value loaded = results.front();
       auto values = unpackLLVector(loc, loaded, rewriter);
       resultVals.append(values.begin(), values.end());
-      emitGSanAtomicEndCall(rewriter, loc, eventState, pred, b.false_val(),
-                            /*isRmw=*/false, static_cast<int32_t>(sem),
-                            static_cast<int32_t>(scope), sourceLoc);
     }
 
     if (sem == MemSemantic::ACQUIRE)
@@ -740,8 +943,8 @@ public:
                             syncScope);
     auto sourceLoc = materializeSourceLocation(rewriter, loc);
     auto eventStateTy = getGSanAtomicEventStateType(rewriter);
-    Value eventState = LLVM::AllocaOp::create(rewriter, loc, ptr_ty(ctx),
-                                              eventStateTy, b.i32_val(1), 0);
+    Value eventState =
+        createGSanStackBuffer(rewriter, loc, *targetInfo, eventStateTy);
 
     unsigned vec = getAtomicLoadStoreVectorSize(op.getPtr(), op.getMask(),
                                                 axisInfoAnalysis, *targetInfo);
@@ -752,19 +955,23 @@ public:
           maskElements.empty()
               ? threadPred
               : ttg::maybeAnd(rewriter, loc, threadPred, maskElements[i]);
-      emitGSanAtomicBeginCall(
-          rewriter, loc, *gsanGlobalStatePtr, eventState, pred, ptrElements[i],
-          bytesPerElem * vec, bytesPerElem, /*doesRead=*/false,
-          static_cast<int32_t>(sem), static_cast<int32_t>(scope), sourceLoc);
-      Value value =
-          vec == 1 ? valueElements[i]
-                   : packLLVector(loc, ArrayRef(valueElements).slice(i, vec),
-                                  rewriter);
-      targetInfo->storeRelaxed(rewriter, loc, ptrElements[i], value, pred,
-                               op.getScope());
-      emitGSanAtomicEndCall(rewriter, loc, eventState, pred, pred,
-                            /*isRmw=*/false, static_cast<int32_t>(sem),
-                            static_cast<int32_t>(scope), sourceLoc);
+      emitGSanAtomicElement(rewriter, loc, *targetInfo, pred, TypeRange{}, [&] {
+        emitGSanAtomicBeginCall(rewriter, loc, *gsanGlobalStatePtr, eventState,
+                                pred, ptrElements[i], bytesPerElem * vec,
+                                bytesPerElem,
+                                /*doesRead=*/false, static_cast<int32_t>(sem),
+                                static_cast<int32_t>(scope), sourceLoc);
+        Value value =
+            vec == 1 ? valueElements[i]
+                     : packLLVector(loc, ArrayRef(valueElements).slice(i, vec),
+                                    rewriter);
+        targetInfo->storeRelaxed(rewriter, loc, ptrElements[i], value, pred,
+                                 op.getScope());
+        emitGSanAtomicEndCall(rewriter, loc, eventState, pred, pred,
+                              /*isRmw=*/false, static_cast<int32_t>(sem),
+                              static_cast<int32_t>(scope), sourceLoc);
+        return SmallVector<Value>{};
+      });
     }
     rewriter.eraseOp(op);
     return success();
@@ -804,19 +1011,22 @@ public:
 
     TritonLLVMOpBuilder b(loc, rewriter);
     auto eventStateTy = getGSanAtomicEventStateType(rewriter);
-    Value eventState = LLVM::AllocaOp::create(rewriter, loc, ptr_ty(ctx),
-                                              eventStateTy, b.i32_val(1),
-                                              /*alignment=*/0);
+    Value eventState =
+        createGSanStackBuffer(rewriter, loc, *targetInfo, eventStateTy);
     for (auto [ptr, success] : llvm::zip_equal(ptrs, matched)) {
       Value pred = ttg::maybeAnd(rewriter, loc, threadPred, success);
-      emitGSanAtomicBeginCall(rewriter, loc, *gsanGlobalStatePtr, eventState,
-                              pred, ptr, bytesPerElem, bytesPerElem,
-                              /*doesRead=*/true,
+      emitGSanAtomicElement(rewriter, loc, *targetInfo, pred, TypeRange{}, [&] {
+        emitGSanAtomicBeginCall(rewriter, loc, *gsanGlobalStatePtr, eventState,
+                                pred, ptr, bytesPerElem, bytesPerElem,
+                                /*doesRead=*/true,
+                                static_cast<int32_t>(op.getSem()),
+                                static_cast<int32_t>(op.getScope()), sourceLoc);
+        emitGSanAtomicEndCall(rewriter, loc, eventState, pred, b.false_val(),
+                              /*isRmw=*/false,
                               static_cast<int32_t>(op.getSem()),
                               static_cast<int32_t>(op.getScope()), sourceLoc);
-      emitGSanAtomicEndCall(rewriter, loc, eventState, pred, b.false_val(),
-                            /*isRmw=*/false, static_cast<int32_t>(op.getSem()),
-                            static_cast<int32_t>(op.getScope()), sourceLoc);
+        return SmallVector<Value>{};
+      });
     }
 
     rewriter.eraseOp(op);
@@ -842,6 +1052,10 @@ public:
                   ConversionPatternRewriter &rewriter) const override {
     auto *ctx = rewriter.getContext();
     Location loc = op.getLoc();
+    // Reject unsupported atomics before creating any IR.
+    if (!targetInfo->isCuda() && (!matchAtomicOp(op.getAtomicRmwOp()) ||
+                                  !getMemoryOrdering(op.getSem())))
+      return rewriter.notifyMatchFailure(op, "unsupported GSan atomic RMW");
     auto gsanGlobalStatePtr = getGSanGlobalStateArg(op, rewriter, loc);
     if (failed(gsanGlobalStatePtr))
       return failure();
@@ -871,9 +1085,8 @@ public:
                                                          loc, *targetInfo);
     auto sourceLoc = materializeSourceLocation(rewriter, loc);
     auto eventStateTy = getGSanAtomicEventStateType(rewriter);
-    Value eventState = LLVM::AllocaOp::create(rewriter, loc, ptr_ty(ctx),
-                                              eventStateTy, b.i32_val(1),
-                                              /*alignment=*/0);
+    Value eventState =
+        createGSanStackBuffer(rewriter, loc, *targetInfo, eventStateTy);
 
     SmallVector<Value> resultVals(elemsPerThread);
 
@@ -884,21 +1097,31 @@ public:
       Value rmwPtr = ptrElements[i];
       Value rmwVal = valElements[i];
 
-      emitGSanAtomicBeginCall(rewriter, loc, *gsanGlobalStatePtr, eventState,
-                              pred, rmwPtr, bytesPerElem, bytesPerElem,
-                              /*doesRead=*/true, static_cast<int32_t>(sem),
-                              static_cast<int32_t>(scope), sourceLoc);
+      bool rmwFailed = false;
+      auto results = emitGSanAtomicElement(
+          rewriter, loc, *targetInfo, pred, valueElemTy, [&] {
+            emitGSanAtomicBeginCall(
+                rewriter, loc, *gsanGlobalStatePtr, eventState, pred, rmwPtr,
+                bytesPerElem, bytesPerElem,
+                /*doesRead=*/true, static_cast<int32_t>(sem),
+                static_cast<int32_t>(scope), sourceLoc);
 
-      SmallVector<Value> rmwVals{rmwVal};
-      auto old = NVIDIA::emitPtxAtomicRMW(rewriter, loc, valueElemTy, rmwPtr,
-                                          rmwVals, rmwOp, sem, scope, pred);
-      if (failed(old))
+            auto old =
+                emitGSanUserAtomicRMW(rewriter, loc, *targetInfo, valueElemTy,
+                                      rmwPtr, rmwVal, rmwOp, sem, scope, pred);
+            if (failed(old)) {
+              rmwFailed = true;
+              return SmallVector<Value>{b.undef(valueElemTy)};
+            }
+
+            emitGSanAtomicEndCall(rewriter, loc, eventState, pred, pred,
+                                  /*isRmw=*/true, static_cast<int32_t>(sem),
+                                  static_cast<int32_t>(scope), sourceLoc);
+            return SmallVector<Value>{*old};
+          });
+      if (rmwFailed)
         return failure();
-
-      emitGSanAtomicEndCall(rewriter, loc, eventState, pred, pred,
-                            /*isRmw=*/true, static_cast<int32_t>(sem),
-                            static_cast<int32_t>(scope), sourceLoc);
-      resultVals[i] = *old;
+      resultVals[i] = results.front();
     }
 
     finalizeAtomicResults(op, rewriter, resultVals, threadPred, *targetInfo,
@@ -951,9 +1174,8 @@ public:
                                                          loc, *targetInfo);
     auto sourceLoc = materializeSourceLocation(rewriter, loc);
     auto eventStateTy = getGSanAtomicEventStateType(rewriter);
-    Value eventState = LLVM::AllocaOp::create(rewriter, loc, ptr_ty(ctx),
-                                              eventStateTy, b.i32_val(1),
-                                              /*alignment=*/0);
+    Value eventState =
+        createGSanStackBuffer(rewriter, loc, *targetInfo, eventStateTy);
 
     SmallVector<Value> resultVals(elemsPerThread);
 
@@ -963,23 +1185,29 @@ public:
       Value casCmp = cmpElements[i];
       Value casVal = valElements[i];
 
-      emitGSanAtomicBeginCall(rewriter, loc, *gsanGlobalStatePtr, eventState,
-                              pred, casPtr, bytesPerElem, bytesPerElem,
-                              /*doesRead=*/true, static_cast<int32_t>(sem),
-                              static_cast<int32_t>(scope), sourceLoc);
+      auto results = emitGSanAtomicElement(
+          rewriter, loc, *targetInfo, pred, valueElemTy, [&] {
+            emitGSanAtomicBeginCall(
+                rewriter, loc, *gsanGlobalStatePtr, eventState, pred, casPtr,
+                bytesPerElem, bytesPerElem,
+                /*doesRead=*/true, static_cast<int32_t>(sem),
+                static_cast<int32_t>(scope), sourceLoc);
 
-      Value old = NVIDIA::emitPtxAtomicCAS(rewriter, loc, valueElemTy, casPtr,
-                                           casCmp, casVal, sem, scope, pred);
+            Value old =
+                emitGSanUserAtomicCAS(rewriter, loc, *targetInfo, valueElemTy,
+                                      casPtr, casCmp, casVal, sem, scope, pred);
 
-      auto oldInt = bitcastToScalarInt(rewriter, loc, old);
-      auto cmpInt = bitcastToScalarInt(rewriter, loc, casCmp);
-      Value didWrite = LLVM::ICmpOp::create(
-          rewriter, loc, i1_ty, LLVM::ICmpPredicate::eq, oldInt, cmpInt);
-      didWrite = ttg::maybeAnd(rewriter, loc, pred, didWrite);
-      emitGSanAtomicEndCall(rewriter, loc, eventState, pred, didWrite,
-                            /*isRmw=*/true, static_cast<int32_t>(sem),
-                            static_cast<int32_t>(scope), sourceLoc);
-      resultVals[i] = old;
+            auto oldInt = bitcastToScalarInt(rewriter, loc, old);
+            auto cmpInt = bitcastToScalarInt(rewriter, loc, casCmp);
+            Value didWrite = LLVM::ICmpOp::create(
+                rewriter, loc, i1_ty, LLVM::ICmpPredicate::eq, oldInt, cmpInt);
+            didWrite = ttg::maybeAnd(rewriter, loc, pred, didWrite);
+            emitGSanAtomicEndCall(rewriter, loc, eventState, pred, didWrite,
+                                  /*isRmw=*/true, static_cast<int32_t>(sem),
+                                  static_cast<int32_t>(scope), sourceLoc);
+            return SmallVector<Value>{old};
+          });
+      resultVals[i] = results.front();
     }
 
     finalizeAtomicResults(op, rewriter, resultVals, threadPred, *targetInfo,
@@ -993,6 +1221,11 @@ struct GSanInitOpConversion
 public:
   using ConvertOpToLLVMPattern<
       tti::ExperimentalGSanInitOp>::ConvertOpToLLVMPattern;
+  const TargetInfoBase *targetInfo;
+
+  GSanInitOpConversion(LLVMTypeConverter &typeConverter,
+                       const TargetInfoBase &targetInfo)
+      : ConvertOpToLLVMPattern(typeConverter), targetInfo(&targetInfo) {}
 
   LogicalResult
   matchAndRewrite(tti::ExperimentalGSanInitOp op,
@@ -1017,7 +1250,7 @@ public:
     auto threadIdx = mlir::getThreadId(rewriter, loc);
     auto numThreads = b.i32_val(ttg::lookupNumWarps(op) *
                                 ttg::lookupThreadsPerWarp(rewriter));
-    Value barrierId = tt::nvgpu::WarpGroupBarrierIdOp::create(rewriter, loc);
+    Value barrierId = getGSanBarrierId(rewriter, loc, *targetInfo);
     b.call(runtimeFunc, ValueRange{*gsanGlobalStatePtr, *launchTablePtr,
                                    *launchIndex, threadIdx, numThreads,
                                    barrierId, sourceLoc.file, sourceLoc.line});
@@ -1030,6 +1263,11 @@ public:
 template <typename OpTy>
 struct GSanStreamClockOpConversion : public ConvertOpToLLVMPattern<OpTy> {
   using ConvertOpToLLVMPattern<OpTy>::ConvertOpToLLVMPattern;
+  const TargetInfoBase *targetInfo;
+
+  GSanStreamClockOpConversion(LLVMTypeConverter &typeConverter,
+                              const TargetInfoBase &targetInfo)
+      : ConvertOpToLLVMPattern<OpTy>(typeConverter), targetInfo(&targetInfo) {}
 
   LogicalResult
   matchAndRewrite(OpTy op, typename OpTy::Adaptor adaptor,
@@ -1052,7 +1290,7 @@ struct GSanStreamClockOpConversion : public ConvertOpToLLVMPattern<OpTy> {
     auto threadIdx = mlir::getThreadId(rewriter, loc);
     auto numThreads = b.i32_val(ttg::lookupNumWarps(op) *
                                 ttg::lookupThreadsPerWarp(rewriter));
-    Value barrierId = tt::nvgpu::WarpGroupBarrierIdOp::create(rewriter, loc);
+    Value barrierId = getGSanBarrierId(rewriter, loc, *targetInfo);
     SmallVector<Value> args{*gsanGlobalStatePtr, *launchTablePtr, *launchIndex,
                             threadIdx,           numThreads,      barrierId};
     if constexpr (std::is_same_v<OpTy, tti::ExperimentalGSanKernelExitOp>) {
@@ -1321,11 +1559,11 @@ void mlir::triton::populateGSanToLLVMPatterns(
     LLVMTypeConverter &typeConverter, RewritePatternSet &patterns,
     ModuleAxisInfoAnalysis &axisInfoAnalysis,
     const TargetInfoBase &targetInfo) {
-  patterns.add<GSanInitOpConversion>(typeConverter);
+  patterns.add<GSanInitOpConversion>(typeConverter, targetInfo);
   patterns.add<
       GSanStreamClockOpConversion<tti::ExperimentalGSanKernelExitOp>,
       GSanStreamClockOpConversion<tti::ExperimentalGSanGridDependencyWaitOp>>(
-      typeConverter);
+      typeConverter, targetInfo);
   patterns.add<GSanClusterBarrierInitOpConversion>(typeConverter, targetInfo);
   patterns.add<GSanClusterBarrierSyncOpConversion>(typeConverter, targetInfo);
   patterns.add<GSanMBarrierTableInitOpConversion>(typeConverter, targetInfo);
