@@ -477,9 +477,11 @@ drv::Result refreshConfigForDevice(int device) {
     fprintf(stderr, "gsan allocator: %s\n", sizingError);
     return drv::kErrorNotSupported;
   }
-  if (kUsesSlots && requestedSMs == 0 &&
-      (sizing.numSMs < numCUs ||
-       sizing.clockBufferSize < kDefaultClockBufferSize))
+  // Report automatic choices that reduce race coverage.
+  if (kUsesSlots &&
+      ((requestedSMs == 0 && sizing.numSMs < numCUs) ||
+       (requestedClockBufferSize == 0 &&
+        sizing.clockBufferSize < kDefaultClockBufferSize)))
     fprintf(stderr,
             "gsan allocator: using %d runtime-state slots per device (%d "
             "CUs) and clock buffer size %d for %d devices (set num_slots, "
