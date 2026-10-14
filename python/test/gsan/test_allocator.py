@@ -78,6 +78,9 @@ def _run_default_clock_buffer_fits_check() -> None:
     size = layout["clock_buffer_size"]
     num_sms, num_threads = layout["num_sms"], layout["num_threads"]
     state_end = layout["thread_state_base_ptr"] + layout["thread_state_stride_bytes"] * num_sms
+    if "slot_table_ptr" in layout:
+        # HIP: the slot table follows the thread states.
+        state_end = layout["slot_table_ptr"] + num_sms * layout["slot_entry_bytes"]
     used = state_end - layout["global_state_ptr"]
     assert 0 < size <= 1024
     assert used <= PER_DEVICE_STATE_STRIDE_BYTES
@@ -506,7 +509,9 @@ def _run_malloc_on_non_current_device_check() -> None:
 
 
 @pytest.mark.xdist_group("gsan-multi-gpu")
-@pytest.mark.skipif(not has_gsan_allocator() or torch.cuda.device_count() < 2, reason="requires at least two GPUs")
+# CUDA keeps the caller's current context during allocation (upstream behavior),
+# so this is HIP-only.
+@pytest.mark.skipif(not is_hip() or torch.cuda.device_count() < 2, reason="requires at least two HIP GPUs")
 def test_malloc_on_non_current_device():
     result = run_in_process(_run_malloc_on_non_current_device_check)
     assert result.exc is None
@@ -975,9 +980,10 @@ def _run_explicit_clock_buffer_size_shrinks_default_slots_check() -> None:
     device = torch.cuda.current_device()
     configure(device_ranks={device: 0}, num_devices=1, clock_buffer_size=65535)
     layout = _state_layout_after_malloc(device)
-    # The explicit clock buffer is kept, even at the cost of fewer slots than CUs.
+    # The explicit clock buffer is kept; the automatic slot count shrinks
+    # (below the 512 default, and on gfx950 below the CU count) to fit it.
     assert layout["clock_buffer_size"] == 65535
-    assert 0 < layout["num_slots"] < torch.cuda.get_device_properties(device).multi_processor_count
+    assert 0 < layout["num_slots"] < 512
 
 
 @pytest.mark.skipif(not is_hip(), reason="slot table is HIP-only")
@@ -992,7 +998,8 @@ def _run_thread_state_lookup_unaligned_stride_check() -> None:
     # 511 slots x 9 clocks x 2 B is not a multiple of 8, so thread states are
     # padded to their alignment. With several visible GPUs, the default slot
     # count gives such strides too (e.g. 2 GPUs: 511 slots, 1022 threads).
-    configure(num_slots=511, clock_buffer_size=8)
+    # One device, so the thread count (and thus the stride) is as computed above.
+    configure(device_ranks={device: 0}, num_devices=1, num_slots=511, clock_buffer_size=8)
     ptr = gsan_malloc(4, device)
     target = uint8_cuda_tensor_from_ptr(ptr, 4, device).view(torch.int32)
     try:

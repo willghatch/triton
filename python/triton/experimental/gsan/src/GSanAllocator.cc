@@ -446,7 +446,7 @@ drv::Result refreshConfigForDevice(int device) {
     return err;
 
   int deviceRank = getDeviceRankForCudaDevice(device);
-  if (device < 0)
+  if (deviceRank < 0)
     return drv::kErrorInvalidDevice;
 
   int numCUs = 0;
@@ -478,10 +478,9 @@ drv::Result refreshConfigForDevice(int device) {
     return drv::kErrorNotSupported;
   }
   // Report automatic choices that reduce race coverage.
-  if (kUsesSlots &&
-      ((requestedSMs == 0 && sizing.numSMs < numCUs) ||
-       (requestedClockBufferSize == 0 &&
-        sizing.clockBufferSize < kDefaultClockBufferSize)))
+  if (kUsesSlots && ((requestedSMs == 0 && sizing.numSMs < numCUs) ||
+                     (requestedClockBufferSize == 0 &&
+                      sizing.clockBufferSize < kDefaultClockBufferSize)))
     fprintf(stderr,
             "gsan allocator: using %d runtime-state slots per device (%d "
             "CUs) and clock buffer size %d for %d devices (set num_slots, "
@@ -810,7 +809,7 @@ extern "C" void *gsanMalloc16(ssize_t size, int device, void *stream) {
 }
 
 extern "C" void gsanFree(void *void_ptr, [[maybe_unused]] ssize_t size,
-                         [[maybe_unused]] int device, void *stream) {
+                         int device, void *stream) {
   LOGF("gsanFree: %p, 0x%zx", void_ptr, size);
   auto ptr = reinterpret_cast<uintptr_t>(void_ptr);
   if (!ptr)
@@ -829,8 +828,14 @@ extern "C" void gsanFree(void *void_ptr, [[maybe_unused]] ssize_t size,
 
   // Wait for outstanding work on the deallocation stream, including the
   // allocator's own async shadow memset from gsanMalloc, before unmapping.
+  // On HIP, the null stream belongs to the current device, so select the
+  // allocation's device first.
+  drv::DeviceScope deviceScope;
+  drv::Result err = deviceScope.enter(device);
+  if (err != drv::kSuccess)
+    printDriverError(err);
   auto drvStream = reinterpret_cast<drv::Stream>(stream);
-  drv::Result err = drv::streamSynchronize(drvStream);
+  err = drv::streamSynchronize(drvStream);
   if (err != drv::kSuccess)
     printDriverError(err);
 
