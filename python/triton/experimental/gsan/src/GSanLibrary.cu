@@ -1160,33 +1160,57 @@ GSAN_DEVICE void tensorAccessCooperative(ThreadState *state,
   const uintptr_t *ptrsPtr = reinterpret_cast<const uintptr_t *>(stackPtr);
   const char *maskPtr = stackPtr + nElems * sizeof(uintptr_t);
   uintptr_t reserveBase = state->reserveBase;
-  uintptr_t reserveEnd = reserveBase + kReserveSize;
   int elem = 0;
   uintptr_t addr = 0;
   uintptr_t end = 0;
-  // Advance to the next masked element with GSan-managed cells.
+  // Shadow granularity of the current element's pool: the step between cells.
+  int step = kShadowMemGranularityBytes;
+  // Advance to the next masked element with lockable GSan-managed cells,
+  // applying the same per-element checks as readRange/writeRange. Write-once
+  // cells are updated lock-free right here, so they never need a lock round.
   auto nextElement = [&]() {
     while (elem < nElems) {
       int i = elem++;
       if (!maskPtr[i])
         continue;
-      int granularity = isGsanManaged(ptrsPtr[i], reserveBase)
-                            ? getShadowGranularity(ptrsPtr[i])
-                            : kShadowMemGranularityBytes;
-      auto range = roundRange(
-          Range{ptrsPtr[i], ptrsPtr[i] + bytesPerElem}, granularity);
-      addr = range.start < reserveBase ? reserveBase : range.start;
-      end = range.end < reserveEnd ? range.end : reserveEnd;
+      auto category = categorize(ptrsPtr[i], reserveBase);
+      int granularity = getShadowGranularity(ptrsPtr[i]);
+      auto range =
+          roundRange(Range{ptrsPtr[i], ptrsPtr[i] + bytesPerElem}, granularity);
+      assert_msg(loc,
+                 range.start == range.end ||
+                     categorize(range.end - 1, reserveBase) == category,
+                 "Access crosses a GSan memory category boundary");
+      if (category == AddressCategory::Unmanaged)
+        continue;
+      checkCoarseAccess(ptrsPtr[i], bytesPerElem, granularity, loc);
+      if (category == AddressCategory::WriteOnce) {
+        for (uintptr_t a = range.start; a < range.end; a += granularity) {
+          auto *cell =
+              reinterpret_cast<WriteOnceShadowCell *>(getShadowAddress(a));
+          if (IsStore)
+            doWrite(state, cell, loc);
+          else
+            doRead(state, cell, loc);
+        }
+        continue;
+      }
+      addr = range.start;
+      end = range.end;
+      step = granularity;
       if (addr < end)
         return true;
     }
     return false;
   };
-  bool active = nextElement();
-  // Lanes hold no shadow locks while waiting for the state read lock.
-  bool acquired = active;
+  // Take the state read lock before nextElement() records any write-once
+  // access. Lanes hold no shadow locks while waiting for it.
+  bool acquired = false;
+  for (int i = 0; i < nElems && !acquired; ++i)
+    acquired = maskPtr[i] != 0;
   if (acquired)
     rwLockAcquireRead(state->lock);
+  bool active = nextElement();
   bool systemScope = useSystemScopeShadowLocks(state);
   uint32_t laneId = getLaneId();
   while (true) {
@@ -1218,7 +1242,7 @@ GSAN_DEVICE void tensorAccessCooperative(ThreadState *state,
     uint64_t lockedMask = __builtin_amdgcn_ballot_w64(locked);
     bool leaderLocked = (lockedMask >> leader) & 1;
     if (locked || (follower && leaderLocked)) {
-      addr += kShadowMemGranularityBytes;
+      addr += step;
       if (addr >= end)
         active = nextElement();
     }
@@ -1287,8 +1311,8 @@ GSAN_DEVICE void tensorLoad(ThreadState *state, const char *stackPtr,
 
 template <typename ElementHandler>
 GSAN_DEVICE void tensorAccessRow(uintptr_t rowPtr, int rowBytes,
-                                  int elementGranularity,
-                                  ElementHandler &handleElement) {
+                                 int elementGranularity,
+                                 ElementHandler &handleElement) {
   uintptr_t reserveBase = handleElement.reserveBase;
   if (!isGsanManaged(rowPtr, reserveBase))
     return;
