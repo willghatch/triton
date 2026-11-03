@@ -137,6 +137,7 @@ inline void registerTritonDialects(mlir::DialectRegistry &registry) {
   mlir::registerTritonAMDFoldTrueCmpI();
   mlir::registerTritonAMDGPUFpSanitizer();
   mlir::registerTritonAMDGPUGSanRejectUnsupported();
+  mlir::registerTritonAMDGPUGSanInstrumentBufferOps();
   mlir::registerTritonAMDGPUOptimizeDotOperands();
   mlir::registerConSanAMDHooks();
 

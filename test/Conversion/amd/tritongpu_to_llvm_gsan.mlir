@@ -84,6 +84,27 @@ module attributes {"ttg.instrumentation_mode" = "gsan", "ttg.num-ctas" = 1 : i32
 
 // -----
 
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.instrumentation_mode" = "gsan", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  // A masked GSan CAS (from an AMD buffer CAS, whose out-of-bounds lanes the
+  // hardware suppresses) runs the check and the CAS only in lanes whose mask
+  // is set: only they start pending.
+  // CHECK-LABEL: llvm.func @masked_atomic_cas
+  // CHECK: [[MASK:%[a-zA-Z0-9_.]+]] = llvm.extractvalue %arg3[0]
+  // CHECK: llvm.br ^[[HEADER:[a-zA-Z0-9_.]+]]([[MASK]],
+  // CHECK: ^[[HEADER]](%[[PENDING:[a-zA-Z0-9_.]+]]: i1
+  // CHECK: rocdl.ballot %[[PENDING]] : i64
+  // CHECK: llvm.call @__triton_gsan_atomic_begin_scalar(
+  // CHECK: llvm.cmpxchg
+  // CHECK: llvm.call @__triton_gsan_atomic_end_scalar(
+  tt.func public @masked_atomic_cas(%ptrs: tensor<256x!tt.ptr<i32>, #blocked>, %cmp: tensor<256xi32, #blocked>, %vals: tensor<256xi32, #blocked>, %mask: tensor<256xi1, #blocked>) {
+    %0 = tti.experimental_gsan_atomic_cas acq_rel, gpu, %ptrs, %cmp, %vals, %mask : (tensor<256x!tt.ptr<i32>, #blocked>, tensor<256xi32, #blocked>, tensor<256xi32, #blocked>, tensor<256xi1, #blocked>) -> tensor<256xi32, #blocked>
+    tt.return
+  }
+}
+
+// -----
+
 module attributes {"ttg.instrumentation_mode" = "gsan", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
   // Atomic load, store, and poll checks also hold runtime locks between begin
   // and end, so each is lane-serialized with the user access inside.

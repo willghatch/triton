@@ -655,11 +655,11 @@ class HIPBackend(BaseBackend):
         passes.ttir.add_triton_licm(pm)
         passes.common.add_canonicalizer(pm)
 
-        # The AMD GSan lowering checks tt.load/tt.store/atomics only; it does
-        # not model AMD buffer ops or async copies (no issue/completion window),
-        # so those lowerings are disabled under GSan. Block pingpong
-        # phase-shifts warps with conditional barriers, which GSan has not been
-        # validated with.
+        # GSan checks buffer ops but does not model async copies (no
+        # issue/completion window), so async copies (and thus
+        # buffer_load_to_local from the pipeliner) are disabled under GSan.
+        # Block pingpong phase-shifts warps with conditional barriers, which
+        # GSan has not been validated with.
         gsan = is_enabled(options, "gsan")
         use_async_copy = is_async_copy_enabled(options.base_arch) and not gsan
         use_block_pingpong = is_pingpong_schedule_enabled(options.base_arch, use_async_copy) and not gsan
@@ -679,7 +679,7 @@ class HIPBackend(BaseBackend):
         if use_block_pingpong and options.num_stages > 1:
             amd.passes.ttgpuir.add_block_pingpong(pm, options.num_stages)
 
-        if knobs.amd.use_buffer_ops and not gsan:
+        if knobs.amd.use_buffer_ops:
             amd.passes.ttgpuir.add_canonicalize_pointers(pm)
             passes.common.add_canonicalizer(pm)
             amd.passes.ttgpuir.add_convert_to_buffer_ops(
@@ -743,8 +743,14 @@ class HIPBackend(BaseBackend):
             # global accesses added later by the "ttgpuir-to-llvmir"
             # instrumentation hook.
             # Fail clearly on global-memory ops GSan cannot check (e.g. Gluon
-            # buffer ops/async copies) before instrumenting.
+            # async copies) before instrumenting.
             amd.passes.ttgpuir.add_gsan_reject_unsupported(pm)
+            # Buffer ops become GSan checks/atomics on their global addresses.
+            # Like all GSan instrumentation ops, these find the GSan function
+            # arguments only when lowered, so running before the global
+            # sanitizer (which adds those arguments) is fine; it ignores amdg
+            # ops and the GSan ops created here, so nothing is checked twice.
+            amd.passes.ttgpuir.add_gsan_instrument_buffer_ops(pm)
             # GSan introduces layout conversions and atomics needing LDS
             # scratch, so it must run before shared-memory allocation.
             # AMD has no programmatic dependent launch.
