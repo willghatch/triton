@@ -20,22 +20,20 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
 
 // -----
 
-#blocked = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
-module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
-  tt.func @buffer_load(%arg0: !tt.ptr<f32>, %offset: tensor<256xi32, #blocked>) {
-    // expected-error@+1 {{GSan on AMD cannot check global-memory operation 'amdg.buffer_load'}}
-    %ret = amdg.buffer_load %arg0[%offset] : !tt.ptr<f32> -> tensor<256xf32, #blocked>
-    tt.return
-  }
-}
-
-// -----
+// AMD buffer ops other than buffer_load_to_local are instrumented by a later
+// GSan pass, and building a descriptor accesses no memory.
 
 #blocked = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
-  tt.func @buffer_store(%arg0: !tt.ptr<f32>, %offset: tensor<256xi32, #blocked>, %value: tensor<256xf32, #blocked>) {
-    // expected-error@+1 {{GSan on AMD cannot check global-memory operation 'amdg.buffer_store'}}
-    amdg.buffer_store %value, %arg0[%offset] : !tt.ptr<f32> -> tensor<256xf32, #blocked>
+  // CHECK-LABEL: @supported_buffer_ops
+  tt.func @supported_buffer_ops(%ptr: !tt.ptr<i32>, %n: i32, %offsets: tensor<256xi32, #blocked>, %value: tensor<256xi32, #blocked>) {
+    %desc = amdg.make_buffer_desc %ptr, %n : !tt.ptr<i32> -> !amdg.buffer_desc<i32>
+    %0 = amdg.buffer_load %desc[%offsets] : !amdg.buffer_desc<i32> -> tensor<256xi32, #blocked>
+    amdg.buffer_store %0, %ptr[%offsets] : !tt.ptr<i32> -> tensor<256xi32, #blocked>
+    %1 = amdg.buffer_atomic_rmw add, acq_rel, gpu, %value, %ptr[%offsets] : !tt.ptr<i32> -> tensor<256xi32, #blocked>
+    %2 = amdg.buffer_atomic_cas acq_rel, gpu, %0, %1, %ptr[%offsets] : !tt.ptr<i32> -> tensor<256xi32, #blocked>
+    %3 = amdg.buffer_atomic_load acquire, gpu, %desc[%offsets] : !amdg.buffer_desc<i32> -> tensor<256xi32, #blocked>
+    amdg.buffer_atomic_store release, gpu, %3, %desc[%offsets] : !amdg.buffer_desc<i32> -> tensor<256xi32, #blocked>
     tt.return
   }
 }
@@ -128,17 +126,6 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   tt.func @buffer_load_to_local(%ptr: !tt.ptr<f32>, %offsets: tensor<32x64xi32, #blocked>, %buffer: !ttg.memdesc<32x64xf32, #shared, #smem, mutable>) {
     // expected-error@+1 {{GSan on AMD cannot check global-memory operation 'amdg.buffer_load_to_local'}}
     %token = amdg.buffer_load_to_local %ptr[%offsets] into %buffer : !tt.ptr<f32>[tensor<32x64xi32, #blocked>] -> <32x64xf32, #shared, #smem, mutable>
-    tt.return
-  }
-}
-
-// -----
-
-#blocked = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
-module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
-  tt.func @buffer_atomic_rmw(%ptr: !tt.ptr<f32>, %offsets: tensor<256xi32, #blocked>, %value: tensor<256xf32, #blocked>) {
-    // expected-error@+1 {{GSan on AMD cannot check global-memory operation 'amdg.buffer_atomic_rmw'}}
-    %0 = amdg.buffer_atomic_rmw fadd, acq_rel, gpu, %value, %ptr[%offsets] : !tt.ptr<f32> -> tensor<256xf32, #blocked>
     tt.return
   }
 }

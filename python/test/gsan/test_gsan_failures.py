@@ -1218,3 +1218,133 @@ def test_transitive_cta_scope_read_after_write(shadow_granularity, release_sem, 
                       source_function=_transitive_atomic_sync_kernel.fn,
                       marker="ready = tl.atomic_add(flag0_ptr, 0, sem=relay_sem, scope=scope)",
                       error="Read after write race detected")
+
+
+# On AMD, tensor accesses through a kernel-argument base are converted to
+# buffer ops (amdg.buffer_*), which GSan checks on the reconstructed addresses.
+@triton.jit
+def _buffer_race_kernel(ptr, scratch_ptr, counter_ptr, KIND: tl.constexpr, BLOCK: tl.constexpr):
+    offsets = tl.arange(0, BLOCK)
+    pid = tl.program_id(0)
+    if pid == 0:
+        if KIND == "war":
+            first_read = tl.load(ptr + offsets)
+            tl.store(scratch_ptr + offsets, first_read)
+        else:
+            tl.store(ptr + offsets, offsets)
+        tl.atomic_add(counter_ptr, 1, sem="relaxed")
+    else:
+        atomic_poll(counter_ptr, 1)
+        if KIND == "raw":
+            second_read = tl.load(ptr + offsets)
+            tl.store(scratch_ptr + offsets, second_read)
+        else:
+            tl.store(ptr + offsets, offsets + 1)
+
+
+def _assert_buffer_ops(compiled, *ops) -> None:
+    ttgir = compiled.asm["ttgir"]
+    for op in ops:
+        assert f"amdg.{op} " in ttgir, f"expected amdg.{op} in TTGIR:\n{ttgir}"
+
+
+@run_with_gsan
+def _run_buffer_race_case(kind: str) -> None:
+    block = 64
+    target = torch.zeros(block, dtype=torch.int32, device="cuda")
+    scratch = torch.zeros_like(target)
+    counter = torch.zeros(1, dtype=torch.int32, device="cuda")
+    args = (target, scratch, counter)
+    compiled = _buffer_race_kernel.warmup(*args, KIND=kind, BLOCK=block, num_warps=1, grid=(2, ))
+    _assert_buffer_ops(compiled, "buffer_load" if kind != "waw" else "buffer_store", "buffer_store")
+    _buffer_race_kernel[(2, )](*args, KIND=kind, BLOCK=block, num_warps=1)
+    torch.cuda.synchronize()
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="AMD buffer ops")
+@pytest.mark.parametrize("kind,marker,error", [
+    ("raw", "second_read = tl.load(ptr + offsets)", "Read after write race detected"),
+    ("war", "tl.store(ptr + offsets, offsets + 1)", "Write after read race detected"),
+    ("waw", "tl.store(ptr + offsets, offsets + 1)", "Write after write race detected"),
+])
+def test_buffer_op_race(kind, marker, error):
+    _run_failure_case(f"buffer_{kind}", runner=_run_buffer_race_case, runner_args=(kind, ),
+                      source_function=_buffer_race_kernel.fn, marker=marker, error=error)
+
+
+@gluon.jit
+def _gluon_buffer_desc_race_kernel(ptr, scratch_ptr, counter_ptr):
+    offsets = gl.arange(0, 64, layout=gl.BlockedLayout([1], [THREADS_PER_WARP], [1], [0]))
+    pid = gl.program_id(0)
+    if pid == 0:
+        gl.store(ptr + 64 + offsets, 1)
+        gl.atomic_add(counter_ptr, 1, sem="relaxed")
+    else:
+        while gl.atomic_add(counter_ptr, 0, sem="relaxed") != 1:
+            pass
+        desc = gl.amd.cdna4.buffer.make_buffer_descriptor(ptr, 128 * 4)
+        # Only the scalar offset moves these reads onto block 0's writes.
+        values = gl.amd.cdna4.buffer.load(desc, offsets, soffset=64)
+        gl.store(scratch_ptr + offsets, values)
+
+
+@run_with_gsan
+def _run_gluon_buffer_desc_race_case() -> None:
+    target = torch.zeros(128, dtype=torch.int32, device="cuda")
+    scratch = torch.zeros(64, dtype=torch.int32, device="cuda")
+    counter = torch.zeros(1, dtype=torch.int32, device="cuda")
+    _gluon_buffer_desc_race_kernel[(2, )](target, scratch, counter, num_warps=1)
+    torch.cuda.synchronize()
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="AMD buffer ops")
+def test_gluon_buffer_descriptor_soffset_read_after_write():
+    _run_failure_case("gluon_buffer_desc_raw", runner=_run_gluon_buffer_desc_race_case,
+                      source_function=_gluon_buffer_desc_race_kernel.fn,
+                      marker="values = gl.amd.cdna4.buffer.load(desc, offsets, soffset=64)",
+                      error="Read after write race detected")
+
+
+@triton.jit
+def _buffer_atomic_handoff_kernel(payload_ptr, flag_ptr, counter_ptr, scratch_ptr, PRODUCER_SEM: tl.constexpr,
+                                  CONSUMER_SEM: tl.constexpr, CONSUMER_OP: tl.constexpr):
+    # One-element tensors, so that the flag atomics become buffer atomics.
+    one = tl.arange(0, 1)
+    pid = tl.program_id(0)
+    if pid == 0:
+        tl.store(payload_ptr + one, 1000)
+        tl.atomic_xchg(flag_ptr + one, 1, sem=PRODUCER_SEM)
+        tl.atomic_add(counter_ptr, 1, sem="relaxed")
+    else:
+        atomic_poll(counter_ptr, 1)
+        ready = 0
+        while ready != 1:
+            if CONSUMER_OP == "cas":
+                ready = tl.sum(tl.atomic_cas(flag_ptr + one, 1, 1, sem=CONSUMER_SEM))
+            else:
+                ready = tl.sum(tl.atomic_add(flag_ptr + one, 0, sem=CONSUMER_SEM))
+        result = tl.load(payload_ptr + one)
+        tl.store(scratch_ptr + one, result)
+
+
+@run_with_gsan
+def _run_buffer_atomic_handoff_case(producer_sem: str, consumer_sem: str, consumer_op: str) -> None:
+    payload = torch.zeros(1, dtype=torch.int32, device="cuda")
+    flag = torch.zeros(1, dtype=torch.int32, device="cuda")
+    counter = torch.zeros(1, dtype=torch.int32, device="cuda")
+    scratch = torch.full((1, ), -1, dtype=torch.int32, device="cuda")
+    args = (payload, flag, counter, scratch, producer_sem, consumer_sem, consumer_op)
+    compiled = _buffer_atomic_handoff_kernel.warmup(*args, num_warps=1, grid=(2, ))
+    _assert_buffer_ops(compiled, "buffer_atomic_rmw", "buffer_atomic_cas" if consumer_op == "cas" else "buffer_load")
+    _buffer_atomic_handoff_kernel[(2, )](*args, num_warps=1)
+    torch.cuda.synchronize()
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="AMD buffer atomics")
+@pytest.mark.parametrize("producer_sem, consumer_sem", [("relaxed", "acquire"), ("release", "relaxed")])
+@pytest.mark.parametrize("consumer_op", ["rmw", "cas"])
+def test_buffer_atomic_semantic_mismatch_read_after_write(producer_sem, consumer_sem, consumer_op):
+    _run_failure_case(f"buffer_atomic_handoff_{producer_sem}_{consumer_sem}_{consumer_op}",
+                      runner=_run_buffer_atomic_handoff_case, runner_args=(producer_sem, consumer_sem, consumer_op),
+                      source_function=_buffer_atomic_handoff_kernel.fn, marker="result = tl.load(payload_ptr + one)",
+                      error="Read after write race detected")

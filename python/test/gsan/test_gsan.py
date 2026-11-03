@@ -919,35 +919,35 @@ def _gsan_pipelined_matmul_kernel(a_ptr, b_ptr, c_ptr, K, BM: tl.constexpr, BN: 
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="buffer ops and async copies are AMD gfx950 lowerings")
-def test_gsan_amd_keeps_global_accesses_instrumentable(with_gsan):
-    # Without GSan, gfx950 turns these loads/atomics into buffer ops and async
-    # copies, which GSan cannot check; under GSan they must stay tt.load/atomic.
+def test_gsan_amd_uses_buffer_ops_without_async_copy(with_gsan):
+    # GSan checks buffer ops, so gfx950 keeps converting these loads/atomics
+    # to buffer ops; async copies (and buffer_load_to_local) stay disabled.
     a = torch.randn(64, 256, dtype=torch.float16, device="cuda")
     b = torch.randn(256, 64, dtype=torch.float16, device="cuda")
     c = torch.zeros(64, 64, dtype=torch.float32, device="cuda")
     compiled = _gsan_pipelined_matmul_kernel.warmup(a, b, c, 256, BM=64, BN=64, BK=64, num_stages=2, grid=(1, ))
     ttgir = compiled.asm["ttgir"]
-    assert "amdg.buffer_" not in ttgir
-    assert "async_copy" not in ttgir
-    assert "tt.load" in ttgir and "tt.atomic_rmw" in ttgir
+    assert "amdg.buffer_load " in ttgir and "amdg.buffer_atomic_rmw " in ttgir
+    assert "async_copy" not in ttgir and "buffer_load_to_local" not in ttgir
 
 
 @gluon.jit
-def _gluon_amd_buffer_load_kernel(ptr, out_ptr):
+def _gluon_amd_buffer_load_to_shared_kernel(ptr):
     layout: gl.constexpr = gl.BlockedLayout([1], [64], [1], [0])
     offsets = gl.arange(0, 64, layout)
-    values = gl.amd.cdna4.buffer_load(ptr, offsets)
-    gl.store(out_ptr + offsets, values)
+    smem = gl.allocate_shared_memory(gl.int32, [64], gl.SwizzledSharedLayout(1, 1, 1, [0]))
+    gl.amd.cdna4.async_copy.buffer_load_to_shared(smem, ptr, offsets)
+    gl.amd.cdna4.async_copy.commit_group()
+    gl.amd.cdna4.async_copy.wait_group(0)
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="AMD buffer ops")
-def test_gsan_amd_rejects_gluon_buffer_ops(with_gsan, capfd):
+def test_gsan_amd_rejects_buffer_load_to_local(with_gsan, capfd):
     src = torch.zeros(64, dtype=torch.int32, device="cuda")
-    out = torch.zeros_like(src)
     with pytest.raises(RuntimeError, match="PassManager::run failed"):
-        _gluon_amd_buffer_load_kernel.warmup(src, out, num_warps=1, grid=(1, ))
+        _gluon_amd_buffer_load_to_shared_kernel.warmup(src, num_warps=1, grid=(1, ))
     captured = capfd.readouterr()
-    assert "GSan on AMD cannot check global-memory operation 'amdg.buffer_load'" in captured.err
+    assert "GSan on AMD cannot check global-memory operation 'amdg.buffer_load_to_local'" in captured.err
 
 
 @triton.jit
@@ -2294,3 +2294,178 @@ def test_gsan_shared_cell_contention():
         mp.setenv("TRITON_TEST_PROCESS_TIMEOUT", os.environ.get("TRITON_TEST_PROCESS_TIMEOUT", "300"))
         result = run_in_process(_run_shared_cell_contention, allow_abort=True)
     assert result.exc is None, f"{result.exc}\n{result.driver_stderr_output}"
+
+
+# On AMD, tensor accesses through a kernel-argument base are converted to
+# buffer ops (amdg.buffer_*), which GSan checks on the reconstructed addresses.
+def _assert_buffer_ops(compiled, *ops) -> None:
+    ttgir = compiled.asm["ttgir"]
+    for op in ops:
+        assert f"amdg.{op} " in ttgir, f"expected amdg.{op} in TTGIR:\n{ttgir}"
+
+
+@triton.jit
+def _buffer_write_blocks_kernel(ptr, arrived_ptr, BLOCK: tl.constexpr):
+    # Keep both blocks resident at once; the relaxed atomics order nothing.
+    tl.atomic_add(arrived_ptr, 1, sem="relaxed")
+    atomic_poll(arrived_ptr, tl.num_programs(0))
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    tl.store(ptr + offsets, offsets)
+
+
+@triton.jit
+def _buffer_read_other_block_kernel(ptr, out_ptr, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    offsets = (tl.num_programs(0) - 1 - pid) * BLOCK + tl.arange(0, BLOCK)
+    tl.store(out_ptr + offsets, tl.load(ptr + offsets) + 1)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="AMD buffer ops")
+@pytest.mark.parametrize("shadow_granularity", [4, 16], indirect=True)
+def test_buffer_ops_disjoint_or_launch_ordered_accesses_do_not_race(with_gsan, capfd):
+    # Two concurrent blocks write disjoint ranges from the same base (a check
+    # on the scalar base alone would see a write-write race), then a second
+    # launch on the same stream reads the other block's range. In 16-byte
+    # pools this also needs the per-element checks merged into whole 16-byte
+    # accesses.
+    block = 256
+    data = torch.zeros(2 * block, dtype=torch.int32, device="cuda")
+    out = torch.zeros_like(data)
+    # Atomics need a pool finer than 16 bytes.
+    with torch.cuda.use_mem_pool(create_mem_pool(shadow_granularity=4)):
+        arrived = torch.zeros(1, dtype=torch.int32, device="cuda")
+    _assert_buffer_ops(_buffer_write_blocks_kernel.warmup(data, arrived, BLOCK=block, num_warps=1, grid=(2, )),
+                       "buffer_store")
+    _assert_buffer_ops(_buffer_read_other_block_kernel.warmup(data, out, BLOCK=block, num_warps=1, grid=(2, )),
+                       "buffer_load", "buffer_store")
+    _buffer_write_blocks_kernel[(2, )](data, arrived, BLOCK=block, num_warps=1)
+    _buffer_read_other_block_kernel[(2, )](data, out, BLOCK=block, num_warps=1)
+    torch.cuda.synchronize()
+    expected = torch.arange(2 * block, dtype=torch.int32, device="cuda")
+    assert torch.equal(data, expected)
+    assert torch.equal(out, expected + 1)
+    _assert_no_gsan_runtime_output(capfd)
+
+
+@triton.jit
+def _buffer_atomic_handoff_kernel(payload_ptr, flag_ptr, out_ptr, CONSUMER_OP: tl.constexpr, BLOCK: tl.constexpr):
+    offsets = tl.arange(0, BLOCK)
+    # One-element tensors, so that the flag atomics become buffer atomics.
+    one = tl.arange(0, 1)
+    if tl.program_id(0) == 0:
+        tl.store(payload_ptr + offsets, offsets + 1000)
+        tl.atomic_xchg(flag_ptr + one, 1, sem="release")
+    else:
+        ready = 0
+        while ready != 1:
+            if CONSUMER_OP == "cas":
+                ready = tl.sum(tl.atomic_cas(flag_ptr + one, 1, 1, sem="acquire"))
+            else:
+                ready = tl.sum(tl.atomic_add(flag_ptr + one, 0, sem="acquire"))
+        tl.store(out_ptr + offsets, tl.load(payload_ptr + offsets))
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="AMD buffer atomics")
+@pytest.mark.parametrize("consumer_op", ["rmw", "cas"])
+def test_buffer_atomic_release_acquire_handoff_does_not_race(with_gsan, capfd, consumer_op):
+    block = 64
+    payload = torch.zeros(block, dtype=torch.int32, device="cuda")
+    flag = torch.zeros(1, dtype=torch.int32, device="cuda")
+    out = torch.zeros_like(payload)
+    args = (payload, flag, out, consumer_op)
+    compiled = _buffer_atomic_handoff_kernel.warmup(*args, BLOCK=block, num_warps=1, grid=(2, ))
+    _assert_buffer_ops(compiled, "buffer_load", "buffer_store", "buffer_atomic_rmw",
+                       *(["buffer_atomic_cas"] if consumer_op == "cas" else []))
+    _buffer_atomic_handoff_kernel[(2, )](*args, BLOCK=block, num_warps=1)
+    torch.cuda.synchronize()
+    assert torch.equal(out, torch.arange(block, dtype=torch.int32, device="cuda") + 1000)
+    _assert_no_gsan_runtime_output(capfd)
+
+
+@triton.jit
+def _buffer_atomic_results_kernel(counter_ptr, cas_ptr, old_ptr, cas_old_ptr, BLOCK: tl.constexpr):
+    offsets = tl.arange(0, BLOCK)
+    old = tl.atomic_add(counter_ptr + offsets, offsets, mask=offsets < BLOCK - 8, sem="relaxed")
+    tl.store(old_ptr + offsets, old, mask=offsets < BLOCK - 8)
+    # Only even elements hold the compare value 0.
+    cas_old = tl.atomic_cas(cas_ptr + offsets, 0, offsets + 100, sem="acq_rel")
+    tl.store(cas_old_ptr + offsets, cas_old)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="AMD buffer atomics")
+def test_buffer_atomic_results_are_preserved(with_gsan, capfd):
+    block = 64
+    idx = torch.arange(block, dtype=torch.int32, device="cuda")
+    counter = torch.full((block, ), 5, dtype=torch.int32, device="cuda")
+    cas = (idx % 2).clone()
+    old = torch.full_like(idx, -1)
+    cas_old = torch.full_like(idx, -1)
+    args = (counter, cas, old, cas_old)
+    _assert_buffer_ops(_buffer_atomic_results_kernel.warmup(*args, BLOCK=block, num_warps=1, grid=(1, )),
+                       "buffer_atomic_rmw", "buffer_atomic_cas")
+    _buffer_atomic_results_kernel[(1, )](*args, BLOCK=block, num_warps=1)
+    torch.cuda.synchronize()
+    active = idx < block - 8
+    assert torch.equal(counter, torch.where(active, 5 + idx, 5))
+    assert torch.equal(old, torch.where(active, 5, -1))
+    assert torch.equal(cas_old, idx % 2)
+    assert torch.equal(cas, torch.where(idx % 2 == 0, idx + 100, 1))
+    _assert_no_gsan_runtime_output(capfd)
+
+
+@gluon.jit
+def _gluon_buffer_bounds_kernel(ptr, out_ptr, arrived_ptr):
+    offsets = gl.arange(0, 64, layout=gl.BlockedLayout([1], [THREADS_PER_WARP], [1], [0]))
+    # Keep both blocks resident at once; the relaxed atomics order nothing.
+    gl.atomic_add(arrived_ptr, 1, sem="relaxed")
+    while gl.atomic_add(arrived_ptr, 0, sem="relaxed") != 2:
+        pass
+    if gl.program_id(0) == 0:
+        # Unsynchronized writes to elements 12..63.
+        gl.store(ptr + 12 + offsets, 1, mask=offsets < 52)
+    else:
+        # Element i is base[8 + i]. Elements 0..3 are accessed. Elements 4..7
+        # (base[12..15]) are in bounds but masked off, and elements 8.. lie
+        # past the 16-element bound; both overlap block 0's writes.
+        desc = gl.amd.cdna4.buffer.make_buffer_descriptor(ptr, 16 * 4)
+        mask = offsets < 4
+        values = gl.amd.cdna4.buffer.load(desc, offsets, mask=mask, soffset=8)
+        gl.amd.cdna4.buffer.store(values + 1, desc, offsets, mask=mask, soffset=8)
+        gl.store(out_ptr + offsets, values)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="AMD buffer ops")
+def test_gluon_buffer_masked_and_out_of_bounds_lanes_do_not_race(with_gsan, capfd):
+    data = torch.arange(64, dtype=torch.int32, device="cuda")
+    out = torch.full((64, ), -1, dtype=torch.int32, device="cuda")
+    arrived = torch.zeros(1, dtype=torch.int32, device="cuda")
+    _gluon_buffer_bounds_kernel[(2, )](data, out, arrived, num_warps=1)
+    torch.cuda.synchronize()
+    idx = torch.arange(64, dtype=torch.int32, device="cuda")
+    assert torch.equal(out, torch.where(idx < 4, idx + 8, 0))
+    assert torch.equal(data, torch.where(idx < 8, idx, torch.where(idx < 12, idx + 1, 1)))
+    _assert_no_gsan_runtime_output(capfd)
+
+
+@gluon.jit
+def _gluon_buffer_atomic_load_store_kernel(ptr, out_ptr):
+    offsets = gl.arange(0, 64, layout=gl.BlockedLayout([1], [THREADS_PER_WARP], [1], [0]))
+    desc = gl.amd.cdna4.buffer.make_buffer_descriptor(ptr, 32 * 4)
+    # Elements 32..47 are out of bounds and dropped; 48.. are masked off.
+    gl.amd.cdna4.buffer.atomic_store(offsets + 100, desc, offsets, mask=offsets < 48, sem="release")
+    # Masked-off and out-of-bounds elements read zero.
+    loaded = gl.amd.cdna4.buffer.atomic_load(desc, offsets, mask=offsets % 2 == 0, sem="acquire")
+    gl.store(out_ptr + offsets, loaded)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="AMD buffer atomics")
+@pytest.mark.gsan_fine_granularity("16-byte pools do not support atomics")
+def test_gluon_buffer_atomic_load_store_results(with_gsan, capfd):
+    data = torch.full((64, ), -1, dtype=torch.int32, device="cuda")
+    out = torch.full((64, ), -1, dtype=torch.int32, device="cuda")
+    _gluon_buffer_atomic_load_store_kernel[(1, )](data, out, num_warps=1)
+    torch.cuda.synchronize()
+    idx = torch.arange(64, dtype=torch.int32, device="cuda")
+    assert torch.equal(data, torch.where(idx < 32, idx + 100, -1))
+    assert torch.equal(out, torch.where((idx < 32) & (idx % 2 == 0), idx + 100, 0))
+    _assert_no_gsan_runtime_output(capfd)
