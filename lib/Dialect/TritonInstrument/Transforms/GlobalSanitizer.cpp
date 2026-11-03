@@ -557,7 +557,7 @@ public:
           .Case([&](tt::AtomicCASOp op) {
             auto newOp = ExperimentalGSanAtomicCASOp::create(
                 b, op.getLoc(), op.getType(), op.getPtr(), op.getCmp(),
-                op.getVal(), op.getSem(), op.getScope());
+                op.getVal(), /*mask=*/Value(), op.getSem(), op.getScope());
             newOp->setAttrs(op->getAttrs());
             b.replaceOp(op, newOp);
           })

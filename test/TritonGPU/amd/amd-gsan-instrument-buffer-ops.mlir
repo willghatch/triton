@@ -29,11 +29,11 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
   // CHECK-DAG: %[[END:.+]] = arith.addi %[[BYTES]], %[[SIZE]] : tensor<256xi64, #blocked>
   // CHECK-DAG: %[[BOUND:.+]] = arith.constant dense<2147483646> : tensor<256xi64, #blocked>
   // CHECK-DAG: %[[INB:.+]] = arith.cmpi ule, %[[END]], %[[BOUND]] : tensor<256xi64, #blocked>
-  // CHECK-DAG: %[[EFF:.+]] = arith.andi %[[MASK]], %[[INB]] : tensor<256xi1, #blocked>
+  // CHECK-DAG: %[[EFF:.+]] = arith.andi %[[MASK]], %[[INB]] {{.*}}: tensor<256xi1, #blocked>
   // CHECK-DAG: %[[BASE8:.+]] = tt.bitcast %[[BASE]] : !tt.ptr<f32> -> !tt.ptr<i8>
   // CHECK-DAG: %[[SPLAT:.+]] = tt.splat %[[BASE8]] : !tt.ptr<i8> -> tensor<256x!tt.ptr<i8>, #blocked>
   // CHECK-DAG: %[[ADDR8:.+]] = tt.addptr %[[SPLAT]], %[[BYTES]] : tensor<256x!tt.ptr<i8>, #blocked>, tensor<256xi64, #blocked>
-  // CHECK-DAG: %[[ADDR:.+]] = tt.bitcast %[[ADDR8]] : tensor<256x!tt.ptr<i8>, #blocked> -> tensor<256x!tt.ptr<f32>, #blocked>
+  // CHECK-DAG: %[[ADDR:.+]] = tt.bitcast %[[ADDR8]] {{.*}}: tensor<256x!tt.ptr<i8>, #blocked> -> tensor<256x!tt.ptr<f32>, #blocked>
   // CHECK: tti.experimental_gsan_tensor_access %[[ADDR]], false, %[[EFF]]
   // CHECK-NEXT: amdg.buffer_load %[[BASE]][%[[OFF]]], %[[MASK]] soffset = %[[SOFF]]
   // CHECK-NOT: tti.experimental_gsan
@@ -66,7 +66,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
   // CHECK-DAG: %[[BASE8:.+]] = tt.bitcast %[[BASE]] : !tt.ptr<f16> -> !tt.ptr<i8>
   // CHECK-DAG: %[[SPLAT:.+]] = tt.splat %[[BASE8]]
   // CHECK-DAG: %[[ADDR8:.+]] = tt.addptr %[[SPLAT]], %[[BYTES]]
-  // CHECK-DAG: %[[ADDR:.+]] = tt.bitcast %[[ADDR8]] : tensor<256x!tt.ptr<i8>, #blocked> -> tensor<256x!tt.ptr<f16>, #blocked>
+  // CHECK-DAG: %[[ADDR:.+]] = tt.bitcast %[[ADDR8]] {{.*}}: tensor<256x!tt.ptr<i8>, #blocked> -> tensor<256x!tt.ptr<f16>, #blocked>
   // CHECK: tti.experimental_gsan_tensor_access %[[ADDR]], true, %[[INB]]
   // CHECK-NEXT: amdg.buffer_store
   tt.func @store_desc_base(%base: !tt.ptr<f16>, %num_records: i32, %offsets: tensor<256xi32, #blocked>, %soffset: tensor<256xi32, #blocked>, %value: tensor<256xf16, #blocked>) {
@@ -94,6 +94,39 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
     %desc = amdg.make_buffer_desc %base, %num_records : !tt.ptr<f64> -> !amdg.buffer_desc<f64>
     %0 = amdg.buffer_load %desc[%offsets] : !amdg.buffer_desc<f64> -> tensor<64xf64, #blocked>
     tt.return %0 : tensor<64xf64, #blocked>
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  // GSan merges a run of checked elements into one access only if the axis
+  // analysis proves the address contiguous and aligned and the mask constant
+  // over the run (16-byte shadow pools need whole 16-byte accesses). It cannot
+  // see through the byte-offset reconstruction, so the facts of the buffer
+  // operands become hints: here 256 contiguous elements, 16-byte aligned
+  // (base divisibility 16, soffset 64 elements), and a user mask constant in
+  // runs of 8. Without a user mask, the in-bounds mask is claimed constant
+  // over each contiguous run: the accessed bytes grow along the run, so a
+  // merged check that counts the run if its first element is in bounds never
+  // drops an access.
+  // CHECK-LABEL: @load_store_hints
+  // CHECK: %[[EFF:.+]] = arith.andi %{{.+}}, %{{.+}} {tt.constancy = dense<8> : tensor<1xi32>}
+  // CHECK: %[[ADDR:.+]] = tt.bitcast %{{.+}} {tt.constancy = dense<1> : tensor<1xi32>, tt.contiguity = dense<256> : tensor<1xi32>, tt.divisibility = dense<16> : tensor<1xi32>}
+  // CHECK: tti.experimental_gsan_tensor_access %[[ADDR]], false, %[[EFF]]
+  // CHECK: amdg.buffer_load
+  // CHECK: %[[INB:.+]] = arith.cmpi ule, %{{.+}}, %{{.+}} {tt.constancy = dense<256> : tensor<1xi32>}
+  // CHECK: %[[SADDR:.+]] = tt.bitcast %{{.+}} {tt.constancy = dense<1> : tensor<1xi32>, tt.contiguity = dense<256> : tensor<1xi32>, tt.divisibility = dense<16> : tensor<1xi32>}
+  // CHECK: tti.experimental_gsan_tensor_access %[[SADDR]], true, %[[INB]]
+  tt.func @load_store_hints(%base: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %n: i32 {tt.divisibility = 8 : i32}) {
+    %offsets = tt.make_range {end = 256 : i32, start = 0 : i32} : tensor<256xi32, #blocked>
+    %soffset = arith.constant 64 : i32
+    %bound = tt.splat %n : i32 -> tensor<256xi32, #blocked>
+    %mask = arith.cmpi slt, %offsets, %bound : tensor<256xi32, #blocked>
+    %0 = amdg.buffer_load %base[%offsets], %mask soffset = %soffset : i32 : !tt.ptr<f32> -> tensor<256xf32, #blocked>
+    amdg.buffer_store %0, %base[%offsets] : !tt.ptr<f32> -> tensor<256xf32, #blocked>
+    tt.return
   }
 }
 

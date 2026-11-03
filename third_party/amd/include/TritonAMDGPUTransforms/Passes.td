@@ -391,10 +391,13 @@ def TritonAMDGPUFpSanitizer : Pass<"tritonamdgpu-fp-sanitizer", "mlir::ModuleOp"
 def TritonAMDGPUGSanRejectUnsupported : Pass<"tritonamdgpu-gsan-reject-unsupported", "mlir::ModuleOp"> {
   let summary = "Reject operations that the global sanitizer (GSan) cannot check on AMD";
   let description = [{
-    GSan instruments `tt.load`, `tt.store`, and the `tt.atomic_*` operations.
-    Any other operation that reads or writes global memory (AMD buffer ops,
-    async copies, TDM copies, tensor descriptor ops, ...) would silently escape
-    race checking, so this pass reports an error for it instead.
+    GSan instruments `tt.load`, `tt.store`, the `tt.atomic_*` operations, and
+    (through `tritonamdgpu-gsan-instrument-buffer-ops`) the AMD buffer loads,
+    stores, and atomics.
+    Any other operation that reads or writes global memory
+    (`amdg.buffer_load_to_local`, async copies, TDM copies, tensor descriptor
+    ops, ...) would silently escape race checking, so this pass reports an
+    error for it instead.
     It also rejects features the AMD GSan prototype does not model or has not
     been validated with: warp specialization, warp pipelining, mbarrier,
     cluster, and conditional barriers (block pingpong), `num_ctas > 1`, and
@@ -403,6 +406,26 @@ def TritonAMDGPUGSanRejectUnsupported : Pass<"tritonamdgpu-gsan-reject-unsupport
     external calls) get a warning, since their accesses are not checked, and
     their count is recorded in the module attribute `tti.gsan_unchecked_ops`.
   }];
+}
+
+def TritonAMDGPUGSanInstrumentBufferOps : Pass<"tritonamdgpu-gsan-instrument-buffer-ops", "mlir::ModuleOp"> {
+  let summary = "Instrument AMD buffer ops for the global sanitizer (GSan)";
+  let description = [{
+    Makes GSan check the global memory accessed by `amdg.buffer_load`,
+    `amdg.buffer_store`, and the `amdg.buffer_atomic_*` operations.
+    Each is turned into the tensor of global addresses it accesses: element
+    `i` accesses `base + zext(elemBytes * soffset) + zext(elemBytes *
+    offsets[i])` (each product wraps in i32), but only if its mask is set and
+    it is within the descriptor bound (`num_records`, or 2^31 - 2 bytes for a
+    pointer base), which the hardware enforces by dropping the access.
+    Loads and stores keep the buffer op and get a GSan tensor access check
+    before it; atomics are replaced by GSan atomics, which perform the user
+    atomic themselves (as a global atomic).
+    A descriptor must come from an `amdg.make_buffer_desc` in the same
+    function; otherwise its base and bound are unknown and this pass fails.
+  }];
+  let dependentDialects = ["mlir::triton::instrument::TritonInstrumentDialect",
+                           "mlir::arith::ArithDialect"];
 }
 
 #endif
