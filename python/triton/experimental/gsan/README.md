@@ -123,8 +123,8 @@ These would allow more efficient communication patterns by minimizing the synchr
 # **5\. AMD gfx950 prototype**
 
 GSan also runs, as a prototype, on AMD gfx950 (MI350-series, wave64) with a single GPU.
-It supports ordinary global `tl.load`/`tl.store`, atomic RMW/CAS, atomic load/store/poll, and launches on ordinary streams with memory from the GSan allocator.
-Buffer-op conversion, async copies, and ping-pong scheduling are disabled under GSan; Gluon buffer ops, async copies, TDM, warp specialization, `num_ctas > 1`, other AMD targets, combining GSan with AddressSanitizer, and HIP graph capture are rejected with an error.
+It supports ordinary global `tl.load`/`tl.store`, atomic RMW/CAS, atomic load/store/poll, AMD buffer loads, stores, and atomics (from Triton's buffer-op conversion or explicit Gluon `buffer` ops), and launches on ordinary streams with memory from the GSan allocator.
+Async copies and ping-pong scheduling are disabled under GSan; Gluon async copies (including `buffer_load_to_shared`, i.e. `amdg.buffer_load_to_local`), TDM, warp specialization, `num_ctas > 1`, other AMD targets, combining GSan with AddressSanitizer, and HIP graph capture are rejected with an error.
 A detected race prints `GSan device assertion failed: '<kind> race detected' at <file>:<line>` and aborts the process (device trap), so run failing cases in a subprocess.
 
 Known limitations:
@@ -134,6 +134,8 @@ Known limitations:
 * Blocks are identified by slots of a fixed table (`num_slots` or `TRITON_GSAN_NUM_SLOTS`, default up to 512). When the runtime state would not fit in 1 GiB per device, the default slot count shrinks, but not below the CU count; then the default clock buffer shrinks instead. The allocator prints a note when it picks fewer slots than CUs or fewer than 1024 clock-buffer entries. A block that takes over a slot from an earlier block, in any kernel or stream, shares that block's identity (its epoch), so the earlier block's accesses look like its own and are treated as ordered. Slots are chosen by hash, so a race between two blocks that do not run concurrently is missed with probability about 1/num_slots per racing pair; grids larger than the slot count have many such pairs.
 * Instrumented kernels are about three to four orders of magnitude slower and reserve the maximum LDS, so one block runs per CU.
 * A block that spins on `tl.atomic_load` waiting for another block hangs under GSan; the cause is not yet known. Spin with an atomic RMW (e.g. `tl.atomic_add(ptr, 0)`) or `tl.atomic_poll` instead.
+* Buffer ops are checked on the addresses they access, `base + soffset + offset` in bytes, and only for elements the hardware does not drop (masked off or past the descriptor's `num_records`). An element wider than 4 bytes counts as accessed when its first 4 bytes are in bounds. A contiguous run of elements is checked as one access, which counts the whole run when its first element is in bounds, so the bytes of a run that `num_records` cuts are also counted (this can report a race on bytes just past the bound). A buffer descriptor must be built by `make_buffer_descriptor` in the same function as its use (not passed in, loop-carried, or selected); otherwise compilation fails.
+* Under GSan, buffer atomics are emitted as global atomics.
 * Write-once memory pools and the explicit graph API (`triton.experimental.gsan.graph`) are untested on AMD; the graph API uses the CUDA driver.
 
 ## **5.1 Build and test from a fresh checkout**
@@ -155,7 +157,8 @@ pytest -s --tb=short python/test/gsan/
 # Compiler-only tests (no GPU); run from the CMake build directory.
 cd build/cmake.linux-x86_64-cpython-3.*
 lit -v test/TritonGPU/amd/amd-gsan-reject-unsupported.mlir test/Conversion/amd/tritongpu_to_llvm_gsan.mlir \
-    test/TritonGPU/gsan.mlir test/Conversion/tritongpu_to_llvm_gsan.mlir
+    test/TritonGPU/amd/amd-gsan-instrument-buffer-ops.mlir test/TritonGPU/gsan.mlir \
+    test/Conversion/tritongpu_to_llvm_gsan.mlir
 ```
 
 To sanitize your own kernels, allocate their tensors from a GSan memory pool and enable the instrumentation mode:
