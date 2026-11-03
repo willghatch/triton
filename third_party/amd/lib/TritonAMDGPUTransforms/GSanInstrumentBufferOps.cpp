@@ -309,17 +309,36 @@ struct TritonAMDGPUGSanInstrumentBufferOpsPass
     // GSan atomics perform the user atomic themselves, so the buffer atomic
     // is replaced (it becomes a global atomic). Inherent attributes such as
     // the operand segment sizes belong to the buffer op and are not copied.
-    Operation *newOp = nullptr;
+    // A dropped (masked-off or out-of-bounds) element of a buffer atomic
+    // reads zero on the hardware, while a GSan atomic leaves it undefined, so
+    // results are selected to keep that behavior.
+    auto replaceWithResult = [&](Operation *newOp, Value mask) {
+      newOp->setDiscardableAttrs(op->getDiscardableAttrDictionary());
+      if (op->getNumResults() == 0) {
+        op->erase();
+        return;
+      }
+      Value result = newOp->getResult(0);
+      Value zero = arith::ConstantOp::create(
+          b, loc, cast<TypedAttr>(b.getZeroAttr(result.getType())));
+      result = arith::SelectOp::create(b, loc, mask, result, zero);
+      op->getResult(0).replaceAllUsesWith(result);
+      op->erase();
+    };
     if (auto rmw = dyn_cast<amdgpu::BufferAtomicRMWOp>(op)) {
       auto access = getAccess(b, op, rmw.getPtr(), rmw.getOffsets(),
                               /*soffset=*/Value(), rmw.getMask(),
                               rmw.getValue());
       if (::mlir::failed(access))
         return failure();
-      newOp = tti::ExperimentalGSanAtomicRMWOp::create(
-          b, loc, rmw.getType(), rmw.getAtomicRmwOp(), access->ptr,
-          rmw.getValue(), access->mask, rmw.getSem(), rmw.getScope());
-    } else if (auto cas = dyn_cast<amdgpu::BufferAtomicCASOp>(op)) {
+      replaceWithResult(tti::ExperimentalGSanAtomicRMWOp::create(
+                            b, loc, rmw.getType(), rmw.getAtomicRmwOp(),
+                            access->ptr, rmw.getValue(), access->mask,
+                            rmw.getSem(), rmw.getScope()),
+                        access->mask);
+      return success();
+    }
+    if (auto cas = dyn_cast<amdgpu::BufferAtomicCASOp>(op)) {
       // Buffer CAS has no user mask, but its out-of-bounds lanes still must
       // not access memory.
       auto access =
@@ -327,43 +346,38 @@ struct TritonAMDGPUGSanInstrumentBufferOpsPass
                     /*mask=*/Value(), cas.getVal());
       if (::mlir::failed(access))
         return failure();
-      newOp = tti::ExperimentalGSanAtomicCASOp::create(
-          b, loc, cas.getType(), access->ptr, cas.getCmp(), cas.getVal(),
-          access->mask, cas.getSem(), cas.getScope());
-    } else if (auto atomicLoad = dyn_cast<amdgpu::BufferAtomicLoadOp>(op)) {
+      replaceWithResult(tti::ExperimentalGSanAtomicCASOp::create(
+                            b, loc, cas.getType(), access->ptr, cas.getCmp(),
+                            cas.getVal(), access->mask, cas.getSem(),
+                            cas.getScope()),
+                        access->mask);
+      return success();
+    }
+    if (auto atomicLoad = dyn_cast<amdgpu::BufferAtomicLoadOp>(op)) {
       auto access = getAccess(b, op, atomicLoad.getPtr(),
                               atomicLoad.getOffsets(), atomicLoad.getSoffset(),
                               atomicLoad.getMask(), atomicLoad.getResult());
       if (::mlir::failed(access))
         return failure();
-      Value loaded = tti::ExperimentalGSanAtomicLoadOp::create(
-          b, loc, atomicLoad.getType(), access->ptr, access->mask,
-          atomicLoad.getSem(), atomicLoad.getScope());
-      loaded.getDefiningOp()->setDiscardableAttrs(
-          op->getDiscardableAttrDictionary());
-      // Masked-off and out-of-bounds elements of a buffer atomic load read
-      // zero.
-      Value zero = arith::ConstantOp::create(
-          b, loc, cast<TypedAttr>(b.getZeroAttr(atomicLoad.getType())));
-      Value result =
-          arith::SelectOp::create(b, loc, access->mask, loaded, zero);
-      op->getResult(0).replaceAllUsesWith(result);
-      op->erase();
+      // Documented: masked-off and out-of-bounds elements read zero.
+      replaceWithResult(tti::ExperimentalGSanAtomicLoadOp::create(
+                            b, loc, atomicLoad.getType(), access->ptr,
+                            access->mask, atomicLoad.getSem(),
+                            atomicLoad.getScope()),
+                        access->mask);
       return success();
-    } else if (auto atomicStore = dyn_cast<amdgpu::BufferAtomicStoreOp>(op)) {
-      auto access = getAccess(b, op, atomicStore.getPtr(),
-                              atomicStore.getOffsets(),
-                              atomicStore.getSoffset(), atomicStore.getMask(),
-                              atomicStore.getValue());
-      if (::mlir::failed(access))
-        return failure();
-      newOp = tti::ExperimentalGSanAtomicStoreOp::create(
-          b, loc, access->ptr, atomicStore.getValue(), access->mask,
-          atomicStore.getSem(), atomicStore.getScope());
     }
-    newOp->setDiscardableAttrs(op->getDiscardableAttrDictionary());
-    op->replaceAllUsesWith(newOp->getResults());
-    op->erase();
+    auto atomicStore = cast<amdgpu::BufferAtomicStoreOp>(op);
+    auto access = getAccess(b, op, atomicStore.getPtr(),
+                            atomicStore.getOffsets(), atomicStore.getSoffset(),
+                            atomicStore.getMask(), atomicStore.getValue());
+    if (::mlir::failed(access))
+      return failure();
+    replaceWithResult(tti::ExperimentalGSanAtomicStoreOp::create(
+                          b, loc, access->ptr, atomicStore.getValue(),
+                          access->mask, atomicStore.getSem(),
+                          atomicStore.getScope()),
+                      access->mask);
     return success();
   }
 };

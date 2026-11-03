@@ -138,6 +138,9 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
   // themselves, on the reconstructed addresses. Kind, semantics, scope,
   // value, and result uses are preserved; the mask also drops out-of-bounds
   // lanes. Attributes such as the operand segment sizes are not copied.
+  // Dropped (masked-off or out-of-bounds) lanes of a buffer atomic return
+  // zero on the hardware, but undefined values from a GSan atomic, so the
+  // result is selected.
   // CHECK-LABEL: @atomic_rmw
   // CHECK-SAME: (%[[BASE:[a-zA-Z0-9_]+]]: !tt.ptr<f32>, %[[OFF:[a-zA-Z0-9_]+]]: tensor<256xi32, #blocked>, %[[VAL:[a-zA-Z0-9_]+]]: tensor<256xf32, #blocked>, %[[MASK:[a-zA-Z0-9_]+]]: tensor<256xi1, #blocked>)
   // CHECK: %[[INB:.+]] = arith.cmpi ule
@@ -145,7 +148,9 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
   // CHECK: %[[ADDR:.+]] = tt.bitcast %{{.+}} : tensor<256x!tt.ptr<i8>, #blocked> -> tensor<256x!tt.ptr<f32>, #blocked>
   // CHECK: %[[OLD:.+]] = tti.experimental_gsan_atomic_rmw fadd, acq_rel, gpu, %[[ADDR]], %[[VAL]], %[[EFF]] {foo = 1 : i32} :
   // CHECK-NOT: amdg.buffer_atomic_rmw
-  // CHECK: tt.return %[[OLD]]
+  // CHECK: %[[ZERO:.+]] = arith.constant dense<0.000000e+00> : tensor<256xf32, #blocked>
+  // CHECK: %[[RESULT:.+]] = arith.select %[[EFF]], %[[OLD]], %[[ZERO]]
+  // CHECK: tt.return %[[RESULT]]
   tt.func @atomic_rmw(%base: !tt.ptr<f32>, %offsets: tensor<256xi32, #blocked>, %value: tensor<256xf32, #blocked>, %mask: tensor<256xi1, #blocked>) -> tensor<256xf32, #blocked> {
     %0 = amdg.buffer_atomic_rmw fadd, acq_rel, gpu, %value, %base[%offsets], %mask {foo = 1 : i32} : !tt.ptr<f32> -> tensor<256xf32, #blocked>
     tt.return %0 : tensor<256xf32, #blocked>
@@ -159,7 +164,9 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
   // CHECK: %[[ADDR:.+]] = tt.bitcast %{{.+}} : tensor<256x!tt.ptr<i8>, #blocked> -> tensor<256x!tt.ptr<i32>, #blocked>
   // CHECK: %[[OLD:.+]] = tti.experimental_gsan_atomic_cas release, cta, %[[ADDR]], %[[CMP]], %[[VAL]], %[[INB]] :
   // CHECK-NOT: amdg.buffer_atomic_cas
-  // CHECK: tt.return %[[OLD]]
+  // CHECK: %[[ZERO:.+]] = arith.constant dense<0> : tensor<256xi32, #blocked>
+  // CHECK: %[[RESULT:.+]] = arith.select %[[INB]], %[[OLD]], %[[ZERO]]
+  // CHECK: tt.return %[[RESULT]]
   tt.func @atomic_cas(%base: !tt.ptr<i32>, %offsets: tensor<256xi32, #blocked>, %cmp: tensor<256xi32, #blocked>, %value: tensor<256xi32, #blocked>) -> tensor<256xi32, #blocked> {
     %0 = amdg.buffer_atomic_cas release, cta, %cmp, %value, %base[%offsets] : !tt.ptr<i32> -> tensor<256xi32, #blocked>
     tt.return %0 : tensor<256xi32, #blocked>
