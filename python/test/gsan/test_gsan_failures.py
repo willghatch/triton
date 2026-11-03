@@ -1308,34 +1308,37 @@ def test_gluon_buffer_descriptor_soffset_read_after_write():
 @triton.jit
 def _buffer_atomic_handoff_kernel(payload_ptr, flag_ptr, counter_ptr, scratch_ptr, PRODUCER_SEM: tl.constexpr,
                                   CONSUMER_SEM: tl.constexpr, CONSUMER_OP: tl.constexpr):
-    # One-element tensors, so that the flag atomics become buffer atomics.
-    one = tl.arange(0, 1)
+    # The flag is element 0 of a pair; element 1 stays 0, and masked-off
+    # atomic results are undefined. (A one-element tensor offset folds away,
+    # and only base + tensor offset becomes a buffer op.)
+    pair = tl.arange(0, 2)
     pid = tl.program_id(0)
     if pid == 0:
-        tl.store(payload_ptr + one, 1000)
-        tl.atomic_xchg(flag_ptr + one, 1, sem=PRODUCER_SEM)
+        tl.store(payload_ptr + pair, 1000)
+        tl.atomic_xchg(flag_ptr + pair, 1, mask=pair < 1, sem=PRODUCER_SEM)
         tl.atomic_add(counter_ptr, 1, sem="relaxed")
     else:
         atomic_poll(counter_ptr, 1)
         ready = 0
         while ready != 1:
             if CONSUMER_OP == "cas":
-                ready = tl.sum(tl.atomic_cas(flag_ptr + one, 1, 1, sem=CONSUMER_SEM))
+                ready = tl.sum(tl.atomic_cas(flag_ptr + pair, 1, 1, sem=CONSUMER_SEM))
             else:
-                ready = tl.sum(tl.atomic_add(flag_ptr + one, 0, sem=CONSUMER_SEM))
-        result = tl.load(payload_ptr + one)
-        tl.store(scratch_ptr + one, result)
+                ready = tl.sum(tl.where(pair < 1, tl.atomic_add(flag_ptr + pair, 0, mask=pair < 1, sem=CONSUMER_SEM), 0))
+        result = tl.load(payload_ptr + pair)
+        tl.store(scratch_ptr + pair, result)
 
 
 @run_with_gsan
 def _run_buffer_atomic_handoff_case(producer_sem: str, consumer_sem: str, consumer_op: str) -> None:
-    payload = torch.zeros(1, dtype=torch.int32, device="cuda")
-    flag = torch.zeros(1, dtype=torch.int32, device="cuda")
+    payload = torch.zeros(2, dtype=torch.int32, device="cuda")
+    flag = torch.zeros(2, dtype=torch.int32, device="cuda")
     counter = torch.zeros(1, dtype=torch.int32, device="cuda")
-    scratch = torch.full((1, ), -1, dtype=torch.int32, device="cuda")
+    scratch = torch.full((2, ), -1, dtype=torch.int32, device="cuda")
     args = (payload, flag, counter, scratch, producer_sem, consumer_sem, consumer_op)
     compiled = _buffer_atomic_handoff_kernel.warmup(*args, num_warps=1, grid=(2, ))
-    _assert_buffer_ops(compiled, "buffer_atomic_rmw", "buffer_atomic_cas" if consumer_op == "cas" else "buffer_load")
+    _assert_buffer_ops(compiled, "buffer_atomic_rmw", "buffer_load",
+                       *(["buffer_atomic_cas"] if consumer_op == "cas" else []))
     _buffer_atomic_handoff_kernel[(2, )](*args, num_warps=1)
     torch.cuda.synchronize()
 
@@ -1346,5 +1349,5 @@ def _run_buffer_atomic_handoff_case(producer_sem: str, consumer_sem: str, consum
 def test_buffer_atomic_semantic_mismatch_read_after_write(producer_sem, consumer_sem, consumer_op):
     _run_failure_case(f"buffer_atomic_handoff_{producer_sem}_{consumer_sem}_{consumer_op}",
                       runner=_run_buffer_atomic_handoff_case, runner_args=(producer_sem, consumer_sem, consumer_op),
-                      source_function=_buffer_atomic_handoff_kernel.fn, marker="result = tl.load(payload_ptr + one)",
+                      source_function=_buffer_atomic_handoff_kernel.fn, marker="result = tl.load(payload_ptr + pair)",
                       error="Read after write race detected")

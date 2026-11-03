@@ -2350,18 +2350,20 @@ def test_buffer_ops_disjoint_or_launch_ordered_accesses_do_not_race(with_gsan, c
 @triton.jit
 def _buffer_atomic_handoff_kernel(payload_ptr, flag_ptr, out_ptr, CONSUMER_OP: tl.constexpr, BLOCK: tl.constexpr):
     offsets = tl.arange(0, BLOCK)
-    # One-element tensors, so that the flag atomics become buffer atomics.
-    one = tl.arange(0, 1)
+    # The flag is element 0 of a pair; element 1 stays 0, and masked-off
+    # atomic results are undefined. (A one-element tensor offset folds away,
+    # and only base + tensor offset becomes a buffer atomic.)
+    pair = tl.arange(0, 2)
     if tl.program_id(0) == 0:
         tl.store(payload_ptr + offsets, offsets + 1000)
-        tl.atomic_xchg(flag_ptr + one, 1, sem="release")
+        tl.atomic_xchg(flag_ptr + pair, 1, mask=pair < 1, sem="release")
     else:
         ready = 0
         while ready != 1:
             if CONSUMER_OP == "cas":
-                ready = tl.sum(tl.atomic_cas(flag_ptr + one, 1, 1, sem="acquire"))
+                ready = tl.sum(tl.atomic_cas(flag_ptr + pair, 1, 1, sem="acquire"))
             else:
-                ready = tl.sum(tl.atomic_add(flag_ptr + one, 0, sem="acquire"))
+                ready = tl.sum(tl.where(pair < 1, tl.atomic_add(flag_ptr + pair, 0, mask=pair < 1, sem="acquire"), 0))
         tl.store(out_ptr + offsets, tl.load(payload_ptr + offsets))
 
 
@@ -2370,7 +2372,7 @@ def _buffer_atomic_handoff_kernel(payload_ptr, flag_ptr, out_ptr, CONSUMER_OP: t
 def test_buffer_atomic_release_acquire_handoff_does_not_race(with_gsan, capfd, consumer_op):
     block = 64
     payload = torch.zeros(block, dtype=torch.int32, device="cuda")
-    flag = torch.zeros(1, dtype=torch.int32, device="cuda")
+    flag = torch.zeros(2, dtype=torch.int32, device="cuda")
     out = torch.zeros_like(payload)
     args = (payload, flag, out, consumer_op)
     compiled = _buffer_atomic_handoff_kernel.warmup(*args, BLOCK=block, num_warps=1, grid=(2, ))
