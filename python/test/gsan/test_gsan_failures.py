@@ -1351,3 +1351,75 @@ def test_buffer_atomic_semantic_mismatch_read_after_write(producer_sem, consumer
                       runner=_run_buffer_atomic_handoff_case, runner_args=(producer_sem, consumer_sem, consumer_op),
                       source_function=_buffer_atomic_handoff_kernel.fn, marker="result = tl.load(payload_ptr + pair)",
                       error="Read after write race detected")
+
+
+@gluon.jit
+def _buffer_i64_bound_kernel(data, out, num_records, KIND: gl.constexpr, MASK_PARTIAL: gl.constexpr,
+                             CONSTANT_BOUND: gl.constexpr):
+    offsets = gl.arange(0, 64, layout=gl.BlockedLayout([1], [THREADS_PER_WARP], [1], [0]))
+    if CONSTANT_BOUND:
+        num_records = 12
+    desc = gl.amd.cdna4.buffer.make_buffer_descriptor(data, num_records)
+    mask = (offsets == 0) | ((offsets == 1) & MASK_PARTIAL)
+    if KIND == "store":
+        values = gl.full((64, ), 0x4444444433333333, gl.int64, layout=gl.BlockedLayout([1], [THREADS_PER_WARP], [1], [0]))
+        gl.amd.cdna4.buffer.atomic_store(values, desc, offsets, mask=mask, sem="release")
+    else:
+        values = gl.amd.cdna4.buffer.atomic_load(desc, offsets, mask=mask, sem="acquire")
+        gl.store(out + offsets, values)
+
+
+def _run_buffer_i64_bound_case(kind, num_records, mask_partial, gsan, constant_bound=False):
+    triton.knobs.compilation.instrumentation_mode = "gsan" if gsan else ""
+    pool = create_mem_pool(shadow_granularity=4)
+    with torch.cuda.use_mem_pool(pool):
+        data = torch.full((64, ), 0x2222222211111111, dtype=torch.int64, device="cuda")
+        out = torch.full_like(data, -1)
+        _buffer_i64_bound_kernel[(1, )](data, out, num_records, kind, mask_partial, constant_bound, num_warps=1)
+        torch.cuda.synchronize()
+        data, out = data.tolist(), out.tolist()
+        expected_data = [0x2222222211111111] * 64
+        expected_out = [-1] * 64 if kind == "store" else [0] * 64
+        bound = 12 if constant_bound else num_records
+        if bound >= 8:
+            if kind == "store":
+                expected_data[0] = 0x4444444433333333
+            else:
+                expected_out[0] = 0x2222222211111111
+        if mask_partial and bound >= 12:
+            if kind == "store":
+                expected_data[1] = 0x4444444433333333 if bound >= 16 else 0x2222222233333333
+            else:
+                expected_out[1] = 0x2222222211111111 if bound >= 16 else 0x11111111
+        assert data == expected_data
+        assert out == expected_out
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="AMD buffer atomics")
+@pytest.mark.parametrize("kind", ["load", "store"])
+@pytest.mark.parametrize("num_records,mask_partial", [(16, True), (12, False), (0, True)])
+def test_buffer_i64_atomic_full_or_dropped_accesses_preserved(kind, num_records, mask_partial, monkeypatch):
+    # Full accesses, masked partial elements, and wholly out-of-bounds accesses
+    # remain supported. Compare actual bits and every byte of the allocation.
+    monkeypatch.setenv("TRITON_TEST_PROCESS_TIMEOUT", HIP_DEFAULT_PROCESS_TIMEOUT_S)
+    baseline = run_in_process(_run_buffer_i64_bound_case, args=(kind, num_records, mask_partial, False))
+    sanitized = run_in_process(_run_buffer_i64_bound_case, args=(kind, num_records, mask_partial, True))
+    assert baseline.exc is None, baseline.exc
+    assert sanitized.exc is None, sanitized.exc
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="AMD buffer atomics")
+@pytest.mark.parametrize("kind", ["load", "store"])
+@pytest.mark.parametrize("constant_bound", [False, True], ids=["dynamic-bound", "constant-bound"])
+def test_buffer_i64_atomic_partial_access_rejected(kind, constant_bound, monkeypatch):
+    # Off: the low dword is accessed, the high dword is zero on loads and
+    # untouched on stores. On: fail clearly instead of issuing a global i64
+    # access that would change those memory effects.
+    monkeypatch.setenv("TRITON_TEST_PROCESS_TIMEOUT", HIP_DEFAULT_PROCESS_TIMEOUT_S)
+    baseline = run_in_process(_run_buffer_i64_bound_case, args=(kind, 12, True, False, constant_bound))
+    assert baseline.exc is None, baseline.exc
+    _run_failure_case("buffer_i64_partial", runner=_run_buffer_i64_bound_case,
+                      source_function=_buffer_i64_bound_kernel.fn,
+                      marker="gl.amd.cdna4.buffer.atomic_" + kind + "(",
+                      error="GSan on AMD does not support partially in-bounds buffer atomics",
+                      runner_args=(kind, 12, True, True, constant_bound))

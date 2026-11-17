@@ -2471,3 +2471,36 @@ def test_gluon_buffer_atomic_load_store_results(with_gsan, capfd):
     assert torch.equal(data, torch.where(idx < 32, idx + 100, -1))
     assert torch.equal(out, torch.where((idx < 32) & (idx % 2 == 0), idx + 100, 0))
     _assert_no_gsan_runtime_output(capfd)
+
+
+@triton.jit
+def _packed_fp4_copy_kernel(src, dst):
+    offsets = tl.arange(0, 1024)
+    tl.store(dst + offsets, tl.load(src + offsets))
+
+
+@gluon.jit
+def _gluon_packed_fp4_copy_kernel(src, dst):
+    offsets = gl.arange(0, 1024, layout=gl.BlockedLayout([16], [THREADS_PER_WARP], [1], [0]))
+    src_desc = gl.amd.cdna4.buffer.make_buffer_descriptor(src, 1024)
+    dst_desc = gl.amd.cdna4.buffer.make_buffer_descriptor(dst, 1024)
+    values = gl.amd.cdna4.buffer.load(src_desc, offsets)
+    gl.amd.cdna4.buffer.store(values, dst_desc, offsets)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="AMD packed FP4 buffer ops")
+@pytest.mark.parametrize("explicit_buffer", [False, True], ids=["automatic", "gluon"])
+def test_buffer_packed_fp4_bytes_preserved(with_gsan, capfd, explicit_buffer):
+    src = torch.arange(1024, dtype=torch.int32, device="cuda").to(torch.uint8)
+    dst = torch.zeros_like(src)
+    kernel = _gluon_packed_fp4_copy_kernel if explicit_buffer else _packed_fp4_copy_kernel
+    args = (triton.reinterpret(src, tl.float4e2m1x2), triton.reinterpret(dst, tl.float4e2m1x2))
+    triton.knobs.amd.use_buffer_ops = True
+    for mode in ("", "gsan"):
+        triton.knobs.compilation.instrumentation_mode = mode
+        dst.zero_()
+        compiled = kernel[(1, )](*args, num_warps=1)
+        _assert_buffer_ops(compiled, "buffer_load", "buffer_store")
+        torch.cuda.synchronize()
+        assert torch.equal(src, dst)
+    _assert_no_gsan_runtime_output(capfd)

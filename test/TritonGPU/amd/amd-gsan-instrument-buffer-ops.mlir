@@ -228,3 +228,67 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
     tt.return
   }
 }
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  // Packed FP4 occupies one byte per element. Both explicit descriptors and
+  // pointer-based buffer conversion must check the packed storage addresses.
+  // CHECK-LABEL: @packed_fp4_copy
+  // CHECK-SAME: (%[[SRC:[a-zA-Z0-9_]+]]: !tt.ptr<!tt.fp4e2m1x2>, %[[DST:[a-zA-Z0-9_]+]]: !tt.ptr<!tt.fp4e2m1x2>
+  // CHECK: %[[ONE:.+]] = arith.constant dense<1> : tensor<256xi32, #blocked>
+  // CHECK: %[[BYTES32:.+]] = arith.muli %{{.+}}, %[[ONE]]
+  // CHECK: %[[BYTES:.+]] = arith.extui %[[BYTES32]]
+  // CHECK: %[[SRC8:.+]] = tt.bitcast %[[SRC]] : !tt.ptr<!tt.fp4e2m1x2> -> !tt.ptr<i8>
+  // CHECK: %[[SRCS:.+]] = tt.splat %[[SRC8]]
+  // CHECK: %[[ADDR8:.+]] = tt.addptr %[[SRCS]], %[[BYTES]]
+  // CHECK: %[[ADDR:.+]] = tt.bitcast %[[ADDR8]] {{.*}} -> tensor<256x!tt.ptr<!tt.fp4e2m1x2>, #blocked>
+  // CHECK: tti.experimental_gsan_tensor_access %[[ADDR]], false,
+  // CHECK: %[[LOADED:.+]] = amdg.buffer_load
+  // CHECK: tti.experimental_gsan_tensor_access %{{.+}}, true,
+  // CHECK: amdg.buffer_store %[[LOADED]], %[[DST]]
+  tt.func @packed_fp4_copy(%src: !tt.ptr<!tt.fp4e2m1x2>, %dst: !tt.ptr<!tt.fp4e2m1x2>, %num_records: i32) {
+    %offsets = tt.make_range {end = 256 : i32, start = 0 : i32} : tensor<256xi32, #blocked>
+    %desc = amdg.make_buffer_desc %src, %num_records : !tt.ptr<!tt.fp4e2m1x2> -> !amdg.buffer_desc<!tt.fp4e2m1x2>
+    %v = amdg.buffer_load %desc[%offsets] : !amdg.buffer_desc<!tt.fp4e2m1x2> -> tensor<256x!tt.fp4e2m1x2, #blocked>
+    amdg.buffer_store %v, %dst[%offsets] : !tt.ptr<!tt.fp4e2m1x2> -> tensor<256x!tt.fp4e2m1x2, #blocked>
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  // Replacing a partly bounded i64 buffer atomic with a global i64 atomic
+  // changes memory effects. Reject active partial elements even with dynamic
+  // bounds, and use the full-width mask for the replacement.
+  // CHECK-LABEL: @atomic_i64_dynamic_bound
+  // CHECK-SAME: (%[[BASE:[a-zA-Z0-9_]+]]: !tt.ptr<i64>, %[[NUM:[a-zA-Z0-9_]+]]: i32, %[[OFF:[a-zA-Z0-9_]+]]: tensor<64xi32, #blocked>, %[[MASK:[a-zA-Z0-9_]+]]: tensor<64xi1, #blocked>)
+  // CHECK: %[[FIRST_END:.+]] = arith.addi %[[BYTES:.+]], %{{.+}} : tensor<64xi64, #blocked>
+  // CHECK: %[[NUM64:.+]] = arith.extui %[[NUM]] : i32 to i64
+  // CHECK: %[[BOUND:.+]] = tt.splat %[[NUM64]]
+  // CHECK: %[[FIRST:.+]] = arith.cmpi ule, %[[FIRST_END]], %[[BOUND]]
+  // CHECK: %[[ACTIVE:.+]] = arith.andi %[[MASK]], %[[FIRST]]
+  // CHECK: %[[EIGHT:.+]] = arith.constant dense<8> : tensor<64xi64, #blocked>
+  // CHECK: %[[FULL_END:.+]] = arith.addi %[[BYTES]], %[[EIGHT]]
+  // CHECK: %[[FULL:.+]] = arith.cmpi ule, %[[FULL_END]], %[[BOUND]]
+  // CHECK: %[[TRUE:.+]] = arith.constant dense<true> : tensor<64xi1, #blocked>
+  // CHECK: %[[INACTIVE:.+]] = arith.xori %[[ACTIVE]], %[[TRUE]]
+  // CHECK: %[[SAFE:.+]] = arith.ori %[[INACTIVE]], %[[FULL]]
+  // CHECK: tt.assert %[[SAFE]], "GSan on AMD does not support partially in-bounds buffer atomics"
+  // CHECK: %[[EFF:.+]] = arith.andi %[[MASK]], %[[FULL]]
+  // CHECK: %[[LOADED:.+]] = tti.experimental_gsan_atomic_load acquire, gpu, %{{.+}}, %[[EFF]]
+  // CHECK: %[[ZERO:.+]] = arith.constant dense<0> : tensor<64xi64, #blocked>
+  // CHECK: %[[RESULT:.+]] = arith.select %[[EFF]], %[[LOADED]], %[[ZERO]]
+  // CHECK: tt.assert %{{.+}}, "GSan on AMD does not support partially in-bounds buffer atomics"
+  // CHECK: tti.experimental_gsan_atomic_store release, gpu, %{{.+}}, %[[RESULT]],
+  // CHECK-NOT: amdg.buffer_atomic
+  tt.func @atomic_i64_dynamic_bound(%base: !tt.ptr<i64>, %num_records: i32, %offsets: tensor<64xi32, #blocked>, %mask: tensor<64xi1, #blocked>) {
+    %desc = amdg.make_buffer_desc %base, %num_records : !tt.ptr<i64> -> !amdg.buffer_desc<i64>
+    %v = amdg.buffer_atomic_load acquire, gpu, %desc[%offsets], %mask : !amdg.buffer_desc<i64> -> tensor<64xi64, #blocked>
+    amdg.buffer_atomic_store release, gpu, %v, %desc[%offsets], %mask : !amdg.buffer_desc<i64> -> tensor<64xi64, #blocked>
+    tt.return
+  }
+}
