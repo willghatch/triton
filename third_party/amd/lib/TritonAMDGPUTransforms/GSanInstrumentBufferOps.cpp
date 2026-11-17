@@ -4,6 +4,7 @@
 #include "third_party/amd/include/Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "triton/Analysis/AxisInfo.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
+#include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonInstrument/IR/Dialect.h"
 
 namespace mlir {
@@ -111,7 +112,7 @@ DenseIntElementsAttr getHintAttr(MLIRContext *ctx, ArrayRef<int32_t> values) {
 }
 
 // The tensor of global addresses a buffer op accesses, and the mask of the
-// elements it actually accesses.
+// elements it actually accesses (conservative for wide non-atomic elements).
 struct BufferAccess {
   Value ptr;
   Value mask;
@@ -130,12 +131,14 @@ struct BufferAccess {
 // out-of-bounds one is dropped by the hardware, so neither accesses memory.
 // The stride, cache policy, contiguity, and (non-atomic) scope of a buffer op
 // affect neither which bytes are accessed nor synchronization.
+// Atomic replacements must access the entire element or none of it, so active
+// partially in-bounds elements are rejected before issuing a global atomic.
 BufferAccess buildBufferAccess(OpBuilder &b, Location loc, BufferBase base,
                                Value offsets, Value soffset, Value userMask,
-                               Type elemTy) {
+                               Type elemTy, bool isAtomic) {
   auto offsetsTy = cast<RankedTensorType>(offsets.getType());
   auto i64TensorTy = offsetsTy.clone(b.getI64Type());
-  int64_t elemBytes = std::max(8u, elemTy.getIntOrFloatBitWidth()) / 8;
+  int64_t elemBytes = std::max(8, getIntOrFloatOrPtrBitWidth(elemTy)) / 8;
 
   Value elemBytesTensor = arith::ConstantOp::create(
       b, loc, DenseElementsAttr::get(offsetsTy, b.getI32IntegerAttr(elemBytes)));
@@ -174,6 +177,27 @@ BufferAccess buildBufferAccess(OpBuilder &b, Location loc, BufferBase base,
       arith::CmpIOp::create(b, loc, arith::CmpIPredicate::ule, end, bound);
   if (userMask)
     mask = arith::AndIOp::create(b, loc, userMask, mask);
+
+  if (isAtomic && elemBytes > 4) {
+    // The original buffer access checks each dword separately. A global
+    // atomic cannot preserve a partial access, including with a dynamic bound.
+    // Check the user mask too: masked partial elements remain supported.
+    Value fullEnd = arith::AddIOp::create(b, loc, bytes, i64Splat(elemBytes));
+    Value fullMask = arith::CmpIOp::create(b, loc, arith::CmpIPredicate::ule,
+                                           fullEnd, bound);
+    Value trueTensor = arith::ConstantOp::create(
+        b, loc,
+        DenseElementsAttr::get(offsetsTy.clone(b.getI1Type()),
+                               b.getBoolAttr(true)));
+    Value inactive = arith::XOrIOp::create(b, loc, mask, trueTensor);
+    Value safe = arith::OrIOp::create(b, loc, inactive, fullMask);
+    tt::AssertOp::create(
+        b, loc, safe,
+        "GSan on AMD does not support partially in-bounds buffer atomics");
+    mask = fullMask;
+    if (userMask)
+      mask = arith::AndIOp::create(b, loc, userMask, mask);
+  }
 
   auto basePtrTy = cast<tt::PointerType>(base.ptr.getType());
   auto bytePtrTy =
@@ -229,9 +253,9 @@ struct TritonAMDGPUGSanInstrumentBufferOpsPass
         continue;
       }
       Type elemTy = getElementType(data);
-      if (!elemTy.isIntOrFloat())
+      if (!elemTy.isIntOrFloat() && !isa<tt::PackedFloat4E2M1Type>(elemTy))
         continue;
-      int64_t elemBytes = std::max(8u, elemTy.getIntOrFloatBitWidth()) / 8;
+      int64_t elemBytes = std::max(8, getIntOrFloatOrPtrBitWidth(elemTy)) / 8;
       if (auto h = computeHints(axisInfo, bufferBase->ptr, offsets, soffset,
                                 mask, elemBytes))
         hints[op] = std::move(*h);
@@ -255,13 +279,14 @@ struct TritonAMDGPUGSanInstrumentBufferOpsPass
     if (::mlir::failed(bufferBase))
       return failure();
     Type elemTy = getElementType(data);
-    if (!elemTy.isIntOrFloat()) {
+    if (!elemTy.isIntOrFloat() && !isa<tt::PackedFloat4E2M1Type>(elemTy)) {
       op->emitError("GSan cannot check a buffer op on elements of type ")
           << elemTy;
       return failure();
     }
-    return buildBufferAccess(b, op->getLoc(), *bufferBase, offsets, soffset,
-                             mask, elemTy);
+    return buildBufferAccess(
+        b, op->getLoc(), *bufferBase, offsets, soffset, mask, elemTy,
+        !isa<amdgpu::BufferLoadOp, amdgpu::BufferStoreOp>(op));
   }
 
   void setHints(BufferAccess access, const AccessHints &hints) {
