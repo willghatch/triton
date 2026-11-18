@@ -666,10 +666,13 @@ public:
           op, "expected one to five descriptor coordinates");
     }
 
+    int64_t maxExtent = targetInfo->isCuda()
+                            ? std::numeric_limits<int16_t>::max()
+                            : std::numeric_limits<uint16_t>::max();
     for (int64_t extent : blockShape)
-      if (extent < 1 || extent > std::numeric_limits<int16_t>::max())
+      if (extent < 1 || extent > maxExtent)
         return rewriter.notifyMatchFailure(
-            op, "descriptor block extent does not fit in int16_t");
+            op, "descriptor block extent does not fit in runtime shape storage");
 
     auto elemTy = descTy.getSignlessBlockType().getElementType();
     if (!elemTy.isIntOrFloat() || elemTy.getIntOrFloatBitWidth() % 8 != 0) {
@@ -713,9 +716,19 @@ public:
     }
     auto runtimeFunc = getOrCreateGSanRuntimeFunction(rewriter, funcName);
     auto sourceLoc = materializeSourceLocation(rewriter, loc);
+    Value descriptor = adaptor.getDesc();
+    if (!targetInfo->isCuda()) {
+      // AMD descriptors are SSA structs, including positioned bounds and pred.
+      // Spill the current value at the access site so loops and branches retain
+      // their dynamic descriptor state without tracing defining operations.
+      Value storage = createGSanStackBuffer(rewriter, loc, *targetInfo,
+                                            descriptor.getType());
+      b.store(descriptor, storage);
+      descriptor = storage;
+    }
     SmallVector<Value> args{
         *gsanGlobalStatePtr,
-        castToGenericPointer(rewriter, loc, adaptor.getDesc()),
+        castToGenericPointer(rewriter, loc, descriptor),
         coords,
         b.i32_val(rank),
         shape,

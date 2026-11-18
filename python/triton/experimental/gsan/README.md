@@ -124,7 +124,11 @@ These would allow more efficient communication patterns by minimizing the synchr
 
 GSan also runs, as a prototype, on AMD gfx950 (MI350-series, wave64) with a single GPU.
 It supports ordinary global `tl.load`/`tl.store`, atomic RMW/CAS, atomic load/store/poll, and launches on ordinary streams with memory from the GSan allocator.
-Buffer-op conversion, async copies, and ping-pong scheduling are disabled under GSan; Gluon buffer ops, async copies, TDM, warp specialization, `num_ctas > 1`, other AMD targets, combining GSan with AddressSanitizer, and HIP graph capture are rejected with an error.
+Buffer-op conversion, async copies, and ping-pong scheduling are disabled under GSan; Gluon buffer ops, async copies, advanced TDM, warp specialization, `num_ctas > 1`, other AMD targets, combining GSan with AddressSanitizer, and HIP graph capture are rejected with an error.
+Rectangular TDM global↔LDS copies have compiler and runtime-library instrumentation that decodes the positioned native descriptor, including dynamic address, element strides, bounds, and predicate.
+Their checks happen when the transfer is issued, matching NVIDIA TMA checks; completion epochs are not tracked.
+TDM instructions require gfx1250, whose GSan runtime state ownership and LDS reservation have not been validated, so the driver still rejects that target.
+Fused, gather/scatter TDM, and TDM completion-barrier operands remain rejected.
 A detected race prints `GSan device assertion failed: '<kind> race detected' at <file>:<line>` and aborts the process (device trap), so run failing cases in a subprocess.
 
 Known limitations:

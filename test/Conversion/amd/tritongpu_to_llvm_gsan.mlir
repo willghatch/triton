@@ -142,11 +142,37 @@ module attributes {"ttg.instrumentation_mode" = "gsan", "ttg.num-ctas" = 1 : i32
   // CHECK: [[GENERIC:%[a-zA-Z0-9_]+]] = llvm.addrspacecast [[DESC_BUFFER]] : !llvm.ptr<5> to !llvm.ptr
   // CHECK: llvm.store [[DESC]], [[GENERIC]]
   // CHECK: llvm.call @__triton_gsan_load_tensor_desc({{%[^,]+}}, [[GENERIC]],
-  // CHECK: llvm.call @__triton_gsan_store_tensor_desc(
   tt.func public @tdm_descriptor_checks(%desc: !tt.tensordesc<128x128xf16, #shared>) {
     %zero = arith.constant 0 : i32
     tti.experimental_gsan_tensordesc_access %desc[%zero, %zero], false : !tt.tensordesc<128x128xf16, #shared>
+    tt.return
+  }
+  // CHECK-LABEL: llvm.func @tdm_descriptor_store(
+  // CHECK-SAME: [[STORE_DESC:%[a-zA-Z0-9_]+]]: !llvm.struct
+  // CHECK: [[STORE_BUFFER:%[a-zA-Z0-9_]+]] = llvm.alloca {{.*}} x !llvm.struct<(i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32)> : (i32) -> !llvm.ptr<5>
+  // CHECK: [[STORE_GENERIC:%[a-zA-Z0-9_]+]] = llvm.addrspacecast [[STORE_BUFFER]] : !llvm.ptr<5> to !llvm.ptr
+  // CHECK: llvm.store [[STORE_DESC]], [[STORE_GENERIC]]
+  // CHECK: llvm.call @__triton_gsan_store_tensor_desc({{%[^,]+}}, [[STORE_GENERIC]],
+  tt.func public @tdm_descriptor_store(%desc: !tt.tensordesc<128x128xf16, #shared>) {
+    %zero = arith.constant 0 : i32
     tti.experimental_gsan_tensordesc_access %desc[%zero, %zero], true : !tt.tensordesc<128x128xf16, #shared>
+    tt.return
+  }
+}
+
+// -----
+
+// A legal 32768-element TDM tile exceeds signed int16_t but fits its hardware
+// unsigned 16-bit shape field. The runtime must preserve this extent.
+#shared = #ttg.padded_shared<[128:+4] {order = [0], shape = [32768]}>
+module attributes {"ttg.instrumentation_mode" = "gsan", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  // CHECK-LABEL: llvm.func @tdm_unsigned_block_extent(
+  // CHECK: [[EXTENT:%[a-zA-Z0-9_]+]] = llvm.mlir.constant(-32768 : i16)
+  // CHECK: llvm.store [[EXTENT]],
+  // CHECK: llvm.call @__triton_gsan_load_tensor_desc(
+  tt.func public @tdm_unsigned_block_extent(%desc: !tt.tensordesc<32768xi8, #shared>) {
+    %zero = arith.constant 0 : i32
+    tti.experimental_gsan_tensordesc_access %desc[%zero], false : !tt.tensordesc<32768xi8, #shared>
     tt.return
   }
 }

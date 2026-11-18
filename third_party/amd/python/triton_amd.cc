@@ -123,6 +123,9 @@ void init_triton_amd_passes_ttgpuir(py::module_ &m) {
   ADD_PASS_WRAPPER_0("add_gsan_reject_unsupported",
                      mlir::createTritonAMDGPUGSanRejectUnsupported);
 
+  ADD_PASS_WRAPPER_0("add_gsan_instrument_tdm",
+                     mlir::createTritonAMDGPUGSanInstrumentTDM);
+
   ADD_PASS_OPTION_WRAPPER_1("add_block_pingpong",
                             mlir::createTritonAMDGPUBlockPingpong, int32_t);
   ADD_PASS_OPTION_WRAPPER_1("add_schedule_loops",

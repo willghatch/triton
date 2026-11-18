@@ -1339,9 +1339,16 @@ GSAN_DEVICE void tensorAccessDesc(const void *descriptor, const int *coords,
                                   int bytesPerElem, int elementGranularity,
                                   int warpId, int numWarps,
                                   ElementHandler &handleElement) {
-  TensorDescInfo desc = decodeTensorDesc(descriptor, rank, bytesPerElem);
+  auto desc = decodeTensorDesc(descriptor, rank, bytesPerElem);
+#if GSAN_AMDGPU
+  if (!desc.enabled())
+    return;
+#endif
   int lastDim = rank - 1;
   int lastExtent = blockShape[lastDim];
+#if GSAN_AMDGPU
+  lastExtent = static_cast<uint16_t>(blockShape[lastDim]);
+#endif
   int64_t lastShape = desc.shape(lastDim);
   int64_t lastStart = coords[lastDim] > 0 ? coords[lastDim] : 0;
   int64_t lastEnd = static_cast<int64_t>(coords[lastDim]) + lastExtent;
@@ -1355,6 +1362,9 @@ GSAN_DEVICE void tensorAccessDesc(const void *descriptor, const int *coords,
   int numRows = 1;
   for (int dim = 0; dim < lastDim; ++dim) {
     int extent = blockShape[dim];
+#if GSAN_AMDGPU
+    extent = static_cast<uint16_t>(blockShape[dim]);
+#endif
     int64_t shape = desc.shape(dim);
     int64_t start = coords[dim] > 0 ? coords[dim] : 0;
     int64_t end = static_cast<int64_t>(coords[dim]) + extent;
@@ -1403,7 +1413,7 @@ GSAN_DEVICE void tensorAccessIndexedDesc(const void *descriptor,
   if (!pred)
     return;
 
-  TensorDescInfo desc = decodeTensorDesc(descriptor, 2, bytesPerElem);
+  auto desc = decodeTensorDesc(descriptor, 2, bytesPerElem);
   int64_t rowShape = desc.shape(0);
   int64_t colShape = desc.shape(1);
   int64_t firstCol = yOffset > 0 ? yOffset : 0;

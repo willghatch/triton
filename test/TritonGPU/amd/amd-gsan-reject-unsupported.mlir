@@ -240,3 +240,40 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
+
+// -----
+
+// A completion-barrier operand is synchronization even without an explicit
+// init/wait op in this function; accepting the copy would invent coverage.
+#shared = #ttg.padded_shared<[64:+4] {order = [1, 0], shape = [64, 64]}>
+#bar = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @tdm_completion_barrier(%desc: !tt.tensordesc<64x64xf16, #shared>, %buf: !ttg.memdesc<64x64xf16, #shared, #smem, mutable>, %barrier: !ttg.memdesc<1xi64, #bar, #smem, mutable>) {
+    // expected-error@+1 {{GSan on AMD does not support TDM completion barriers}}
+    %loaded = amdg.async_tdm_copy_global_to_local %desc into %buf, barrier = %barrier : !tt.tensordesc<64x64xf16, #shared>, !ttg.memdesc<1xi64, #bar, #smem, mutable> -> !ttg.memdesc<64x64xf16, #shared, #smem, mutable>
+    // expected-error@+1 {{GSan on AMD does not support TDM completion barriers}}
+    %stored = amdg.async_tdm_copy_local_to_global %desc from %buf, barrier = %barrier : !ttg.memdesc<64x64xf16, #shared, #smem, mutable>, !ttg.memdesc<1xi64, #bar, #smem, mutable> -> !tt.tensordesc<64x64xf16, #shared>
+    tt.return
+  }
+}
+
+// -----
+
+// Advanced copies must fail rather than silently checking only a rectangular
+// approximation of fused or indexed accesses.
+#shared = #ttg.padded_shared<[64:+4] {order = [1, 0], shape = [64, 64]}>
+#index_parent = #ttg.blocked<{sizePerThread = [64, 1], threadsPerWarp = [1, 64], warpsPerCTA = [1, 4], order = [1, 0]}>
+#idx = #ttg.slice<{dim = 1, parent = #index_parent}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @tdm_advanced(%desc: !tt.tensordesc<64x64xf16, #shared>, %buf: !ttg.memdesc<64x64xf16, #shared, #smem, mutable>, %indices: tensor<64xi32, #idx>) {
+    // expected-error@+1 {{GSan on AMD cannot check global-memory operation 'amdg.async_tdm_fused_copy_global_to_local'}}
+    %fused = amdg.async_tdm_fused_copy_global_to_local %desc, %desc into %buf, %buf {warp_used_hints = array<i32: 3, 12>} : !tt.tensordesc<64x64xf16, #shared>, !tt.tensordesc<64x64xf16, #shared> -> !ttg.memdesc<64x64xf16, #shared, #smem, mutable>, !ttg.memdesc<64x64xf16, #shared, #smem, mutable>
+    // expected-error@+1 {{GSan on AMD cannot check global-memory operation 'amdg.async_tdm_gather'}}
+    %gather = amdg.async_tdm_gather %desc[%indices] to %buf : tensor<64xi32, #idx>, !ttg.memdesc<64x64xf16, #shared, #smem, mutable> -> !tt.tensordesc<64x64xf16, #shared>
+    // expected-error@+1 {{GSan on AMD cannot check global-memory operation 'amdg.async_tdm_scatter'}}
+    %scatter = amdg.async_tdm_scatter %desc[%indices] from %buf : tensor<64xi32, #idx>, !ttg.memdesc<64x64xf16, #shared, #smem, mutable> -> !tt.tensordesc<64x64xf16, #shared>
+    tt.return
+  }
+}

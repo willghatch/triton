@@ -392,8 +392,9 @@ def TritonAMDGPUGSanRejectUnsupported : Pass<"tritonamdgpu-gsan-reject-unsupport
   let summary = "Reject operations that the global sanitizer (GSan) cannot check on AMD";
   let description = [{
     GSan instruments `tt.load`, `tt.store`, and the `tt.atomic_*` operations.
-    Any other operation that reads or writes global memory (AMD buffer ops,
-    async copies, TDM copies, tensor descriptor ops, ...) would silently escape
+    Rectangular TDM copies are instrumented by the AMD TDM sanitizer pass.
+    Other operations that read or write global memory (AMD buffer ops,
+    async copies, advanced TDM, tensor descriptor ops, ...) would silently escape
     race checking, so this pass reports an error for it instead.
     It also rejects features the AMD GSan prototype does not model or has not
     been validated with: warp specialization, warp pipelining, mbarrier,
@@ -403,6 +404,18 @@ def TritonAMDGPUGSanRejectUnsupported : Pass<"tritonamdgpu-gsan-reject-unsupport
     external calls) get a warning, since their accesses are not checked, and
     their count is recorded in the module attribute `tti.gsan_unchecked_ops`.
   }];
+}
+
+def TritonAMDGPUGSanInstrumentTDM : Pass<"tritonamdgpu-gsan-instrument-tdm", "mlir::ModuleOp"> {
+  let summary = "Check rectangular AMD TDM transfers at issue time for GSan";
+  let description = [{
+    Inserts descriptor checks for global-to-LDS reads and LDS-to-global writes.
+    The runtime recovers the positioned native descriptor address, element
+    strides, bounds, and predicate, and checks the logical rectangular tile.
+    Completion epochs are not modeled, matching NVIDIA TMA checking.
+  }];
+  let dependentDialects = ["mlir::arith::ArithDialect",
+                           "mlir::triton::instrument::TritonInstrumentDialect"];
 }
 
 #endif

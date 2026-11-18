@@ -749,6 +749,7 @@ class HIPBackend(BaseBackend):
             # scratch, so it must run before shared-memory allocation.
             # AMD has no programmatic dependent launch.
             mod.set_attr("tti.gsan_launch_pdl", ir.builder(mod.context).get_int32_attr(0))
+            amd.passes.ttgpuir.add_gsan_instrument_tdm(pm)
             passes.ttgpuir.add_global_sanitizer(pm)
 
         amd.passes.ttgpuir.add_update_async_wait_count(pm, options.arch)

@@ -241,10 +241,13 @@ def TTI_ExperimentalGSanMBarrierWaitOp
 def TTI_ExperimentalGSanTensorDescAccessOp
     : TTI_Op<"experimental_gsan_tensordesc_access",
              [AttrSizedOperandSegments]> {
-  let summary = "Instrument a TMA tensor descriptor access for GSan";
+  let summary = "Instrument a rectangular tensor descriptor access for GSan";
   let description = [{
-    Passes the native tensor descriptor and its coordinates directly to the
-    GSan runtime, which decodes the descriptor and iterates over the tile.
+    Passes the native tensor descriptor and its coordinates to the GSan
+    runtime, which decodes the descriptor and iterates over the logical tile.
+    NVIDIA TMA descriptors use coordinates; positioned AMD TDM descriptors
+    use zero coordinates and carry their address, bounds, and predicate.
+    Checks happen at issue time; asynchronous completion is not modeled.
   }];
   let arguments = (ins TT_AnyTensorDescType:$desc, Variadic<I32>:$coords,
                    Optional<I1>:$pred, BoolAttr:$isStore);

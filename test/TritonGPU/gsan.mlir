@@ -1,4 +1,4 @@
-// RUN: triton-opt %s -split-input-file -allow-unregistered-dialect -tritoninstrument-global-sanitizer | FileCheck %s
+// RUN: triton-opt %s -split-input-file -allow-unregistered-dialect -tritonamdgpu-gsan-instrument-tdm -tritoninstrument-global-sanitizer | FileCheck %s
 
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
 
@@ -512,6 +512,40 @@ module attributes {"ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 32 : i32}
     // CHECK: tti.experimental_gsan_tensordesc_access %[[DESC]][%{{.*}}, %{{.*}}], false, %{{.*}}
     // CHECK-NEXT: ttng.async_tma_copy_global_to_local
     ttng.async_tma_copy_global_to_local %desc[%c0_i32, %c0_i32] %buf, %barrier, %true : !tt.tensordesc<32x32xf32, #shared>, !ttg.memdesc<1xi64, #bar, #smem, mutable> -> !ttg.memdesc<32x32xf32, #shared, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+// Positioned and loop-carried AMD descriptors must be checked as the current
+// SSA value, preserving their bounds/predicate updates and both directions.
+#shared = #ttg.padded_shared<[64:+4] {order = [1, 0], shape = [64, 64]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 64 : i32} {
+  // CHECK-LABEL: tt.func @instrumented_tdm_updates(
+  // CHECK-SAME: [[DESC:%[a-zA-Z0-9_]+]]: !tt.tensordesc
+  // CHECK-SAME: [[OFFSET:%[a-zA-Z0-9_]+]]: i32
+  // CHECK-SAME: [[BOUND:%[a-zA-Z0-9_]+]]: i32
+  // CHECK-SAME: [[PRED:%[a-zA-Z0-9_]+]]: i32
+  tt.func @instrumented_tdm_updates(%desc: !tt.tensordesc<64x64xf16, #shared>, %offset: i32, %bound: i32, %pred: i32, %iters: i32) {
+    %zero = arith.constant 0 : i32
+    %one = arith.constant 1 : i32
+    %buf = ttg.local_alloc : () -> !ttg.memdesc<64x64xf16, #shared, #smem, mutable>
+    // CHECK: [[POSITIONED:%[a-zA-Z0-9_]+]] = amdg.update_tensor_descriptor [[DESC]] add_offsets = {{\[}}[[OFFSET]], %{{.*}}{{\]}} set_bounds = {{\[}}[[BOUND]], [[BOUND]]{{\]}} pred = [[PRED]]
+    %positioned = amdg.update_tensor_descriptor %desc add_offsets=[%offset, %zero] set_bounds=[%bound, %bound] pred=%pred : !tt.tensordesc<64x64xf16, #shared>
+    // CHECK: [[ZERO:%[a-zA-Z0-9_]+]] = arith.constant 0 : i32
+    // CHECK: tti.experimental_gsan_tensordesc_access [[POSITIONED]]{{\[}}[[ZERO]], [[ZERO]]{{\]}}, false
+    // CHECK-NEXT: {{.*}}amdg.async_tdm_copy_global_to_local [[POSITIONED]]
+    %token = amdg.async_tdm_copy_global_to_local %positioned into %buf {warp_used_hint = 5 : i32} : !tt.tensordesc<64x64xf16, #shared> -> !ttg.memdesc<64x64xf16, #shared, #smem, mutable>
+    // CHECK: scf.for {{.*}}iter_args([[CARRIED:%[a-zA-Z0-9_]+]] = [[POSITIONED]])
+    %result = scf.for %i = %zero to %iters step %one iter_args(%carried = %positioned) -> (!tt.tensordesc<64x64xf16, #shared>) : i32 {
+      // CHECK: tti.experimental_gsan_tensordesc_access [[CARRIED]]{{\[}}%{{.*}}, %{{.*}}{{\]}}, true
+      // CHECK-NEXT: {{.*}}amdg.async_tdm_copy_local_to_global [[CARRIED]]
+      %stored = amdg.async_tdm_copy_local_to_global %carried from %buf : !ttg.memdesc<64x64xf16, #shared, #smem, mutable> -> !tt.tensordesc<64x64xf16, #shared>
+      %next = amdg.update_tensor_descriptor %carried add_offsets=[%one, %zero] {clamp_bounds} : !tt.tensordesc<64x64xf16, #shared>
+      scf.yield %next : !tt.tensordesc<64x64xf16, #shared>
+    }
     tt.return
   }
 }
