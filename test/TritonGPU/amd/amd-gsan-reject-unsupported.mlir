@@ -47,7 +47,6 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
   tt.func @async_copy(%ptrs: tensor<32x64x!tt.ptr<f16>, #blocked>, %dst: !ttg.memdesc<32x64xf16, #shared, #smem, mutable>) {
-    // expected-error@+1 {{GSan on AMD cannot check global-memory operation 'ttg.async_copy_global_to_local'}}
     %0 = ttg.async_copy_global_to_local %ptrs, %dst : tensor<32x64x!tt.ptr<f16>, #blocked> -> <32x64xf16, #shared, #smem, mutable>
     tt.return
   }
@@ -126,7 +125,6 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
   tt.func @buffer_load_to_local(%ptr: !tt.ptr<f32>, %offsets: tensor<32x64xi32, #blocked>, %buffer: !ttg.memdesc<32x64xf32, #shared, #smem, mutable>) {
-    // expected-error@+1 {{GSan on AMD cannot check global-memory operation 'amdg.buffer_load_to_local'}}
     %token = amdg.buffer_load_to_local %ptr[%offsets] into %buffer : !tt.ptr<f32>[tensor<32x64xi32, #blocked>] -> <32x64xf32, #shared, #smem, mutable>
     tt.return
   }
@@ -150,7 +148,6 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
   tt.func @async_copy_local_to_global(%buffer: !ttg.memdesc<32x32xf32, #shared, #smem, mutable>, %dst: tensor<32x32x!tt.ptr<f32>, #blocked>) {
-    // expected-error@+1 {{GSan on AMD cannot check global-memory operation 'amdg.async_copy_local_to_global'}}
     %token = amdg.async_copy_local_to_global %buffer, %dst : !ttg.memdesc<32x32xf32, #shared, #smem, mutable> -> tensor<32x32x!tt.ptr<f32>, #blocked>
     tt.return
   }

@@ -9,6 +9,7 @@ import triton
 import triton.language as tl
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
+from triton.experimental.gluon.language.amd.cdna4 import async_copy as cdna4_async_copy
 from triton.experimental.gluon.language.nvidia.ampere import async_copy
 from triton.experimental.gluon.language.nvidia import hopper
 from triton.tools.tensor_descriptor import TensorDescriptor
@@ -2294,3 +2295,40 @@ def test_gsan_shared_cell_contention():
         mp.setenv("TRITON_TEST_PROCESS_TIMEOUT", os.environ.get("TRITON_TEST_PROCESS_TIMEOUT", "300"))
         result = run_in_process(_run_shared_cell_contention, allow_abort=True)
     assert result.exc is None, f"{result.exc}\n{result.driver_stderr_output}"
+
+
+@gluon.jit
+def _gluon_amd_direct_async_kernel(src, dst, n_elements, soffset, BUFFER: gl.constexpr):
+    layout: gl.constexpr = gl.BlockedLayout([1], [64], [1], [0])
+    shared: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [0])
+    index = gl.arange(0, 64, layout)
+    mask = index % 2 == 0
+    smem = gl.allocate_shared_memory(gl.int32, [64], shared)
+    if BUFFER:
+        desc = gl.amd.cdna4.buffer.make_buffer_descriptor(src, n_elements * 4)
+        gl.amd.cdna4.buffer.load_to_shared(smem, desc, index, mask=mask, soffset=soffset)
+    else:
+        cdna4_async_copy.global_load_to_shared(smem, src + index + soffset,
+                                              mask=mask & (index + soffset < n_elements), other=0)
+    cdna4_async_copy.commit_group()
+    cdna4_async_copy.wait_group(0)
+    gl.store(dst + index, smem.load(layout))
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Direct async GSAN requires AMD gfx950")
+@pytest.mark.parametrize("buffer", [False, True])
+@pytest.mark.parametrize("shadow_granularity", [1, 2, 4], indirect=True)
+def test_gsan_amd_direct_async_masks_bounds_update_shadow(with_gsan, buffer):
+    # Both the alternating user mask and the dynamic descriptor tail must
+    # leave untouched shadow cells unchanged, even in byte-granular pools.
+    src = torch.arange(80, dtype=torch.int32, device="cuda")
+    dst = torch.empty(64, dtype=torch.int32, device="cuda")
+    before = [_shadow_cells_for_tensor(src)]
+    _gluon_amd_direct_async_kernel[(1, )](src, dst, 43, 5, buffer, num_warps=1)
+    index = torch.arange(64, device="cuda")
+    active = (index % 2 == 0) & (index + 5 < 43)
+    expected = torch.where(active, src[index + 5], 0)
+    torch.testing.assert_close(dst, expected)
+    changed = torch.zeros((1, src.numel()), dtype=torch.bool)
+    changed[0, 5:69] = active.cpu()
+    _assert_shadow_mask(before, [_shadow_cells_for_tensor(src)], changed, access_kind="read")
