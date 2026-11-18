@@ -128,3 +128,25 @@ module attributes {"ttg.instrumentation_mode" = "gsan", "ttg.num-ctas" = 1 : i32
     tt.return
   }
 }
+
+// -----
+
+// Dynamic native AMD descriptors, including host arguments, must be passed to
+// rectangular checks by value through private memory. Treating them as NVIDIA
+// descriptor pointers would lose the actual address, strides, bounds, and pred.
+#shared = #ttg.padded_shared<[128:+8] {order = [1, 0], shape = [128, 128]}>
+module attributes {"ttg.instrumentation_mode" = "gsan", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  // CHECK-LABEL: llvm.func @tdm_descriptor_checks(
+  // CHECK-SAME: [[DESC:%[a-zA-Z0-9_]+]]: !llvm.struct<(i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32)>
+  // CHECK: [[DESC_BUFFER:%[a-zA-Z0-9_]+]] = llvm.alloca {{.*}} x !llvm.struct<(i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32)> : (i32) -> !llvm.ptr<5>
+  // CHECK: [[GENERIC:%[a-zA-Z0-9_]+]] = llvm.addrspacecast [[DESC_BUFFER]] : !llvm.ptr<5> to !llvm.ptr
+  // CHECK: llvm.store [[DESC]], [[GENERIC]]
+  // CHECK: llvm.call @__triton_gsan_load_tensor_desc({{%[^,]+}}, [[GENERIC]],
+  // CHECK: llvm.call @__triton_gsan_store_tensor_desc(
+  tt.func public @tdm_descriptor_checks(%desc: !tt.tensordesc<128x128xf16, #shared>) {
+    %zero = arith.constant 0 : i32
+    tti.experimental_gsan_tensordesc_access %desc[%zero, %zero], false : !tt.tensordesc<128x128xf16, #shared>
+    tti.experimental_gsan_tensordesc_access %desc[%zero, %zero], true : !tt.tensordesc<128x128xf16, #shared>
+    tt.return
+  }
+}

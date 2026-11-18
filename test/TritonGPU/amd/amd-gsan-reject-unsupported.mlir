@@ -162,7 +162,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
   tt.func @tdm_copy(%desc: !tt.tensordesc<128x128xf16, #shared>, %dst: !ttg.memdesc<128x128xf16, #shared, #smem, mutable>) {
-    // expected-error@+1 {{GSan on AMD cannot check global-memory operation 'amdg.async_tdm_copy_global_to_local'}}
+    // CHECK-LABEL: @tdm_copy
     %token = amdg.async_tdm_copy_global_to_local %desc into %dst : !tt.tensordesc<128x128xf16, #shared> -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
     tt.return
   }
