@@ -32,6 +32,9 @@ bool isHandledByGSan(Operation *op) {
           amdgpu::BufferAtomicRMWOp, amdgpu::BufferAtomicCASOp,
           amdgpu::BufferAtomicLoadOp, amdgpu::BufferAtomicStoreOp>(op))
     return true;
+  if (isa<amdgpu::AsyncTDMCopyGlobalToLocalOp,
+          amdgpu::AsyncTDMCopyLocalToGlobalOp>(op))
+    return true;
   return isa<tt::instrument::TritonInstrumentDialect>(op->getDialect());
 }
 
@@ -119,6 +122,18 @@ struct TritonAMDGPUGSanRejectUnsupportedPass
         failed = true;
         return;
       }
+      if (auto copy = dyn_cast<amdgpu::AsyncTDMCopyGlobalToLocalOp>(op);
+          copy && copy.getBarrier()) {
+        op->emitError("GSan on AMD does not support TDM completion barriers");
+        failed = true;
+        return;
+      }
+      if (auto copy = dyn_cast<amdgpu::AsyncTDMCopyLocalToGlobalOp>(op);
+          copy && copy.getBarrier()) {
+        op->emitError("GSan on AMD does not support TDM completion barriers");
+        failed = true;
+        return;
+      }
       if (isHandledByGSan(op))
         return;
       MemoryAccess access = getMemoryAccess(op);
@@ -126,8 +141,8 @@ struct TritonAMDGPUGSanRejectUnsupportedPass
         op->emitError("GSan on AMD cannot check global-memory operation '")
             << op->getName()
             << "'; it would escape race detection (GSan instruments only "
-               "tt.load, tt.store, tt.atomic_*, AMD buffer loads, stores, "
-               "atomics, and direct async copies on AMD)";
+               "supported loads, stores, atomics, direct async copies, "
+               "and rectangular TDM copies on AMD)";
         failed = true;
       } else if (access.unknown) {
         // Not an error: e.g. sleep loops use non-pure inline assembly.

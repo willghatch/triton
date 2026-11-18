@@ -28,6 +28,7 @@ add_triton_library(TritonAMDGPUTransforms
   GSanInstrumentBufferOps.cpp
   GSanInstrumentDirectAsync.cpp
   GSanRejectUnsupported.cpp
+  GSanInstrumentTDM.cpp
   UpdateAsyncWaitCount.cpp
   Utility.cpp
   WarpPipeliner.cpp
