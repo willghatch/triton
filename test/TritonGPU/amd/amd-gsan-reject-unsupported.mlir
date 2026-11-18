@@ -253,3 +253,19 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
     tt.return
   }
 }
+
+// -----
+
+// Linear layouts can encode valid subword copies, but the direct GSan pass
+// currently recovers issued dword groups only for blocked layouts.
+#linear = #ttg.linear<{register = [[1]], lane = [[2], [4], [8], [16], [32], [64]], warp = [], block = []}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @linear_subword_buffer_async(%base: !tt.ptr<f16>, %dst: !ttg.memdesc<128xf16, #shared, #smem, mutable>) {
+    %offsets = tt.make_range {start = 0 : i32, end = 128 : i32} : tensor<128xi32, #linear>
+    // expected-error@+1 {{GSan sub-dword buffer async copies require a blocked layout with provably contiguous dword groups}}
+    %token = amdg.buffer_load_to_local %base[%offsets] into %dst : !tt.ptr<f16>[tensor<128xi32, #linear>] -> <128xf16, #shared, #smem, mutable>
+    tt.return
+  }
+}

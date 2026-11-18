@@ -414,6 +414,8 @@ def TritonAMDGPUGSanInstrumentDirectAsync : Pass<"tritonamdgpu-gsan-instrument-d
     Pointer global-to-local copies are checked by the shared GSan pass.
     Buffer checks reconstruct unsigned independently wrapped byte offsets and
     descriptor bounds, checking each in-bounds dword of wider elements.
+    Sub-dword elements require provably contiguous uniformly masked blocked
+    dword groups, whose whole-transaction bounds apply to each element.
     Buffer descriptors must be defined directly by amdg.make_buffer_desc.
     Like NVIDIA async instrumentation, checks use the issue epoch and do not
     model the interval through completion or create synchronization at waits.

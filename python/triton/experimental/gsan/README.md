@@ -136,6 +136,7 @@ Known limitations:
 * A block that spins on `tl.atomic_load` waiting for another block hangs under GSan; the cause is not yet known. Spin with an atomic RMW (e.g. `tl.atomic_add(ptr, 0)`) or `tl.atomic_poll` instead.
 * Direct async copies are checked at issue time, matching NVIDIA's checking approach; the interval through completion is not tracked, and async waits do not add happens-before edges.
 * Buffer global-to-LDS copies check the independently wrapped unsigned byte offsets and descriptor byte bounds, including individual dwords of partially in-bounds wide elements.
+  Sub-dword element types (such as f16 and i8) require a blocked layout whose per-lane dword groups have provably contiguous offsets and uniform masks; checks use the issued dword bounds, so a partial dword dropped by hardware leaves every contained element unchecked.
   A buffer descriptor must be defined directly by `amdg.make_buffer_desc`; passed-in, selected, or loop-carried descriptors fail compilation.
   Exact dynamic buffer bounds can prevent merging checks into complete 16-byte accesses, so use shadow granularity 1, 2, 4, or 8 for those copies; 16-byte pools retain the runtime's complete-access requirement.
 * Pointer LDS-to-global copies (`amdg.async_copy_local_to_global`) receive issue-time write checks, but their gfx1250 hardware lowering is not validated on the gfx950 prototype.
