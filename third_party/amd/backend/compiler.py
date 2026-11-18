@@ -655,13 +655,12 @@ class HIPBackend(BaseBackend):
         passes.ttir.add_triton_licm(pm)
         passes.common.add_canonicalizer(pm)
 
-        # The AMD GSan lowering checks tt.load/tt.store/atomics only; it does
-        # not model AMD buffer ops or async copies (no issue/completion window),
-        # so those lowerings are disabled under GSan. Block pingpong
-        # phase-shifts warps with conditional barriers, which GSan has not been
-        # validated with.
+        # GSan checks direct async copies at issue time, as on NVIDIA.
+        # Synchronous buffer conversion stays disabled until its operations
+        # are instrumented. Block pingpong phase-shifts warps with conditional
+        # barriers, which GSan has not been validated with.
         gsan = is_enabled(options, "gsan")
-        use_async_copy = is_async_copy_enabled(options.base_arch) and not gsan
+        use_async_copy = is_async_copy_enabled(options.base_arch)
         use_block_pingpong = is_pingpong_schedule_enabled(options.base_arch, use_async_copy) and not gsan
         amd.passes.ttgpuir.add_optimize_descriptor_encoding(pm)
         amd.passes.ttgpuir.add_schedule_loops(pm, options.num_stages)
@@ -743,8 +742,9 @@ class HIPBackend(BaseBackend):
             # global accesses added later by the "ttgpuir-to-llvmir"
             # instrumentation hook.
             # Fail clearly on global-memory ops GSan cannot check (e.g. Gluon
-            # buffer ops/async copies) before instrumenting.
+            # synchronous buffer ops) before instrumenting.
             amd.passes.ttgpuir.add_gsan_reject_unsupported(pm)
+            amd.passes.ttgpuir.add_gsan_instrument_direct_async(pm)
             # GSan introduces layout conversions and atomics needing LDS
             # scratch, so it must run before shared-memory allocation.
             # AMD has no programmatic dependent launch.

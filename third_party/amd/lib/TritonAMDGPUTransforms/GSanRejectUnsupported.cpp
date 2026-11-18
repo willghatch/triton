@@ -1,9 +1,9 @@
 #include "TritonAMDGPUTransforms/Passes.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
+#include "third_party/amd/include/Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonInstrument/IR/Dialect.h"
-#include "third_party/amd/include/Dialect/TritonAMDGPU/IR/Dialect.h"
 
 namespace mlir {
 
@@ -24,7 +24,8 @@ constexpr char kUncheckedOpsAttr[] = "tti.gsan_unchecked_ops";
 bool isHandledByGSan(Operation *op) {
   if (isa<tt::LoadOp, tt::StoreOp, tt::AtomicRMWOp, tt::AtomicCASOp,
           tt::AtomicLoadOp, tt::AtomicStoreOp, tt::AtomicPollOp, tt::PrintOp,
-          tt::AssertOp>(op))
+          tt::AssertOp, ttg::AsyncCopyGlobalToLocalOp,
+          amdgpu::BufferLoadToLocalOp, amdgpu::AsyncCopyLocalToGlobalOp>(op))
     return true;
   return isa<tt::instrument::TritonInstrumentDialect>(op->getDialect());
 }
@@ -89,8 +90,7 @@ struct TritonAMDGPUGSanRejectUnsupportedPass
       failed = true;
     }
     // The device runtime's lane waterfall and slot protocol assume wave64.
-    if (auto tpw =
-            mod->getAttrOfType<IntegerAttr>(ttg::AttrNumThreadsPerWarp);
+    if (auto tpw = mod->getAttrOfType<IntegerAttr>(ttg::AttrNumThreadsPerWarp);
         tpw && tpw.getInt() != 64) {
       mod.emitError("GSan on AMD requires 64 threads per warp (got ")
           << tpw.getInt() << ")";
@@ -121,7 +121,8 @@ struct TritonAMDGPUGSanRejectUnsupportedPass
         op->emitError("GSan on AMD cannot check global-memory operation '")
             << op->getName()
             << "'; it would escape race detection (GSan instruments only "
-               "tt.load, tt.store, and tt.atomic_* on AMD)";
+               "tt.load, tt.store, tt.atomic_*, and direct async copies on "
+               "AMD)";
         failed = true;
       } else if (access.unknown) {
         // Not an error: e.g. sleep loops use non-pure inline assembly.

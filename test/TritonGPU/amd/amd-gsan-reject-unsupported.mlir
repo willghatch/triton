@@ -1,4 +1,4 @@
-// RUN: triton-opt %s -split-input-file -tritonamdgpu-gsan-reject-unsupported -verify-diagnostics | FileCheck %s
+// RUN: triton-opt %s -split-input-file -tritonamdgpu-gsan-reject-unsupported -tritonamdgpu-gsan-instrument-direct-async -verify-diagnostics | FileCheck %s
 
 // Operations GSan instruments pass through unchanged.
 
@@ -234,6 +234,22 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %v = amdg.masked_load %ptr, %mask, %other : (!llvm.ptr<1>, i1, f32) -> f32
     // expected-error@+1 {{GSan on AMD cannot check global-memory operation 'amdg.masked_store'}}
     amdg.masked_store %ptr, %v, %mask : !llvm.ptr<1>, f32, i1
+    tt.return
+  }
+}
+
+
+// -----
+
+// A copy through an opaque descriptor must fail explicitly rather than
+// inventing a base address or silently escaping issue-time race checking.
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @opaque_async_buffer(%desc: !amdg.buffer_desc<f32>, %offsets: tensor<64xi32, #blocked>, %dst: !ttg.memdesc<64xf32, #shared, #smem, mutable>) {
+    // expected-error@+1 {{GSan direct async copies require a buffer descriptor defined by amdg.make_buffer_desc}}
+    %token = amdg.buffer_load_to_local %desc[%offsets] into %dst : !amdg.buffer_desc<f32>[tensor<64xi32, #blocked>] -> <64xf32, #shared, #smem, mutable>
     tt.return
   }
 }

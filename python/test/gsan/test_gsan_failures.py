@@ -1218,3 +1218,54 @@ def test_transitive_cta_scope_read_after_write(shadow_granularity, release_sem, 
                       source_function=_transitive_atomic_sync_kernel.fn,
                       marker="ready = tl.atomic_add(flag0_ptr, 0, sem=relay_sem, scope=scope)",
                       error="Read after write race detected")
+
+
+@gluon.jit
+def _amd_direct_async_handoff_kernel(payload, flag, output, BUFFER: gl.constexpr, ORDERED: gl.constexpr):
+    layout: gl.constexpr = gl.BlockedLayout([1], [64], [1], [0])
+    shared: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [0])
+    index = gl.arange(0, 64, layout)
+    if gl.program_id(0) == 0:
+        gl.store(payload + index, 7)
+        gl.atomic_add(flag, 1, sem="release" if ORDERED else "relaxed")
+    else:
+        while gl.atomic_add(flag, 0, sem="acquire" if ORDERED else "relaxed") == 0:
+            pass
+        smem = gl.allocate_shared_memory(gl.int32, [64], shared)
+        if BUFFER:
+            desc = gl.amd.cdna4.buffer.make_buffer_descriptor(payload, 64 * 4)
+            gl.amd.cdna4.buffer.load_to_shared(smem, desc, index)
+        else:
+            gl.amd.cdna4.async_copy.global_load_to_shared(smem, payload + index)
+        gl.amd.cdna4.async_copy.commit_group()
+        gl.amd.cdna4.async_copy.wait_group(0)
+        gl.store(output + index, smem.load(layout))
+
+
+@run_with_gsan
+def _run_amd_direct_async_handoff(buffer, ordered):
+    payload = torch.zeros(64, dtype=torch.int32, device="cuda")
+    flag = torch.zeros(1, dtype=torch.int32, device="cuda")
+    output = torch.zeros_like(payload)
+    _amd_direct_async_handoff_kernel[(2, )](payload, flag, output, buffer, ordered, num_warps=1)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(output, torch.full_like(output, 7))
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="AMD gfx950 direct async GSan")
+@pytest.mark.parametrize("buffer", [False, True])
+def test_gsan_amd_direct_async_read_after_write(buffer):
+    # The relaxed flag forces the writer to run first without ordering its
+    # payload.  The async issue must report a source-located RAW diagnostic.
+    marker = "buffer.load_to_shared" if buffer else "async_copy.global_load_to_shared"
+    _run_failure_case("amd direct async raw", runner=_run_amd_direct_async_handoff,
+                      source_function=_amd_direct_async_handoff_kernel.fn, marker=marker,
+                      error="Read after write race detected", runner_args=(buffer, False))
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="AMD gfx950 direct async GSan")
+@pytest.mark.parametrize("buffer", [False, True])
+def test_gsan_amd_direct_async_release_acquire_handoff(buffer, monkeypatch):
+    monkeypatch.setenv("TRITON_TEST_PROCESS_TIMEOUT", HIP_DEFAULT_PROCESS_TIMEOUT_S)
+    result = run_in_process(_run_amd_direct_async_handoff, args=(buffer, True), allow_abort=True)
+    assert result.exc is None, result.driver_stderr_output

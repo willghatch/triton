@@ -392,8 +392,9 @@ def TritonAMDGPUGSanRejectUnsupported : Pass<"tritonamdgpu-gsan-reject-unsupport
   let summary = "Reject operations that the global sanitizer (GSan) cannot check on AMD";
   let description = [{
     GSan instruments `tt.load`, `tt.store`, and the `tt.atomic_*` operations.
-    Any other operation that reads or writes global memory (AMD buffer ops,
-    async copies, TDM copies, tensor descriptor ops, ...) would silently escape
+    Direct async pointer and buffer copies also receive issue-time checks.
+    Any other operation that reads or writes global memory (synchronous AMD
+    buffer ops, TDM copies, tensor descriptor ops, ...) would silently escape
     race checking, so this pass reports an error for it instead.
     It also rejects features the AMD GSan prototype does not model or has not
     been validated with: warp specialization, warp pipelining, mbarrier,
@@ -403,6 +404,21 @@ def TritonAMDGPUGSanRejectUnsupported : Pass<"tritonamdgpu-gsan-reject-unsupport
     external calls) get a warning, since their accesses are not checked, and
     their count is recorded in the module attribute `tti.gsan_unchecked_ops`.
   }];
+}
+
+def TritonAMDGPUGSanInstrumentDirectAsync : Pass<"tritonamdgpu-gsan-instrument-direct-async", "mlir::ModuleOp"> {
+  let summary = "Check AMD direct async copies at issue time with GSan";
+  let description = [{
+    Adds global read checks for buffer_load_to_local and global write checks
+    for async_copy_local_to_global, retaining the original copies and tokens.
+    Pointer global-to-local copies are checked by the shared GSan pass.
+    Buffer checks reconstruct unsigned independently wrapped byte offsets and
+    descriptor bounds, checking each in-bounds dword of wider elements.
+    Buffer descriptors must be defined directly by amdg.make_buffer_desc.
+    Like NVIDIA async instrumentation, checks use the issue epoch and do not
+    model the interval through completion or create synchronization at waits.
+  }];
+  let dependentDialects = ["mlir::triton::instrument::TritonInstrumentDialect"];
 }
 
 #endif
