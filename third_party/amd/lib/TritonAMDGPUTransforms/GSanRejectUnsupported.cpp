@@ -25,7 +25,8 @@ constexpr char kUncheckedOpsAttr[] = "tti.gsan_unchecked_ops";
 bool isHandledByGSan(Operation *op) {
   if (isa<tt::LoadOp, tt::StoreOp, tt::AtomicRMWOp, tt::AtomicCASOp,
           tt::AtomicLoadOp, tt::AtomicStoreOp, tt::AtomicPollOp, tt::PrintOp,
-          tt::AssertOp>(op))
+          tt::AssertOp, ttg::AsyncCopyGlobalToLocalOp,
+          amdgpu::BufferLoadToLocalOp, amdgpu::AsyncCopyLocalToGlobalOp>(op))
     return true;
   if (isa<amdgpu::BufferLoadOp, amdgpu::BufferStoreOp,
           amdgpu::BufferAtomicRMWOp, amdgpu::BufferAtomicCASOp,
@@ -125,8 +126,8 @@ struct TritonAMDGPUGSanRejectUnsupportedPass
         op->emitError("GSan on AMD cannot check global-memory operation '")
             << op->getName()
             << "'; it would escape race detection (GSan instruments only "
-               "tt.load, tt.store, tt.atomic_*, and AMD buffer loads, "
-               "stores, and atomics on AMD)";
+               "tt.load, tt.store, tt.atomic_*, AMD buffer loads, stores, "
+               "atomics, and direct async copies on AMD)";
         failed = true;
       } else if (access.unknown) {
         // Not an error: e.g. sleep loops use non-pure inline assembly.

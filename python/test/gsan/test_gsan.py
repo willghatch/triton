@@ -9,6 +9,7 @@ import triton
 import triton.language as tl
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
+from triton.experimental.gluon.language.amd.cdna4 import async_copy as cdna4_async_copy
 from triton.experimental.gluon.language.nvidia.ampere import async_copy
 from triton.experimental.gluon.language.nvidia import hopper
 from triton.tools.tensor_descriptor import TensorDescriptor
@@ -916,16 +917,15 @@ def _gsan_pipelined_matmul_kernel(a_ptr, b_ptr, c_ptr, K, BM: tl.constexpr, BN: 
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="buffer ops and async copies are AMD gfx950 lowerings")
-def test_gsan_amd_uses_buffer_ops_without_async_copy(with_gsan):
-    # GSan checks buffer ops, so gfx950 keeps converting these loads/atomics
-    # to buffer ops; async copies (and buffer_load_to_local) stay disabled.
+def test_gsan_amd_uses_buffer_ops_and_async_copy(with_gsan):
+    # Buffer conversion and pipelined async copies both receive GSan checks.
     a = torch.randn(64, 256, dtype=torch.float16, device="cuda")
     b = torch.randn(256, 64, dtype=torch.float16, device="cuda")
     c = torch.zeros(64, 64, dtype=torch.float32, device="cuda")
     compiled = _gsan_pipelined_matmul_kernel.warmup(a, b, c, 256, BM=64, BN=64, BK=64, num_stages=2, grid=(1, ))
     ttgir = compiled.asm["ttgir"]
-    assert "amdg.buffer_load " in ttgir and "amdg.buffer_atomic_rmw " in ttgir
-    assert "async_copy" not in ttgir and "buffer_load_to_local" not in ttgir
+    assert "amdg.buffer_atomic_rmw " in ttgir
+    assert "amdg.buffer_load " in ttgir or "amdg.buffer_load_to_local" in ttgir
 
 
 @gluon.jit
@@ -2500,3 +2500,119 @@ def test_buffer_packed_fp4_bytes_preserved(with_gsan, capfd, explicit_buffer):
         torch.cuda.synchronize()
         assert torch.equal(src, dst)
     _assert_no_gsan_runtime_output(capfd)
+
+
+@gluon.jit
+def _gluon_amd_direct_async_kernel(src, dst, n_elements, soffset, BUFFER: gl.constexpr):
+    layout: gl.constexpr = gl.BlockedLayout([1], [64], [1], [0])
+    shared: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [0])
+    index = gl.arange(0, 64, layout)
+    mask = index % 2 == 0
+    smem = gl.allocate_shared_memory(gl.int32, [64], shared)
+    if BUFFER:
+        desc = gl.amd.cdna4.buffer.make_buffer_descriptor(src, n_elements * 4)
+        gl.amd.cdna4.buffer.load_to_shared(smem, desc, index, mask=mask, soffset=soffset)
+    else:
+        cdna4_async_copy.global_load_to_shared(smem, src + index + soffset, mask=mask & (index + soffset < n_elements),
+                                               other=0)
+    cdna4_async_copy.commit_group()
+    cdna4_async_copy.wait_group(0)
+    gl.store(dst + index, smem.load(layout))
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Direct async GSAN requires AMD gfx950")
+@pytest.mark.parametrize("buffer", [False, True])
+@pytest.mark.parametrize("shadow_granularity", [1, 2, 4], indirect=True)
+def test_gsan_amd_direct_async_masks_bounds_update_shadow(with_gsan, buffer):
+    # Both the alternating user mask and the dynamic descriptor tail must
+    # leave untouched shadow cells unchanged, even in byte-granular pools.
+    src = torch.arange(80, dtype=torch.int32, device="cuda")
+    dst = torch.empty(64, dtype=torch.int32, device="cuda")
+    before = [_shadow_cells_for_tensor(src)]
+    _gluon_amd_direct_async_kernel[(1, )](src, dst, 43, 5, buffer, num_warps=1)
+    index = torch.arange(64, device="cuda")
+    active = (index % 2 == 0) & (index + 5 < 43)
+    expected = torch.where(active, src[index + 5], 0)
+    torch.testing.assert_close(dst, expected)
+    changed = torch.zeros((1, src.numel()), dtype=torch.bool)
+    changed[0, 5:69] = active.cpu()
+    _assert_shadow_mask(before, [_shadow_cells_for_tensor(src)], changed, access_kind="read")
+
+
+@gluon.jit
+def _gluon_amd_buffer_async_wide_kernel(src, dst, bound, scalar_offset):
+    layout: gl.constexpr = gl.BlockedLayout([2], [64], [1], [0])
+    shared: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [0])
+    index = gl.arange(0, 128, layout)
+    smem = gl.allocate_shared_memory(gl.float64, [128], shared)
+    desc = gl.amd.cdna4.buffer.make_buffer_descriptor(src, bound)
+    # Scaling each element offset by eight wraps independently in the two
+    # hardware i32 offset fields, leaving effective offsets index and three.
+    gl.amd.cdna4.buffer.load_to_shared(smem, desc, index + (1 << 29), soffset=scalar_offset)
+    cdna4_async_copy.commit_group()
+    cdna4_async_copy.wait_group(0)
+    gl.store(dst + index, smem.load(layout))
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Direct buffer async GSAN requires AMD gfx950")
+@pytest.mark.parametrize("shadow_granularity", [1, 2, 4], indirect=True)
+def test_gsan_amd_buffer_async_partial_dwords_wrapped_offsets(with_gsan):
+    # The 260-byte bound cuts an f64 element after its first dword.  Inspect
+    # integer storage and its shadow cells to distinguish that partial access
+    # from an incorrectly checked full f64 element or signed i32 address.
+    src_words = torch.arange(320, dtype=torch.int32, device="cuda")
+    dst_words = torch.empty(256, dtype=torch.int32, device="cuda")
+    before = [_shadow_cells_for_tensor(src_words)]
+    _gluon_amd_buffer_async_wide_kernel[(1, )](src_words.view(torch.float64), dst_words.view(torch.float64), 65 * 4,
+                                               (1 << 29) + 3, num_warps=1)
+    expected = torch.zeros_like(dst_words)
+    expected[:59] = src_words[6:65]
+    torch.testing.assert_close(dst_words, expected)
+    changed = torch.zeros((1, src_words.numel()), dtype=torch.bool)
+    changed[0, 6:65] = True
+    _assert_shadow_mask(before, [_shadow_cells_for_tensor(src_words)], changed, access_kind="read")
+
+
+@gluon.jit
+def _gluon_amd_buffer_async_subword_kernel(src, dst, bound, soffset, PACK: gl.constexpr, RANK: gl.constexpr):
+    if RANK == 1:
+        layout: gl.constexpr = gl.BlockedLayout([PACK], [64], [1], [0])
+        shared: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [0])
+        index = gl.arange(0, 64 * PACK, layout)
+        smem = gl.allocate_shared_memory(src.dtype.element_ty, [64 * PACK], shared)
+    else:
+        layout: gl.constexpr = gl.BlockedLayout([1, PACK], [1, 64], [1, 1], [1, 0])
+        shared: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [1, 0])
+        row = gl.arange(0, 16, gl.SliceLayout(1, layout))
+        col = gl.arange(0, 64 * PACK, gl.SliceLayout(0, layout))
+        index = row[:, None] * (64 * PACK) + col[None, :]
+        smem = gl.allocate_shared_memory(src.dtype.element_ty, [16, 64 * PACK], shared)
+    desc = gl.amd.cdna4.buffer.make_buffer_descriptor(src, bound)
+    gl.amd.cdna4.buffer.load_to_shared(smem, desc, index, soffset=gl.cast(soffset, gl.uint32))
+    cdna4_async_copy.commit_group()
+    cdna4_async_copy.wait_group(0)
+    gl.store(dst + index, smem.load(layout))
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Direct buffer async GSAN requires AMD gfx950")
+@pytest.mark.parametrize("dtype", [torch.int8, torch.int16, torch.float16])
+@pytest.mark.parametrize("rank,soffset,bound", [(1, 0, 3), (1, 0, 5), (1, 0, 7), (2, 1, 519), (2, (1 << 31) + 1, 519)])
+@pytest.mark.parametrize("shadow_granularity", [1, 2, 4], indirect=True)
+def test_gsan_amd_buffer_async_subwords_obey_dword_bounds(with_gsan, dtype, rank, soffset, bound):
+    # Subword elements share each issued dword.  A bound that admits an
+    # element but drops its dword must leave all its shadow cells untouched.
+    elem_bytes = torch.empty((), dtype=dtype).element_size()
+    pack = 4 // elem_bytes
+    n = 64 * pack * (16 if rank == 2 else 1)
+    src = torch.arange(n + 8, dtype=torch.int32, device="cuda").to(dtype)
+    dst = torch.empty(n, dtype=dtype, device="cuda")
+    before = [_shadow_cells_for_tensor(src)]
+    _gluon_amd_buffer_async_subword_kernel[(1, )](src, dst, bound, soffset, pack, rank, num_warps=1)
+    effective_soffset = ((soffset * elem_bytes) % (1 << 32)) // elem_bytes
+    count = max(0, (bound - effective_soffset * elem_bytes) // 4) * pack
+    expected = torch.zeros_like(dst)
+    expected[:count] = src[effective_soffset:effective_soffset + count]
+    torch.testing.assert_close(dst, expected)
+    changed = torch.zeros((1, src.numel()), dtype=torch.bool)
+    changed[0, effective_soffset:effective_soffset + count] = True
+    _assert_shadow_mask(before, [_shadow_cells_for_tensor(src)], changed, access_kind="read")

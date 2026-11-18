@@ -391,13 +391,11 @@ def TritonAMDGPUFpSanitizer : Pass<"tritonamdgpu-fp-sanitizer", "mlir::ModuleOp"
 def TritonAMDGPUGSanRejectUnsupported : Pass<"tritonamdgpu-gsan-reject-unsupported", "mlir::ModuleOp"> {
   let summary = "Reject operations that the global sanitizer (GSan) cannot check on AMD";
   let description = [{
-    GSan instruments `tt.load`, `tt.store`, the `tt.atomic_*` operations, and
-    (through `tritonamdgpu-gsan-instrument-buffer-ops`) the AMD buffer loads,
-    stores, and atomics.
-    Any other operation that reads or writes global memory
-    (`amdg.buffer_load_to_local`, async copies, TDM copies, tensor descriptor
-    ops, ...) would silently escape race checking, so this pass reports an
-    error for it instead.
+    GSan instruments `tt.load`, `tt.store`, the `tt.atomic_*` operations,
+    AMD buffer loads, stores, and atomics, and direct async copies.
+    Any other operation that reads or writes global memory (TDM copies,
+    tensor descriptor ops, ...) would silently escape race checking, so this
+    pass reports an error for it instead.
     It also rejects features the AMD GSan prototype does not model or has not
     been validated with: warp specialization, warp pipelining, mbarrier,
     cluster, and conditional barriers (block pingpong), `num_ctas > 1`, and
@@ -426,6 +424,23 @@ def TritonAMDGPUGSanInstrumentBufferOps : Pass<"tritonamdgpu-gsan-instrument-buf
   }];
   let dependentDialects = ["mlir::triton::instrument::TritonInstrumentDialect",
                            "mlir::arith::ArithDialect"];
+}
+
+def TritonAMDGPUGSanInstrumentDirectAsync : Pass<"tritonamdgpu-gsan-instrument-direct-async", "mlir::ModuleOp"> {
+  let summary = "Check AMD direct async copies at issue time with GSan";
+  let description = [{
+    Adds global read checks for buffer_load_to_local and global write checks
+    for async_copy_local_to_global, retaining the original copies and tokens.
+    Pointer global-to-local copies are checked by the shared GSan pass.
+    Buffer checks reconstruct unsigned independently wrapped byte offsets and
+    descriptor bounds, checking each in-bounds dword of wider elements.
+    Sub-dword elements require provably contiguous uniformly masked blocked
+    dword groups, whose whole-transaction bounds apply to each element.
+    Buffer descriptors must be defined directly by amdg.make_buffer_desc.
+    Like NVIDIA async instrumentation, checks use the issue epoch and do not
+    model the interval through completion or create synchronization at waits.
+  }];
+  let dependentDialects = ["mlir::triton::instrument::TritonInstrumentDialect"];
 }
 
 #endif

@@ -1,4 +1,4 @@
-// RUN: triton-opt %s -split-input-file -tritonamdgpu-gsan-reject-unsupported -verify-diagnostics | FileCheck %s
+// RUN: triton-opt %s -split-input-file -tritonamdgpu-gsan-reject-unsupported -tritonamdgpu-gsan-instrument-direct-async -verify-diagnostics | FileCheck %s
 
 // Operations GSan instruments pass through unchanged.
 
@@ -45,7 +45,6 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
   tt.func @async_copy(%ptrs: tensor<32x64x!tt.ptr<f16>, #blocked>, %dst: !ttg.memdesc<32x64xf16, #shared, #smem, mutable>) {
-    // expected-error@+1 {{GSan on AMD cannot check global-memory operation 'ttg.async_copy_global_to_local'}}
     %0 = ttg.async_copy_global_to_local %ptrs, %dst : tensor<32x64x!tt.ptr<f16>, #blocked> -> <32x64xf16, #shared, #smem, mutable>
     tt.return
   }
@@ -124,7 +123,6 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
   tt.func @buffer_load_to_local(%ptr: !tt.ptr<f32>, %offsets: tensor<32x64xi32, #blocked>, %buffer: !ttg.memdesc<32x64xf32, #shared, #smem, mutable>) {
-    // expected-error@+1 {{GSan on AMD cannot check global-memory operation 'amdg.buffer_load_to_local'}}
     %token = amdg.buffer_load_to_local %ptr[%offsets] into %buffer : !tt.ptr<f32>[tensor<32x64xi32, #blocked>] -> <32x64xf32, #shared, #smem, mutable>
     tt.return
   }
@@ -137,7 +135,6 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
   tt.func @async_copy_local_to_global(%buffer: !ttg.memdesc<32x32xf32, #shared, #smem, mutable>, %dst: tensor<32x32x!tt.ptr<f32>, #blocked>) {
-    // expected-error@+1 {{GSan on AMD cannot check global-memory operation 'amdg.async_copy_local_to_global'}}
     %token = amdg.async_copy_local_to_global %buffer, %dst : !ttg.memdesc<32x32xf32, #shared, #smem, mutable> -> tensor<32x32x!tt.ptr<f32>, #blocked>
     tt.return
   }
@@ -224,6 +221,38 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %v = amdg.masked_load %ptr, %mask, %other : (!llvm.ptr<1>, i1, f32) -> f32
     // expected-error@+1 {{GSan on AMD cannot check global-memory operation 'amdg.masked_store'}}
     amdg.masked_store %ptr, %v, %mask : !llvm.ptr<1>, f32, i1
+    tt.return
+  }
+}
+
+
+// -----
+
+// A copy through an opaque descriptor must fail explicitly rather than
+// inventing a base address or silently escaping issue-time race checking.
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @opaque_async_buffer(%desc: !amdg.buffer_desc<f32>, %offsets: tensor<64xi32, #blocked>, %dst: !ttg.memdesc<64xf32, #shared, #smem, mutable>) {
+    // expected-error@+1 {{GSan direct async copies require a buffer descriptor defined by amdg.make_buffer_desc}}
+    %token = amdg.buffer_load_to_local %desc[%offsets] into %dst : !amdg.buffer_desc<f32>[tensor<64xi32, #blocked>] -> <64xf32, #shared, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+// Linear layouts can encode valid subword copies, but the direct GSan pass
+// currently recovers issued dword groups only for blocked layouts.
+#linear = #ttg.linear<{register = [[1]], lane = [[2], [4], [8], [16], [32], [64]], warp = [], block = []}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @linear_subword_buffer_async(%base: !tt.ptr<f16>, %dst: !ttg.memdesc<128xf16, #shared, #smem, mutable>) {
+    %offsets = tt.make_range {start = 0 : i32, end = 128 : i32} : tensor<128xi32, #linear>
+    // expected-error@+1 {{GSan sub-dword buffer async copies require a blocked layout with provably contiguous dword groups}}
+    %token = amdg.buffer_load_to_local %base[%offsets] into %dst : !tt.ptr<f16>[tensor<128xi32, #linear>] -> <128xf16, #shared, #smem, mutable>
     tt.return
   }
 }

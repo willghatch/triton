@@ -655,13 +655,11 @@ class HIPBackend(BaseBackend):
         passes.ttir.add_triton_licm(pm)
         passes.common.add_canonicalizer(pm)
 
-        # GSan checks buffer ops but does not model async copies (no
-        # issue/completion window), so async copies (and thus
-        # buffer_load_to_local from the pipeliner) are disabled under GSan.
+        # GSan checks buffer ops and direct async copies at issue time.
         # Block pingpong phase-shifts warps with conditional barriers, which
         # GSan has not been validated with.
         gsan = is_enabled(options, "gsan")
-        use_async_copy = is_async_copy_enabled(options.base_arch) and not gsan
+        use_async_copy = is_async_copy_enabled(options.base_arch)
         use_block_pingpong = is_pingpong_schedule_enabled(options.base_arch, use_async_copy) and not gsan
         amd.passes.ttgpuir.add_optimize_descriptor_encoding(pm)
         amd.passes.ttgpuir.add_schedule_loops(pm, options.num_stages)
@@ -743,7 +741,7 @@ class HIPBackend(BaseBackend):
             # global accesses added later by the "ttgpuir-to-llvmir"
             # instrumentation hook.
             # Fail clearly on global-memory ops GSan cannot check (e.g. Gluon
-            # async copies) before instrumenting.
+            # TDM copies) before instrumenting.
             amd.passes.ttgpuir.add_gsan_reject_unsupported(pm)
             # Buffer ops become GSan checks/atomics on their global addresses.
             # Like all GSan instrumentation ops, these find the GSan function
@@ -751,6 +749,7 @@ class HIPBackend(BaseBackend):
             # sanitizer (which adds those arguments) is fine; it ignores amdg
             # ops and the GSan ops created here, so nothing is checked twice.
             amd.passes.ttgpuir.add_gsan_instrument_buffer_ops(pm)
+            amd.passes.ttgpuir.add_gsan_instrument_direct_async(pm)
             # GSan introduces layout conversions and atomics needing LDS
             # scratch, so it must run before shared-memory allocation.
             # AMD has no programmatic dependent launch.

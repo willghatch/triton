@@ -1,4 +1,4 @@
-// RUN: triton-opt %s -split-input-file -allow-unregistered-dialect -tritoninstrument-global-sanitizer | FileCheck %s
+// RUN: triton-opt %s -split-input-file -allow-unregistered-dialect -tritonamdgpu-gsan-instrument-direct-async -tritoninstrument-global-sanitizer | FileCheck %s
 
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
 
@@ -512,6 +512,91 @@ module attributes {"ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 32 : i32}
     // CHECK: tti.experimental_gsan_tensordesc_access %[[DESC]][%{{.*}}, %{{.*}}], false, %{{.*}}
     // CHECK-NEXT: ttng.async_tma_copy_global_to_local
     ttng.async_tma_copy_global_to_local %desc[%c0_i32, %c0_i32] %buf, %barrier, %true : !tt.tensordesc<32x32xf32, #shared>, !ttg.memdesc<1xi64, #bar, #smem, mutable> -> !ttg.memdesc<32x32xf32, #shared, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+// AMD direct copies retain their async tokens and check only global memory at
+// issue time.  The buffer address uses independently wrapped unsigned i32
+// byte offsets and descriptor bounds, so masks and OOB zero-fill do not add
+// false global accesses.
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-warps" = 1 : i32, "ttg.num-ctas" = 1 : i32, "ttg.threads-per-warp" = 64 : i32, ttg.target = "hip:gfx950"} {
+  // CHECK-LABEL: @amd_direct_store
+  // CHECK-SAME: %[[DST:[a-zA-Z0-9_]+]]: tensor<64x!tt.ptr<f32>, #blocked>
+  // CHECK-SAME: %[[MASK:[a-zA-Z0-9_]+]]: tensor<64xi1, #blocked>
+  tt.func @amd_direct_store(%src: !ttg.memdesc<64xf32, #shared, #smem, mutable>, %dst: tensor<64x!tt.ptr<f32>, #blocked>, %mask: tensor<64xi1, #blocked>) {
+    // CHECK: tti.experimental_gsan_tensor_access %[[DST]], true, %[[MASK]]
+    // CHECK: %[[TOK:[a-zA-Z0-9_]+]] = amdg.async_copy_local_to_global {{.*}}, %[[DST]] mask %[[MASK]]
+    %token = amdg.async_copy_local_to_global %src, %dst mask %mask : !ttg.memdesc<64xf32, #shared, #smem, mutable> -> tensor<64x!tt.ptr<f32>, #blocked>
+    // CHECK: ttg.async_wait %[[TOK]]
+    ttg.async_wait %token {num = 0 : i32}
+    tt.return
+  }
+
+  // CHECK-LABEL: @amd_buffer_async
+  // CHECK-SAME: %[[BASE:[a-zA-Z0-9_]+]]: !tt.ptr<f32>
+  // CHECK-SAME: %[[BOUND:[a-zA-Z0-9_]+]]: i32
+  // CHECK-SAME: %[[OFF:[a-zA-Z0-9_]+]]: tensor<64xi32, #blocked>
+  // CHECK-SAME: %[[SOFF:[a-zA-Z0-9_]+]]: i32
+  // CHECK-SAME: %[[USERMASK:[a-zA-Z0-9_]+]]: tensor<64xi1, #blocked>
+  tt.func @amd_buffer_async(%base: !tt.ptr<f32>, %bound: i32, %offsets: tensor<64xi32, #blocked>, %soffset: i32, %mask: tensor<64xi1, #blocked>, %other: tensor<64xf32, #blocked>, %dst: !ttg.memdesc<64xf32, #shared, #smem, mutable>) {
+    %desc = amdg.make_buffer_desc %base, %bound : !tt.ptr<f32> -> !amdg.buffer_desc<f32>
+    // CHECK-DAG: %[[FOUR:[a-zA-Z0-9_]+]] = arith.constant dense<4> : tensor<64xi32
+    // CHECK-DAG: %[[VOFF:[a-zA-Z0-9_]+]] = arith.muli %[[OFF]], %[[FOUR]]
+    // CHECK-DAG: %[[V64:[a-zA-Z0-9_]+]] = arith.extui %[[VOFF]]
+    // CHECK-DAG: %[[SFOUR:[a-zA-Z0-9_]+]] = arith.constant 4 : i32
+    // CHECK-DAG: %[[SWRAP:[a-zA-Z0-9_]+]] = arith.muli %[[SOFF]], %[[SFOUR]]
+    // CHECK-DAG: %[[S64:[a-zA-Z0-9_]+]] = arith.extui %[[SWRAP]]
+    // CHECK-DAG: %[[SSPLAT:[a-zA-Z0-9_]+]] = tt.splat %[[S64]]
+    // CHECK: %[[BYTES:[a-zA-Z0-9_]+]] = arith.addi %[[V64]], %[[SSPLAT]]
+    // CHECK-DAG: %[[B64:[a-zA-Z0-9_]+]] = arith.extui %[[BOUND]]
+    // CHECK-DAG: %[[BSPLAT:[a-zA-Z0-9_]+]] = tt.splat %[[B64]]
+    // CHECK-DAG: %[[BYTEBASE:[a-zA-Z0-9_]+]] = tt.bitcast %[[BASE]] : !tt.ptr<f32> -> !tt.ptr<i8>
+    // CHECK: %[[PTRS:[a-zA-Z0-9_]+]] = tt.splat %[[BYTEBASE]]
+    // CHECK: %[[ADDRS:[a-zA-Z0-9_]+]] = tt.addptr %[[PTRS]], %[[BYTES]]
+    // CHECK-DAG: %[[END:[a-zA-Z0-9_]+]] = arith.addi %[[BYTES]], {{.*}}
+    // CHECK: %[[INBOUNDS:[a-zA-Z0-9_]+]] = arith.cmpi ule, %[[END]], %[[BSPLAT]]
+    // CHECK: %[[ACTIVE:[a-zA-Z0-9_]+]] = arith.andi %[[USERMASK]], %[[INBOUNDS]]
+    // CHECK: %[[TYPED:[a-zA-Z0-9_]+]] = tt.bitcast %[[ADDRS]]
+    // CHECK: tti.experimental_gsan_tensor_access %[[TYPED]], false, %[[ACTIVE]]
+    // CHECK: %[[COPY:[a-zA-Z0-9_]+]] = amdg.buffer_load_to_local {{.*}}[%[[OFF]]] mask = %[[USERMASK]] other = {{.*}} soffset = %[[SOFF]]
+    %token = amdg.buffer_load_to_local %desc[%offsets] mask = %mask other = %other soffset = %soffset into %dst : !amdg.buffer_desc<f32>[tensor<64xi32, #blocked>] tensor<64xf32, #blocked> -> <64xf32, #shared, #smem, mutable>
+    // CHECK: ttg.async_wait %[[COPY]]
+    ttg.async_wait %token {num = 0 : i32}
+    tt.return
+  }
+}
+
+// -----
+
+// A dynamic bound can cut an f64 element between its two dwords.  Only its
+// in-bounds dwords should enter shadow memory; counting the whole element
+// would spuriously report races past the bound in fine-grained pools.
+#blocked = #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-warps" = 1 : i32, "ttg.num-ctas" = 1 : i32, "ttg.threads-per-warp" = 64 : i32, ttg.target = "hip:gfx950"} {
+  // CHECK-LABEL: @amd_buffer_async_partial_dword
+  tt.func @amd_buffer_async_partial_dword(%base: !tt.ptr<f64>, %bound: i32, %offsets: tensor<128xi32, #blocked>, %dst: !ttg.memdesc<128xf64, #shared, #smem, mutable>) {
+    %desc = amdg.make_buffer_desc %base, %bound : !tt.ptr<f64> -> !amdg.buffer_desc<f64>
+    // CHECK: %[[FIRSTADDR:[a-zA-Z0-9_]+]] = tt.addptr
+    // CHECK: %[[FIRSTEND:[a-zA-Z0-9_]+]] = arith.addi
+    // CHECK: %[[FIRSTMASK:[a-zA-Z0-9_]+]] = arith.cmpi ule, %[[FIRSTEND]], %[[BOUND:[a-zA-Z0-9_]+]]
+    // CHECK: %[[FIRSTPTR:[a-zA-Z0-9_]+]] = tt.bitcast %[[FIRSTADDR]] : {{.*}} -> tensor<128x!tt.ptr<i32>
+    // CHECK: tti.experimental_gsan_tensor_access %[[FIRSTPTR]], false, %[[FIRSTMASK]]
+    // CHECK: %[[SECONDADDR:[a-zA-Z0-9_]+]] = tt.addptr
+    // CHECK: %[[SECONDEND:[a-zA-Z0-9_]+]] = arith.addi
+    // CHECK: %[[SECONDMASK:[a-zA-Z0-9_]+]] = arith.cmpi ule, %[[SECONDEND]], %[[BOUND]]
+    // CHECK: %[[SECONDPTR:[a-zA-Z0-9_]+]] = tt.bitcast %[[SECONDADDR]] : {{.*}} -> tensor<128x!tt.ptr<i32>
+    // CHECK: tti.experimental_gsan_tensor_access %[[SECONDPTR]], false, %[[SECONDMASK]]
+    // CHECK-NOT: tti.experimental_gsan_tensor_access
+    // CHECK: amdg.buffer_load_to_local
+    %token = amdg.buffer_load_to_local %desc[%offsets] into %dst : !amdg.buffer_desc<f64>[tensor<128xi32, #blocked>] -> <128xf64, #shared, #smem, mutable>
     tt.return
   }
 }
