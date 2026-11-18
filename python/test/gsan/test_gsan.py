@@ -2366,3 +2366,34 @@ def test_gsan_amd_buffer_async_partial_dwords_wrapped_offsets(with_gsan):
     changed = torch.zeros((1, src_words.numel()), dtype=torch.bool)
     changed[0, 6:65] = True
     _assert_shadow_mask(before, [_shadow_cells_for_tensor(src_words)], changed, access_kind="read")
+
+
+@gluon.jit
+def _gluon_amd_buffer_async_subword_kernel(src, dst, bound):
+    layout: gl.constexpr = gl.BlockedLayout([2], [64], [1], [0])
+    shared: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [0])
+    index = gl.arange(0, 128, layout)
+    smem = gl.allocate_shared_memory(gl.int16, [128], shared)
+    desc = gl.amd.cdna4.buffer.make_buffer_descriptor(src, bound)
+    gl.amd.cdna4.buffer.load_to_shared(smem, desc, index)
+    cdna4_async_copy.commit_group()
+    cdna4_async_copy.wait_group(0)
+    gl.store(dst + index, smem.load(layout))
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Direct buffer async GSAN requires AMD gfx950")
+@pytest.mark.parametrize("bound", [3, 5, 7])
+def test_gsan_amd_buffer_async_subwords_obey_dword_bounds(with_gsan, bound):
+    # Two i16 elements share each issued dword.  A bound that admits the
+    # first i16 but drops that dword must leave both shadow cells untouched.
+    src = torch.arange(128, dtype=torch.int16, device="cuda")
+    dst = torch.empty_like(src)
+    before = [_shadow_cells_for_tensor(src)]
+    _gluon_amd_buffer_async_subword_kernel[(1, )](src, dst, bound, num_warps=1)
+    count = bound // 4 * 2
+    expected = torch.zeros_like(src)
+    expected[:count] = src[:count]
+    torch.testing.assert_close(dst, expected)
+    changed = torch.zeros((1, src.numel()), dtype=torch.bool)
+    changed[0, :count] = True
+    _assert_shadow_mask(before, [_shadow_cells_for_tensor(src)], changed, access_kind="read")
