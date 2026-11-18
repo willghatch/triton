@@ -538,11 +538,14 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     // CHECK: tti.experimental_gsan_tensordesc_access [[POSITIONED]]{{\[}}[[ZERO]], [[ZERO]]{{\]}}, false
     // CHECK-NEXT: {{.*}}amdg.async_tdm_copy_global_to_local [[POSITIONED]]
     %token = amdg.async_tdm_copy_global_to_local %positioned into %buf {warp_used_hint = 5 : i32} : !tt.tensordesc<64x64xf16, #shared> -> !ttg.memdesc<64x64xf16, #shared, #smem, mutable>
+    %loaded = amdg.async_tdm_wait %token {num = 0 : i32}
+    ttg.barrier local
     // CHECK: scf.for {{.*}}iter_args([[CARRIED:%[a-zA-Z0-9_]+]] = [[POSITIONED]])
     %result = scf.for %i = %zero to %iters step %one iter_args(%carried = %positioned) -> (!tt.tensordesc<64x64xf16, #shared>) : i32 {
       // CHECK: tti.experimental_gsan_tensordesc_access [[CARRIED]]{{\[}}%{{.*}}, %{{.*}}{{\]}}, true
       // CHECK-NEXT: {{.*}}amdg.async_tdm_copy_local_to_global [[CARRIED]]
       %stored = amdg.async_tdm_copy_local_to_global %carried from %buf : !ttg.memdesc<64x64xf16, #shared, #smem, mutable> -> !tt.tensordesc<64x64xf16, #shared>
+      %completed = amdg.async_tdm_wait %stored {num = 0 : i32}
       %next = amdg.update_tensor_descriptor %carried add_offsets=[%one, %zero] {clamp_bounds} : !tt.tensordesc<64x64xf16, #shared>
       scf.yield %next : !tt.tensordesc<64x64xf16, #shared>
     }
