@@ -207,7 +207,6 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
 
 // -----
 
-// expected-error@+1 {{GSan on AMD requires 64 threads per warp (got 32)}}
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
   tt.func @wave32() {
     tt.return
@@ -293,6 +292,16 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %gather = amdg.async_tdm_gather %desc[%indices] to %buf : tensor<64xi32, #idx>, !ttg.memdesc<64x64xf16, #shared, #smem, mutable> -> !tt.tensordesc<64x64xf16, #shared>
     // expected-error@+1 {{GSan on AMD cannot check global-memory operation 'amdg.async_tdm_scatter'}}
     %scatter = amdg.async_tdm_scatter %desc[%indices] from %buf : tensor<64xi32, #idx>, !ttg.memdesc<64x64xf16, #shared, #smem, mutable> -> !tt.tensordesc<64x64xf16, #shared>
+    tt.return
+  }
+}
+
+// -----
+
+// Only the two supported hardware wave widths can use the runtime.
+// expected-error@+1 {{GSan on AMD requires 32 or 64 threads per warp (got 16)}}
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 16 : i32} {
+  tt.func @invalid_wave_size() {
     tt.return
   }
 }

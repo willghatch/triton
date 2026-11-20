@@ -14,7 +14,7 @@ from triton.experimental.gluon.language.nvidia.ampere import async_copy
 from triton.experimental.gluon.language.nvidia import hopper
 from triton.tools.tensor_descriptor import TensorDescriptor
 
-from triton._internal_testing import is_blackwell, is_cuda, is_hip, is_hip_cdna4, is_ampere_or_newer, is_hopper_or_newer, is_sm12x, run_in_process
+from triton._internal_testing import is_blackwell, is_cuda, is_hip, is_hip_cdna4, is_hip_cdna5, is_ampere_or_newer, is_hopper_or_newer, is_sm12x, run_in_process
 from triton.experimental.gsan import create_mem_pool
 from triton.experimental.gsan._allocator import get_device_rank, gsan_free, gsan_malloc
 from triton.experimental.gsan._stream_sync import _runtime_state_layout
@@ -24,9 +24,12 @@ from triton._C.libtriton.gsan_testing import AtomicScope, ScalarClock, shadow_gr
 from triton.experimental.gsan._testing_utils import (atomic_poll, load_one_i32, shadow_cell_from_address, store_one_i32,
                                                      thread_state_from_smid)
 
-# GSan runs on NVIDIA GPUs and, as a prototype, on AMD gfx950.
-requires_gsan = pytest.mark.skipif(not (is_cuda() or is_hip_cdna4()), reason="GSan requires CUDA or AMD gfx950")
-THREADS_PER_WARP = gl.constexpr(64 if is_hip() else 32)
+# GSan runs on NVIDIA GPUs and, as a prototype, on AMD gfx950/gfx1250.
+requires_gsan = pytest.mark.skipif(not (is_cuda() or is_hip_cdna4() or is_hip_cdna5()),
+                                   reason="GSan requires CUDA or AMD gfx950/gfx1250")
+THREADS_PER_WARP = gl.constexpr(64 if is_hip_cdna4() else 32)
+amd_global_load_to_shared = (gl.amd.cdna5.async_copy.global_to_shared
+                             if is_hip_cdna5() else gl.amd.cdna4.async_copy.global_load_to_shared)
 
 
 @pytest.fixture()
@@ -916,7 +919,7 @@ def _gsan_pipelined_matmul_kernel(a_ptr, b_ptr, c_ptr, K, BM: tl.constexpr, BN: 
     tl.atomic_add(c_ptr + rm[:, None] * BN + rn[None, :], acc)
 
 
-@pytest.mark.skipif(not is_hip_cdna4(), reason="buffer ops and async copies are AMD gfx950 lowerings")
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Checks the gfx950 matmul buffer/async lowering")
 def test_gsan_amd_uses_buffer_ops_and_async_copy(with_gsan):
     # Buffer conversion and pipelined async copies both receive GSan checks.
     a = torch.randn(64, 256, dtype=torch.float16, device="cuda")
@@ -930,7 +933,7 @@ def test_gsan_amd_uses_buffer_ops_and_async_copy(with_gsan):
 
 @gluon.jit
 def _gluon_amd_buffer_load_to_shared_kernel(ptr):
-    layout: gl.constexpr = gl.BlockedLayout([1], [64], [1], [0])
+    layout: gl.constexpr = gl.BlockedLayout([1], [THREADS_PER_WARP], [1], [0])
     offsets = gl.arange(0, 64, layout)
     smem = gl.allocate_shared_memory(gl.int32, [64], gl.SwizzledSharedLayout(1, 1, 1, [0]))
     gl.amd.cdna4.async_copy.buffer_load_to_shared(smem, ptr, offsets)
@@ -938,7 +941,7 @@ def _gluon_amd_buffer_load_to_shared_kernel(ptr):
     gl.amd.cdna4.async_copy.wait_group(0)
 
 
-@pytest.mark.skipif(not is_hip_cdna4(), reason="AMD buffer ops")
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Checks rejected gfx950 buffer-to-LDS lowering")
 def test_gsan_amd_rejects_buffer_load_to_local(with_gsan, capfd):
     src = torch.zeros(64, dtype=torch.int32, device="cuda")
     with pytest.raises(RuntimeError, match="PassManager::run failed"):
@@ -953,7 +956,7 @@ def _gsan_empty_tl_kernel(out_ptr):
     tl.store(out_ptr, 0)
 
 
-@pytest.mark.skipif(not is_hip_cdna4(), reason="AMD gfx950 GSan LDS reservation")
+@pytest.mark.skipif(not (is_hip_cdna4() or is_hip_cdna5()), reason="AMD GSan LDS reservation")
 def test_gsan_uses_all_available_shared_memory(with_gsan):
     out = torch.empty(4, dtype=torch.int32, device="cuda")
     compiled = _gsan_empty_tl_kernel.warmup(out, grid=(1, ))
@@ -1727,10 +1730,25 @@ def test_freed_allocation_does_not_keep_shadow_state(with_gsan):
         gsan_free(second, device, nbytes, second_stream.cuda_stream)
 
 
+@triton.jit
+def _gsan_wave32_copy_kernel(src, dst, BLOCK: tl.constexpr):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    tl.store(dst + offsets, tl.load(src + offsets) + 1)
+
+
+@pytest.mark.skipif(not is_hip() or triton.runtime.driver.active.get_current_target().arch != "gfx1250",
+                    reason="Requires AMD gfx1250")
+def test_gsan_gfx1250_multiwave_copy(with_gsan):
+    src = torch.arange(4096, dtype=torch.int32, device="cuda")
+    dst = torch.empty_like(src)
+    compiled = _gsan_wave32_copy_kernel[(4, )](src, dst, BLOCK=1024, num_warps=4)
+    torch.testing.assert_close(dst, src + 1)
+    assert compiled.metadata.warp_size == 32
+
+
 @pytest.mark.skipif(not is_hip(), reason="AMD target check")
 def test_gsan_rejects_unsupported_amd_target():
-    # Only gfx950 (wave64) is validated; other targets, e.g. wave32 RDNA, must
-    # fail at compile time.
+    # Targets beyond gfx950 and gfx1250 must fail at compile time.
     src = triton.compiler.ASTSource(fn=_write_blocks_kernel, signature={"ptr": "*i32", "n_elements": "i32"},
                                     constexprs={"BLOCK_SIZE": 128})
     with pytest.raises(ValueError, match="GSan is not supported on gfx1200"):
@@ -2316,7 +2334,7 @@ def _buffer_read_other_block_kernel(ptr, out_ptr, BLOCK: tl.constexpr):
     tl.store(out_ptr + offsets, tl.load(ptr + offsets) + 1)
 
 
-@pytest.mark.skipif(not is_hip_cdna4(), reason="AMD buffer ops")
+@pytest.mark.skipif(not (is_hip_cdna4() or is_hip_cdna5()), reason="AMD buffer ops")
 @pytest.mark.parametrize("shadow_granularity", [4, 16], indirect=True)
 def test_buffer_ops_disjoint_or_launch_ordered_accesses_do_not_race(with_gsan, capfd):
     # Two concurrent blocks write disjoint ranges from the same base (a check
@@ -2363,7 +2381,7 @@ def _buffer_atomic_handoff_kernel(payload_ptr, flag_ptr, out_ptr, CONSUMER_OP: t
         tl.store(out_ptr + offsets, tl.load(payload_ptr + offsets))
 
 
-@pytest.mark.skipif(not is_hip_cdna4(), reason="AMD buffer atomics")
+@pytest.mark.skipif(not (is_hip_cdna4() or is_hip_cdna5()), reason="AMD buffer atomics")
 @pytest.mark.parametrize("consumer_op", ["rmw", "cas"])
 def test_buffer_atomic_release_acquire_handoff_does_not_race(with_gsan, capfd, consumer_op):
     block = 64
@@ -2390,7 +2408,7 @@ def _buffer_atomic_results_kernel(counter_ptr, cas_ptr, old_ptr, cas_old_ptr, BL
     tl.store(cas_old_ptr + offsets, cas_old)
 
 
-@pytest.mark.skipif(not is_hip_cdna4(), reason="AMD buffer atomics")
+@pytest.mark.skipif(not (is_hip_cdna4() or is_hip_cdna5()), reason="AMD buffer atomics")
 def test_buffer_atomic_results_are_preserved(with_gsan, capfd):
     block = 64
     idx = torch.arange(block, dtype=torch.int32, device="cuda")
@@ -2432,7 +2450,7 @@ def _gluon_buffer_bounds_kernel(ptr, out_ptr, arrived_ptr):
         gl.store(out_ptr + offsets, values)
 
 
-@pytest.mark.skipif(not is_hip_cdna4(), reason="AMD buffer ops")
+@pytest.mark.skipif(not (is_hip_cdna4() or is_hip_cdna5()), reason="AMD buffer ops")
 def test_gluon_buffer_masked_and_out_of_bounds_lanes_do_not_race(with_gsan, capfd):
     data = torch.arange(64, dtype=torch.int32, device="cuda")
     out = torch.full((64, ), -1, dtype=torch.int32, device="cuda")
@@ -2456,7 +2474,7 @@ def _gluon_buffer_atomic_load_store_kernel(ptr, out_ptr):
     gl.store(out_ptr + offsets, loaded)
 
 
-@pytest.mark.skipif(not is_hip_cdna4(), reason="AMD buffer atomics")
+@pytest.mark.skipif(not (is_hip_cdna4() or is_hip_cdna5()), reason="AMD buffer atomics")
 @pytest.mark.gsan_fine_granularity("16-byte pools do not support atomics")
 def test_gluon_buffer_atomic_load_store_results(with_gsan, capfd):
     data = torch.full((64, ), -1, dtype=torch.int32, device="cuda")
@@ -2484,7 +2502,7 @@ def _gluon_packed_fp4_copy_kernel(src, dst):
     gl.amd.cdna4.buffer.store(values, dst_desc, offsets)
 
 
-@pytest.mark.skipif(not is_hip_cdna4(), reason="AMD packed FP4 buffer ops")
+@pytest.mark.skipif(not (is_hip_cdna4() or is_hip_cdna5()), reason="AMD packed FP4 buffer ops")
 @pytest.mark.parametrize("explicit_buffer", [False, True], ids=["automatic", "gluon"])
 def test_buffer_packed_fp4_bytes_preserved(with_gsan, capfd, explicit_buffer):
     src = torch.arange(1024, dtype=torch.int32, device="cuda").to(torch.uint8)
@@ -2504,7 +2522,7 @@ def test_buffer_packed_fp4_bytes_preserved(with_gsan, capfd, explicit_buffer):
 
 @gluon.jit
 def _gluon_amd_direct_async_kernel(src, dst, n_elements, soffset, BUFFER: gl.constexpr):
-    layout: gl.constexpr = gl.BlockedLayout([1], [64], [1], [0])
+    layout: gl.constexpr = gl.BlockedLayout([1], [THREADS_PER_WARP], [1], [0])
     shared: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [0])
     index = gl.arange(0, 64, layout)
     mask = index % 2 == 0
@@ -2513,15 +2531,17 @@ def _gluon_amd_direct_async_kernel(src, dst, n_elements, soffset, BUFFER: gl.con
         desc = gl.amd.cdna4.buffer.make_buffer_descriptor(src, n_elements * 4)
         gl.amd.cdna4.buffer.load_to_shared(smem, desc, index, mask=mask, soffset=soffset)
     else:
-        cdna4_async_copy.global_load_to_shared(smem, src + index + soffset, mask=mask & (index + soffset < n_elements),
-                                               other=0)
+        amd_global_load_to_shared(smem, src + index + soffset, mask=mask & (index + soffset < n_elements), other=0)
     cdna4_async_copy.commit_group()
     cdna4_async_copy.wait_group(0)
     gl.store(dst + index, smem.load(layout))
 
 
-@pytest.mark.skipif(not is_hip_cdna4(), reason="Direct async GSAN requires AMD gfx950")
-@pytest.mark.parametrize("buffer", [False, True])
+@pytest.mark.skipif(not (is_hip_cdna4() or is_hip_cdna5()), reason="Direct async GSAN requires AMD gfx950/gfx1250")
+@pytest.mark.parametrize("buffer", [
+    False,
+    pytest.param(True, marks=pytest.mark.skipif(not is_hip_cdna4(), reason="Buffer-to-LDS instructions require gfx950"))
+])
 @pytest.mark.parametrize("shadow_granularity", [1, 2, 4], indirect=True)
 def test_gsan_amd_direct_async_masks_bounds_update_shadow(with_gsan, buffer):
     # Both the alternating user mask and the dynamic descriptor tail must
@@ -2541,7 +2561,7 @@ def test_gsan_amd_direct_async_masks_bounds_update_shadow(with_gsan, buffer):
 
 @gluon.jit
 def _gluon_amd_buffer_async_wide_kernel(src, dst, bound, scalar_offset):
-    layout: gl.constexpr = gl.BlockedLayout([2], [64], [1], [0])
+    layout: gl.constexpr = gl.BlockedLayout([2], [THREADS_PER_WARP], [1], [0])
     shared: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [0])
     index = gl.arange(0, 128, layout)
     smem = gl.allocate_shared_memory(gl.float64, [128], shared)
@@ -2554,7 +2574,7 @@ def _gluon_amd_buffer_async_wide_kernel(src, dst, bound, scalar_offset):
     gl.store(dst + index, smem.load(layout))
 
 
-@pytest.mark.skipif(not is_hip_cdna4(), reason="Direct buffer async GSAN requires AMD gfx950")
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Buffer-to-LDS instructions require gfx950")
 @pytest.mark.parametrize("shadow_granularity", [1, 2, 4], indirect=True)
 def test_gsan_amd_buffer_async_partial_dwords_wrapped_offsets(with_gsan):
     # The 260-byte bound cuts an f64 element after its first dword.  Inspect
@@ -2576,12 +2596,12 @@ def test_gsan_amd_buffer_async_partial_dwords_wrapped_offsets(with_gsan):
 @gluon.jit
 def _gluon_amd_buffer_async_subword_kernel(src, dst, bound, soffset, PACK: gl.constexpr, RANK: gl.constexpr):
     if RANK == 1:
-        layout: gl.constexpr = gl.BlockedLayout([PACK], [64], [1], [0])
+        layout: gl.constexpr = gl.BlockedLayout([PACK], [THREADS_PER_WARP], [1], [0])
         shared: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [0])
         index = gl.arange(0, 64 * PACK, layout)
         smem = gl.allocate_shared_memory(src.dtype.element_ty, [64 * PACK], shared)
     else:
-        layout: gl.constexpr = gl.BlockedLayout([1, PACK], [1, 64], [1, 1], [1, 0])
+        layout: gl.constexpr = gl.BlockedLayout([1, PACK], [1, THREADS_PER_WARP], [1, 1], [1, 0])
         shared: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [1, 0])
         row = gl.arange(0, 16, gl.SliceLayout(1, layout))
         col = gl.arange(0, 64 * PACK, gl.SliceLayout(0, layout))
@@ -2594,7 +2614,7 @@ def _gluon_amd_buffer_async_subword_kernel(src, dst, bound, soffset, PACK: gl.co
     gl.store(dst + index, smem.load(layout))
 
 
-@pytest.mark.skipif(not is_hip_cdna4(), reason="Direct buffer async GSAN requires AMD gfx950")
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Buffer-to-LDS instructions require gfx950")
 @pytest.mark.parametrize("dtype", [torch.int8, torch.int16, torch.float16])
 @pytest.mark.parametrize("rank,soffset,bound", [(1, 0, 3), (1, 0, 5), (1, 0, 7), (2, 1, 519), (2, (1 << 31) + 1, 519)])
 @pytest.mark.parametrize("shadow_granularity", [1, 2, 4], indirect=True)
@@ -2616,3 +2636,62 @@ def test_gsan_amd_buffer_async_subwords_obey_dword_bounds(with_gsan, dtype, rank
     changed = torch.zeros((1, src.numel()), dtype=torch.bool)
     changed[0, effective_soffset:effective_soffset + count] = True
     _assert_shadow_mask(before, [_shadow_cells_for_tensor(src)], changed, access_kind="read")
+
+
+@gluon.jit
+def _gsan_gfx1250_tdm_copy_kernel(src, dst, row, enabled):
+    shared: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [1, 0])
+    src_desc = gl.amd.cdna5.tdm.make_tensor_descriptor(src, [32, 128], [128, 1], [16, 64], shared)
+    dst_desc = gl.amd.cdna5.tdm.make_tensor_descriptor(dst, [32, 128], [128, 1], [16, 64], shared)
+    smem = gl.allocate_shared_memory(gl.int32, [16, 64], shared)
+    gl.amd.cdna5.tdm.async_load(src_desc, offsets=[row, 32], dest=smem, pred=enabled)
+    gl.amd.cdna5.tdm.async_wait(0)
+    dst_desc = gl.amd.cdna5.tdm.update_tensor_descriptor(dst_desc, add_offsets=[row, 16], pred=enabled,
+                                                         clamp_bounds=True)
+    gl.amd.cdna5.tdm.async_store(dst_desc, src=smem)
+    gl.amd.cdna5.tdm.async_wait(0)
+
+
+@pytest.mark.skipif(not is_hip_cdna5(), reason="TDM requires AMD gfx1250")
+@pytest.mark.parametrize("row", [0, 24])
+@pytest.mark.parametrize("enabled", [False, True])
+def test_gsan_gfx1250_tdm_offsets_bounds_predicate(with_gsan, row, enabled):
+    src = torch.arange(32 * 128, dtype=torch.int32, device="cuda").reshape(32, 128)
+    dst = torch.full_like(src, -1)
+    before_src = _shadow_cells_for_tensor(src)
+    before_dst = _shadow_cells_for_tensor(dst)
+    _gsan_gfx1250_tdm_copy_kernel[(1, )](src, dst, row, enabled)
+    expected = torch.full_like(src, -1)
+    reads = torch.zeros((32, 128), dtype=torch.bool)
+    writes = torch.zeros_like(reads)
+    if enabled:
+        expected[row:row + 16, 16:80] = src[row:row + 16, 32:96]
+        reads[row:row + 16, 32:96] = True
+        writes[row:row + 16, 16:80] = True
+    torch.testing.assert_close(dst, expected)
+    _assert_shadow_mask(before_src, _shadow_cells_for_tensor(src), reads, access_kind="read")
+    _assert_shadow_mask(before_dst, _shadow_cells_for_tensor(dst), writes, access_kind="write")
+
+
+@gluon.jit
+def _gsan_gfx1250_async_store_kernel(src, dst):
+    layout: gl.constexpr = gl.BlockedLayout([1], [32], [1], [0])
+    index = gl.arange(0, 64, layout)
+    values = gl.load(src + index)
+    smem = gl.allocate_shared_memory(gl.int32, [64], gl.SwizzledSharedLayout(1, 1, 1, [0]), values)
+    gl.amd.cdna5.async_copy.shared_to_global(dst + index, smem, mask=index % 2 == 0)
+    gl.amd.cdna5.async_copy.commit_group()
+    gl.amd.cdna5.async_copy.wait_group(0)
+
+
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Async LDS-to-global requires AMD gfx1250")
+def test_gsan_gfx1250_async_store_mask_updates_shadow(with_gsan):
+    src = torch.arange(64, dtype=torch.int32, device="cuda")
+    dst = torch.full_like(src, -1)
+    before = [_shadow_cells_for_tensor(dst)]
+    _gsan_gfx1250_async_store_kernel[(1, )](src, dst, num_warps=1)
+    active = torch.arange(64) % 2 == 0
+    expected = torch.full_like(src, -1)
+    expected[::2] = src[::2]
+    torch.testing.assert_close(dst, expected)
+    _assert_shadow_mask(before, [_shadow_cells_for_tensor(dst)], active[None, :], access_kind="write")

@@ -354,10 +354,9 @@ def is_consan_supported(base_arch):
     return base_arch == "gfx1250"
 
 
-# Per-workgroup LDS limit (bytes) of the architectures GSan supports. The
-# GSan device library is target-generic, but only gfx950 (wave64) has been
-# validated.
-_GSAN_LDS_LIMIT = {"gfx950": 160 * 1024}
+# Per-workgroup LDS limit (bytes) of the architectures GSan supports.
+# Reserve the full allocation to limit workgroup residency.
+_GSAN_LDS_LIMIT = {"gfx950": 160 * 1024, "gfx1250": 320 * 1024}
 
 
 def is_gsan_supported(arch):
@@ -472,7 +471,7 @@ class HIPOptions:
         extern_libs = {} if self.extern_libs is None else dict(self.extern_libs)
         if is_enabled(self, "gsan"):
             if not is_gsan_supported(self.base_arch):
-                raise ValueError(f"GSan is not supported on {self.arch}; only gfx950 is supported")
+                raise ValueError(f"GSan is not supported on {self.arch}; only gfx950 and gfx1250 are supported")
             if knobs.compilation.enable_asan:
                 raise ValueError("GSan cannot be combined with AddressSanitizer (TRITON_ENABLE_ASAN)")
             if self.num_ctas > 1:
@@ -481,7 +480,8 @@ class HIPOptions:
             # arch-override compiles reserve the right amount.
             object.__setattr__(self, 'min_shared_mem', _GSAN_LDS_LIMIT[self.base_arch])
             # Built by Triton itself, so it is not affected by the bitcode path knob.
-            gsan_lib = Path(__file__).parent / "lib" / "gsan.bc"
+            gsan_name = "gsan-gfx1250.bc" if self.base_arch == "gfx1250" else "gsan.bc"
+            gsan_lib = Path(__file__).parent / "lib" / gsan_name
             if not gsan_lib.exists():
                 raise FileNotFoundError(f"GSan device library is missing at {gsan_lib}. "
                                         "Rebuild Triton to generate it.")

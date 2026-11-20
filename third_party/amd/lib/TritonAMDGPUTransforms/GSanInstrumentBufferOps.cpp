@@ -132,10 +132,12 @@ struct BufferAccess {
 // The stride, cache policy, contiguity, and (non-atomic) scope of a buffer op
 // affect neither which bytes are accessed nor synchronization.
 // Atomic replacements must access the entire element or none of it, so active
-// partially in-bounds elements are rejected before issuing a global atomic.
+// partially in-bounds elements are rejected on gfx950 before issuing a
+// global atomic. gfx1250 drops the whole element, so use its full bound.
 BufferAccess buildBufferAccess(OpBuilder &b, Location loc, BufferBase base,
                                Value offsets, Value soffset, Value userMask,
-                               Type elemTy, bool isAtomic) {
+                               Type elemTy, bool isAtomic,
+                               bool fullAtomicBounds) {
   auto offsetsTy = cast<RankedTensorType>(offsets.getType());
   auto i64TensorTy = offsetsTy.clone(b.getI64Type());
   int64_t elemBytes = std::max(8, getIntOrFloatOrPtrBitWidth(elemTy)) / 8;
@@ -165,8 +167,10 @@ BufferAccess buildBufferAccess(OpBuilder &b, Location loc, BufferBase base,
         b, loc,
         DenseElementsAttr::get(i64TensorTy, b.getI64IntegerAttr(value)));
   };
-  Value end = arith::AddIOp::create(b, loc, bytes,
-                                    i64Splat(std::min<int64_t>(elemBytes, 4)));
+  int64_t boundBytes = isAtomic && fullAtomicBounds
+                           ? elemBytes
+                           : std::min<int64_t>(elemBytes, 4);
+  Value end = arith::AddIOp::create(b, loc, bytes, i64Splat(boundBytes));
   Value bound;
   if (base.numRecords) {
     Value numRecords64 =
@@ -180,7 +184,7 @@ BufferAccess buildBufferAccess(OpBuilder &b, Location loc, BufferBase base,
   if (userMask)
     mask = arith::AndIOp::create(b, loc, userMask, mask);
 
-  if (isAtomic && elemBytes > 4) {
+  if (isAtomic && elemBytes > 4 && !fullAtomicBounds) {
     // The original buffer access checks each dword separately. A global
     // atomic cannot preserve a partial access, including with a dynamic bound.
     // Check the user mask too: masked partial elements remain supported.
@@ -286,9 +290,14 @@ struct TritonAMDGPUGSanInstrumentBufferOpsPass
           << elemTy;
       return failure();
     }
+    auto target = op->getParentOfType<ModuleOp>()->getAttrOfType<StringAttr>(
+        "ttg.target");
+    bool fullAtomicBounds =
+        target && target.getValue().starts_with("hip:gfx1250");
     return buildBufferAccess(
         b, op->getLoc(), *bufferBase, offsets, soffset, mask, elemTy,
-        !isa<amdgpu::BufferLoadOp, amdgpu::BufferStoreOp>(op));
+        !isa<amdgpu::BufferLoadOp, amdgpu::BufferStoreOp>(op),
+        fullAtomicBounds);
   }
 
   void setHints(BufferAccess access, const AccessHints &hints) {

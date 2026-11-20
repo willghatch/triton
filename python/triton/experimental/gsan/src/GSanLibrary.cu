@@ -27,11 +27,21 @@ GSAN_DEVICE __UINT64_TYPE__ __ockl_printf_append_args(
     __UINT64_TYPE__ value1, __UINT64_TYPE__ value2, __UINT64_TYPE__ value3,
     __UINT64_TYPE__ value4, __UINT64_TYPE__ value5, __UINT64_TYPE__ value6,
     __UINT32_TYPE__ isLast);
-// No clang builtins exist for these (s_memrealtime needs -mcpu); the generic
-// bitcode calls the intrinsics directly.
+// Generic bitcode calls target-specific intrinsics directly.
 GSAN_DEVICE __UINT64_TYPE__ gsanDispatchId() __asm("llvm.amdgcn.dispatch.id");
+#if GSAN_AMD_WAVE32
+GSAN_DEVICE __UINT64_TYPE__
+    gsanRealtimeMessage(__UINT32_TYPE__) __asm("llvm.amdgcn.s.sendmsg.rtn.i64");
+#else
 GSAN_DEVICE __UINT64_TYPE__ gsanRealtime() __asm("llvm.amdgcn.s.memrealtime");
+#endif
 }
+
+#if GSAN_AMD_WAVE32
+static GSAN_DEVICE __UINT64_TYPE__ gsanRealtime() {
+  return gsanRealtimeMessage(131); // MSG_RTN_GET_REALTIME
+}
+#endif
 
 static GSAN_DEVICE __UINT64_TYPE__ gsanStrlenWithNul(const char *s) {
   __UINT64_TYPE__ n = 0;
@@ -41,7 +51,11 @@ static GSAN_DEVICE __UINT64_TYPE__ gsanStrlenWithNul(const char *s) {
 }
 
 static GSAN_DEVICE inline __UINT32_TYPE__ gsanLaneId() {
+#if GSAN_AMD_WAVE32
+  return __builtin_amdgcn_mbcnt_lo(~0u, 0u);
+#else
   return __builtin_amdgcn_mbcnt_hi(~0u, __builtin_amdgcn_mbcnt_lo(~0u, 0u));
+#endif
 }
 
 // Kept out of line so the hostcall code is not duplicated at every check.
@@ -169,7 +183,19 @@ GSAN_DEVICE inline uintptr_t roundUp(uintptr_t ptr, uintptr_t align) {
 
 #if GSAN_AMDGPU
 
+#if GSAN_AMD_WAVE32
+static constexpr uint32_t kWaveSize = 32;
+#else
 static constexpr uint32_t kWaveSize = 64;
+#endif
+
+GSAN_DEVICE uint64_t ballot(bool predicate) {
+#if GSAN_AMD_WAVE32
+  return __builtin_amdgcn_ballot_w32(predicate);
+#else
+  return __builtin_amdgcn_ballot_w64(predicate);
+#endif
+}
 
 // Shadow-cell locks use agent scope when the runtime manages one GPU: on
 // gfx950, system-scope acquire/release adds L2 writeback/invalidate to every
@@ -209,7 +235,7 @@ template <typename F> GSAN_DEVICE void forEachLaneSerially(F &&f) {
   uint32_t laneId = getLaneId();
   bool pending = true;
   while (true) {
-    uint64_t mask = __builtin_amdgcn_ballot_w64(pending);
+    uint64_t mask = ballot(pending);
     if (mask == 0)
       break;
     if (laneId == static_cast<uint32_t>(__builtin_ctzll(mask))) {
@@ -243,7 +269,7 @@ GSAN_DEVICE uint32_t getSlotHint(uint32_t numSlots) {
     __attribute__((address_space(3))) uint32_t gsanBlockSlot;
 
 static constexpr uint64_t kSlotAcquireTimeoutTicks =
-    20ull * 100 * 1000 * 1000; // 20 s of the 100 MHz s_memrealtime clock
+    20ull * 100 * 1000 * 1000; // 20 s of the 100 MHz realtime clock
 
 // Called by one thread of the block at kernel entry. Waits while all slots
 // are taken: slots are released by blocks that finish, which is enough as
@@ -511,9 +537,9 @@ GSAN_DEVICE void initThread(GlobalState *globals, const LaunchState &launch,
                             uint32_t threadIdx, uint32_t numThreads,
                             uint32_t barrierId, Location loc) {
 #if GSAN_AMDGPU
-  // The runtime is built as generic amdgcn bitcode but assumes wave64.
+  // The runtime profile must match the kernel wave width.
   assert_msg(loc, __builtin_amdgcn_wavefrontsize() == kWaveSize,
-             "GSan on AMD requires wave64");
+             "GSan runtime wave size does not match the kernel");
   // Take exclusive ownership of an identity before touching its state.
   if (threadIdx == 0)
     acquireSlot(globals, loc);
@@ -1214,7 +1240,7 @@ GSAN_DEVICE void tensorAccessCooperative(ThreadState *state,
   bool systemScope = useSystemScopeShadowLocks(state);
   uint32_t laneId = getLaneId();
   while (true) {
-    uint64_t activeMask = __builtin_amdgcn_ballot_w64(active);
+    uint64_t activeMask = ballot(active);
     if (activeMask == 0)
       break;
     // Wave-uniform leader and its current address.
@@ -1239,7 +1265,7 @@ GSAN_DEVICE void tensorAccessCooperative(ThreadState *state,
         locked = true;
       }
     }
-    uint64_t lockedMask = __builtin_amdgcn_ballot_w64(locked);
+    uint64_t lockedMask = ballot(locked);
     bool leaderLocked = (lockedMask >> leader) & 1;
     if (locked || (follower && leaderLocked)) {
       addr += step;

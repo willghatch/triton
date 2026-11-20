@@ -97,10 +97,10 @@ struct TritonAMDGPUGSanRejectUnsupportedPass
           << numCTAs.getInt() << ")";
       failed = true;
     }
-    // The device runtime's lane waterfall and slot protocol assume wave64.
+    // Both runtime profiles support the lane waterfall and slot protocol.
     if (auto tpw = mod->getAttrOfType<IntegerAttr>(ttg::AttrNumThreadsPerWarp);
-        tpw && tpw.getInt() != 64) {
-      mod.emitError("GSan on AMD requires 64 threads per warp (got ")
+        tpw && tpw.getInt() != 32 && tpw.getInt() != 64) {
+      mod.emitError("GSan on AMD requires 32 or 64 threads per warp (got ")
           << tpw.getInt() << ")";
       failed = true;
     }

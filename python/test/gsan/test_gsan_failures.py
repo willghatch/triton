@@ -19,17 +19,20 @@ from triton.experimental.gluon.language.nvidia.blackwell import (
     tcgen05_mma,
 )
 
-from triton._internal_testing import is_blackwell, is_cuda, is_hip, is_hip_cdna4, is_hopper_or_newer, run_in_process
+from triton._internal_testing import is_blackwell, is_cuda, is_hip, is_hip_cdna4, is_hip_cdna5, is_hopper_or_newer, run_in_process
 from triton.experimental.gsan import create_mem_pool
 from triton.experimental.gsan._testing_utils import atomic_poll, shadow_cell_from_address
 from triton.tools.tensor_descriptor import TensorDescriptor
 
-THREADS_PER_WARP = gl.constexpr(64 if is_hip() else 32)
+THREADS_PER_WARP = gl.constexpr(64 if is_hip_cdna4() else 32)
+amd_global_load_to_shared = (gl.amd.cdna5.async_copy.global_to_shared
+                             if is_hip_cdna5() else gl.amd.cdna4.async_copy.global_load_to_shared)
 # tl.atomic_load/atomic_store arrived with the shared base after the AMD
 # prototype; a cross-block atomic_load spin loop hangs under GSan on gfx950.
 _HIP_ATOMIC_LOAD_SPIN_HANG = "GSan on AMD hangs in tl.atomic_load spin loops (not yet validated on gfx950)"
 
-pytestmark = pytest.mark.skipif(not (is_cuda() or is_hip_cdna4()), reason="requires CUDA or AMD gfx950 backend")
+pytestmark = pytest.mark.skipif(not (is_cuda() or is_hip_cdna4() or is_hip_cdna5()),
+                                reason="requires CUDA or AMD gfx950/gfx1250 backend")
 
 # On AMD, a GSan race report traps on the device, which aborts the whole
 # process and by default writes a large, slow GPU core dump into the cwd.
@@ -1261,7 +1264,7 @@ def _run_buffer_race_case(kind: str) -> None:
     torch.cuda.synchronize()
 
 
-@pytest.mark.skipif(not is_hip_cdna4(), reason="AMD buffer ops")
+@pytest.mark.skipif(not (is_hip_cdna4() or is_hip_cdna5()), reason="AMD buffer ops")
 @pytest.mark.parametrize("kind,marker,error", [
     ("raw", "second_read = tl.load(ptr + offsets)", "Read after write race detected"),
     ("war", "tl.store(ptr + offsets, offsets + 1)", "Write after read race detected"),
@@ -1297,7 +1300,7 @@ def _run_gluon_buffer_desc_race_case() -> None:
     torch.cuda.synchronize()
 
 
-@pytest.mark.skipif(not is_hip_cdna4(), reason="AMD buffer ops")
+@pytest.mark.skipif(not (is_hip_cdna4() or is_hip_cdna5()), reason="AMD buffer ops")
 def test_gluon_buffer_descriptor_soffset_read_after_write():
     _run_failure_case("gluon_buffer_desc_raw", runner=_run_gluon_buffer_desc_race_case,
                       source_function=_gluon_buffer_desc_race_kernel.fn,
@@ -1344,7 +1347,7 @@ def _run_buffer_atomic_handoff_case(producer_sem: str, consumer_sem: str, consum
     torch.cuda.synchronize()
 
 
-@pytest.mark.skipif(not is_hip_cdna4(), reason="AMD buffer atomics")
+@pytest.mark.skipif(not (is_hip_cdna4() or is_hip_cdna5()), reason="AMD buffer atomics")
 @pytest.mark.parametrize("producer_sem, consumer_sem", [("relaxed", "acquire"), ("release", "relaxed")])
 @pytest.mark.parametrize("consumer_op", ["rmw", "cas"])
 def test_buffer_atomic_semantic_mismatch_read_after_write(producer_sem, consumer_sem, consumer_op):
@@ -1388,7 +1391,7 @@ def _run_buffer_i64_bound_case(kind, num_records, mask_partial, gsan, constant_b
                 expected_data[0] = 0x4444444433333333
             else:
                 expected_out[0] = 0x2222222211111111
-        if mask_partial and bound >= 12:
+        if mask_partial and bound >= 12 and (bound >= 16 or not is_hip_cdna5()):
             if kind == "store":
                 expected_data[1] = 0x4444444433333333 if bound >= 16 else 0x2222222233333333
             else:
@@ -1397,20 +1400,29 @@ def _run_buffer_i64_bound_case(kind, num_records, mask_partial, gsan, constant_b
         assert out == expected_out
 
 
-@pytest.mark.skipif(not is_hip_cdna4(), reason="AMD buffer atomics")
+@pytest.mark.skipif(not (is_hip_cdna4() or is_hip_cdna5()), reason="AMD buffer atomics")
 @pytest.mark.parametrize("kind", ["load", "store"])
-@pytest.mark.parametrize("num_records,mask_partial", [(16, True), (12, False), (0, True)])
-def test_buffer_i64_atomic_full_or_dropped_accesses_preserved(kind, num_records, mask_partial, monkeypatch):
+@pytest.mark.parametrize("num_records,mask_partial,constant_bound", [
+    (16, True, False),
+    (12, False, False),
+    (0, True, False),
+    pytest.param(12, True, False, marks=pytest.mark.skipif(not is_hip_cdna5(),
+                                                           reason="gfx950 accesses a partial dword")),
+    pytest.param(12, True, True, marks=pytest.mark.skipif(not is_hip_cdna5(),
+                                                          reason="gfx950 accesses a partial dword")),
+])
+def test_buffer_i64_atomic_full_or_dropped_accesses_preserved(kind, num_records, mask_partial, constant_bound,
+                                                              monkeypatch):
     # Full accesses, masked partial elements, and wholly out-of-bounds accesses
     # remain supported. Compare actual bits and every byte of the allocation.
     monkeypatch.setenv("TRITON_TEST_PROCESS_TIMEOUT", HIP_DEFAULT_PROCESS_TIMEOUT_S)
-    baseline = run_in_process(_run_buffer_i64_bound_case, args=(kind, num_records, mask_partial, False))
-    sanitized = run_in_process(_run_buffer_i64_bound_case, args=(kind, num_records, mask_partial, True))
+    baseline = run_in_process(_run_buffer_i64_bound_case, args=(kind, num_records, mask_partial, False, constant_bound))
+    sanitized = run_in_process(_run_buffer_i64_bound_case, args=(kind, num_records, mask_partial, True, constant_bound))
     assert baseline.exc is None, baseline.exc
     assert sanitized.exc is None, sanitized.exc
 
 
-@pytest.mark.skipif(not is_hip_cdna4(), reason="AMD buffer atomics")
+@pytest.mark.skipif(not is_hip_cdna4(), reason="gfx950 accesses partial buffer atomics")
 @pytest.mark.parametrize("kind", ["load", "store"])
 @pytest.mark.parametrize("constant_bound", [False, True], ids=["dynamic-bound", "constant-bound"])
 def test_buffer_i64_atomic_partial_access_rejected(kind, constant_bound, monkeypatch):
@@ -1428,7 +1440,7 @@ def test_buffer_i64_atomic_partial_access_rejected(kind, constant_bound, monkeyp
 
 @gluon.jit
 def _amd_direct_async_handoff_kernel(payload, flag, output, BUFFER: gl.constexpr, ORDERED: gl.constexpr):
-    layout: gl.constexpr = gl.BlockedLayout([1], [64], [1], [0])
+    layout: gl.constexpr = gl.BlockedLayout([1], [THREADS_PER_WARP], [1], [0])
     shared: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [0])
     index = gl.arange(0, 64, layout)
     if gl.program_id(0) == 0:
@@ -1442,7 +1454,7 @@ def _amd_direct_async_handoff_kernel(payload, flag, output, BUFFER: gl.constexpr
             desc = gl.amd.cdna4.buffer.make_buffer_descriptor(payload, 64 * 4)
             gl.amd.cdna4.buffer.load_to_shared(smem, desc, index)
         else:
-            gl.amd.cdna4.async_copy.global_load_to_shared(smem, payload + index)
+            amd_global_load_to_shared(smem, payload + index)
         gl.amd.cdna4.async_copy.commit_group()
         gl.amd.cdna4.async_copy.wait_group(0)
         gl.store(output + index, smem.load(layout))
@@ -1458,19 +1470,25 @@ def _run_amd_direct_async_handoff(buffer, ordered):
     torch.testing.assert_close(output, torch.full_like(output, 7))
 
 
-@pytest.mark.skipif(not is_hip_cdna4(), reason="AMD gfx950 direct async GSan")
-@pytest.mark.parametrize("buffer", [False, True])
+@pytest.mark.skipif(not (is_hip_cdna4() or is_hip_cdna5()), reason="AMD gfx950/gfx1250 direct async GSan")
+@pytest.mark.parametrize("buffer", [
+    False,
+    pytest.param(True, marks=pytest.mark.skipif(not is_hip_cdna4(), reason="Buffer-to-LDS instructions require gfx950"))
+])
 def test_gsan_amd_direct_async_read_after_write(buffer):
     # The relaxed flag forces the writer to run first without ordering its
     # payload.  The async issue must report a source-located RAW diagnostic.
-    marker = "buffer.load_to_shared" if buffer else "async_copy.global_load_to_shared"
+    marker = "buffer.load_to_shared" if buffer else "amd_global_load_to_shared"
     _run_failure_case("amd direct async raw", runner=_run_amd_direct_async_handoff,
                       source_function=_amd_direct_async_handoff_kernel.fn, marker=marker,
                       error="Read after write race detected", runner_args=(buffer, False))
 
 
-@pytest.mark.skipif(not is_hip_cdna4(), reason="AMD gfx950 direct async GSan")
-@pytest.mark.parametrize("buffer", [False, True])
+@pytest.mark.skipif(not (is_hip_cdna4() or is_hip_cdna5()), reason="AMD gfx950/gfx1250 direct async GSan")
+@pytest.mark.parametrize("buffer", [
+    False,
+    pytest.param(True, marks=pytest.mark.skipif(not is_hip_cdna4(), reason="Buffer-to-LDS instructions require gfx950"))
+])
 def test_gsan_amd_direct_async_release_acquire_handoff(buffer, monkeypatch):
     monkeypatch.setenv("TRITON_TEST_PROCESS_TIMEOUT", HIP_DEFAULT_PROCESS_TIMEOUT_S)
     result = run_in_process(_run_amd_direct_async_handoff, args=(buffer, True), allow_abort=True)
