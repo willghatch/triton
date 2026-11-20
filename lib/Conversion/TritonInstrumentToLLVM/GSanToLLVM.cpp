@@ -313,9 +313,10 @@ Value getGSanBarrierId(ConversionPatternRewriter &rewriter, Location loc,
 // atomic_end. On NVIDIA, lanes make independent progress, so the body is
 // emitted inline. On AMD, a lane spinning on a lock held by another lane of
 // its wave would deadlock, so lanes with `pred` set run the body one at a
-// time (a "waterfall" over a ballot of pending lanes); other lanes get undef
-// results. Lanes without `pred` skip the body; the body's runtime calls would
-// be no-ops for them.
+// time (a "waterfall" over a ballot of pending lanes); other lanes' results
+// are unspecified. Lanes without `pred` skip the body; the body's runtime calls
+// would be no-ops for them. Callers must broadcast results from the lanes that
+// ran the body before using them as block-uniform values.
 SmallVector<Value>
 emitGSanAtomicElement(ConversionPatternRewriter &rewriter, Location loc,
                       const TargetInfoBase &targetInfo, Value pred,
@@ -327,9 +328,15 @@ emitGSanAtomicElement(ConversionPatternRewriter &rewriter, Location loc,
   auto *ctx = rewriter.getContext();
   TritonLLVMOpBuilder b(loc, rewriter);
   Value initPending = pred ? pred : b.true_val();
+  // Seed results with zero rather than undef. The header merges the body's
+  // result with each other lane's carried value; LLVM's uniformity analysis
+  // treats a phi of one value and undef as uniform even at a divergent join.
+  // When the body's result is itself uniform (e.g. an atomic load from a
+  // uniform address), the AMDGPU backend then deletes the caller's cross-lane
+  // broadcast, leaving the other lanes with stale registers.
   SmallVector<Value> initResults;
   for (Type ty : resultTys)
-    initResults.push_back(b.undef(ty));
+    initResults.push_back(LLVM::ZeroOp::create(rewriter, loc, ty));
 
   // prev -> header(pending, results) -> check -> crit -> header
   //                                \-> exit(results)  \-> header
