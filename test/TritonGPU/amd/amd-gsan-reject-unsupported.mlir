@@ -245,16 +245,22 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
 
 // -----
 
-// A completion-barrier operand is synchronization even without an explicit
-// init/wait op in this function; accepting the copy would invent coverage.
+// Single-CTA gfx1250 completion barriers preserve hardware semantics and
+// issue-time global checks, including in helpers taking a barrier argument.
 #shared = #ttg.padded_shared<[64:+4] {order = [1, 0], shape = [64, 64]}>
 #bar = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 64 : i32} {
+  // CHECK-LABEL: @tdm_completion_barrier(
+  // CHECK-SAME: [[DESC:%[^:]+]]:
+  // CHECK-SAME: [[BUF:%[^:]+]]:
+  // CHECK-SAME: [[BAR:%[^:]+]]:
+  // CHECK: tti.experimental_gsan_tensordesc_access [[DESC]]{{.*}}, false
+  // CHECK: amdg.async_tdm_copy_global_to_local [[DESC]] into [[BUF]], barrier = [[BAR]]
+  // CHECK: tti.experimental_gsan_tensordesc_access [[DESC]]{{.*}}, true
+  // CHECK: amdg.async_tdm_copy_local_to_global [[DESC]] from [[BUF]], barrier = [[BAR]]
   tt.func @tdm_completion_barrier(%desc: !tt.tensordesc<64x64xf16, #shared>, %buf: !ttg.memdesc<64x64xf16, #shared, #smem, mutable>, %barrier: !ttg.memdesc<1xi64, #bar, #smem, mutable>) {
-    // expected-error@+1 {{GSan on AMD does not support TDM completion barriers}}
     %loaded = amdg.async_tdm_copy_global_to_local %desc into %buf, barrier = %barrier : !tt.tensordesc<64x64xf16, #shared>, !ttg.memdesc<1xi64, #bar, #smem, mutable> -> !ttg.memdesc<64x64xf16, #shared, #smem, mutable>
-    // expected-error@+1 {{GSan on AMD does not support TDM completion barriers}}
     %stored = amdg.async_tdm_copy_local_to_global %desc from %buf, barrier = %barrier : !ttg.memdesc<64x64xf16, #shared, #smem, mutable>, !ttg.memdesc<1xi64, #bar, #smem, mutable> -> !tt.tensordesc<64x64xf16, #shared>
     tt.return
   }
@@ -320,9 +326,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
   tt.func @indexed_completion_barriers(%desc: !tt.tensordesc<16x64xi32, #shared>, %buf: !ttg.memdesc<16x64xi32, #shared, #smem, mutable>, %indices: tensor<16xi32, #idx>, %barrier: !ttg.memdesc<1xi64, #bar, #smem, mutable>) {
-    // expected-error@+1 {{GSan on AMD does not support TDM completion barriers}}
     %gather = amdg.async_tdm_gather %desc[%indices] to %buf, barrier = %barrier : tensor<16xi32, #idx>, !ttg.memdesc<16x64xi32, #shared, #smem, mutable>, !ttg.memdesc<1xi64, #bar, #smem, mutable> -> !tt.tensordesc<16x64xi32, #shared>
-    // expected-error@+1 {{GSan on AMD does not support TDM completion barriers}}
     %scatter = amdg.async_tdm_scatter %desc[%indices] from %buf, barrier = %barrier : tensor<16xi32, #idx>, !ttg.memdesc<16x64xi32, #shared, #smem, mutable>, !ttg.memdesc<1xi64, #bar, #smem, mutable> -> !tt.tensordesc<16x64xi32, #shared>
     tt.return
   }

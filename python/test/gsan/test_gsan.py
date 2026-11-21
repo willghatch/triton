@@ -2696,28 +2696,41 @@ def test_gsan_amd_buffer_async_subwords_obey_dword_bounds(with_gsan, dtype, rank
 
 
 @gluon.jit
-def _gsan_gfx1250_tdm_copy_kernel(src, dst, row, enabled):
+def _gsan_gfx1250_tdm_copy_kernel(src, dst, row, enabled, COMPLETION: gl.constexpr):
     shared: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [1, 0])
     src_desc = gl.amd.cdna5.tdm.make_tensor_descriptor(src, [32, 128], [128, 1], [16, 64], shared)
     dst_desc = gl.amd.cdna5.tdm.make_tensor_descriptor(dst, [32, 128], [128, 1], [16, 64], shared)
     smem = gl.allocate_shared_memory(gl.int32, [16, 64], shared)
-    gl.amd.cdna5.tdm.async_load(src_desc, offsets=[row, 32], dest=smem, pred=enabled)
-    gl.amd.cdna5.tdm.async_wait(0)
+    bar = gl.allocate_shared_memory(gl.int64, [1], gl.amd.cdna5.mbarrier.MBarrierLayout())
+    if COMPLETION:
+        gl.amd.cdna5.mbarrier.init(bar, count=gl.num_warps())
+    gl.amd.cdna5.tdm.async_load(src_desc, offsets=[row, 32], dest=smem, pred=enabled,
+                                mbarrier=bar if COMPLETION else None)
+    if COMPLETION:
+        if enabled:
+            gl.amd.cdna5.mbarrier.wait(bar, 0)
+    else:
+        gl.amd.cdna5.tdm.async_wait(0)
     dst_desc = gl.amd.cdna5.tdm.update_tensor_descriptor(dst_desc, add_offsets=[row, 16], pred=enabled,
                                                          clamp_bounds=True)
-    gl.amd.cdna5.tdm.async_store(dst_desc, src=smem)
-    gl.amd.cdna5.tdm.async_wait(0)
+    gl.amd.cdna5.tdm.async_store(dst_desc, src=smem, mbarrier=bar if COMPLETION else None)
+    if COMPLETION:
+        if enabled:
+            gl.amd.cdna5.mbarrier.wait(bar, 1)
+    else:
+        gl.amd.cdna5.tdm.async_wait(0)
 
 
 @pytest.mark.skipif(not is_hip_cdna5(), reason="TDM requires AMD gfx1250")
 @pytest.mark.parametrize("row", [0, 24])
 @pytest.mark.parametrize("enabled", [False, True])
-def test_gsan_gfx1250_tdm_offsets_bounds_predicate(with_gsan, row, enabled):
+@pytest.mark.parametrize("completion", [False, True])
+def test_gsan_gfx1250_tdm_offsets_bounds_predicate(with_gsan, row, enabled, completion):
     src = torch.arange(32 * 128, dtype=torch.int32, device="cuda").reshape(32, 128)
     dst = torch.full_like(src, -1)
     before_src = _shadow_cells_for_tensor(src)
     before_dst = _shadow_cells_for_tensor(dst)
-    _gsan_gfx1250_tdm_copy_kernel[(1, )](src, dst, row, enabled)
+    _gsan_gfx1250_tdm_copy_kernel[(1, )](src, dst, row, enabled, completion)
     expected = torch.full_like(src, -1)
     reads = torch.zeros((32, 128), dtype=torch.bool)
     writes = torch.zeros_like(reads)
@@ -2756,7 +2769,7 @@ def test_gsan_gfx1250_async_store_mask_updates_shadow(with_gsan):
 
 @gluon.jit
 def _gsan_gfx1250_tdm_indexed_kernel(src, dst, enabled, COL: gl.constexpr, INDEX16: gl.constexpr, PADDED: gl.constexpr,
-                                     ROW_BASE: gl.constexpr = 0):
+                                     ROW_BASE: gl.constexpr = 0, COMPLETION: gl.constexpr = False):
     shared: gl.constexpr = (gl.PaddedSharedLayout.with_identity_for([[64, 4]], [16, 64], [1, 0])
                             if PADDED else gl.SwizzledSharedLayout(1, 1, 1, [1, 0]))
     parent: gl.constexpr = gl.BlockedLayout([16, 1], [1, 32], [1, 4], [1, 0])
@@ -2774,10 +2787,21 @@ def _gsan_gfx1250_tdm_indexed_kernel(src, dst, enabled, COL: gl.constexpr, INDEX
     else:
         parent_smem = gl.allocate_shared_memory(gl.int32, [32, 64], shared)
         smem = parent_smem.slice(16, 16, dim=0)
-    gl.amd.cdna5.tdm.async_gather(src_desc, rows, smem)
-    gl.amd.cdna5.tdm.async_wait(0)
-    gl.amd.cdna5.tdm.async_scatter(dst_desc, rows, smem)
-    gl.amd.cdna5.tdm.async_wait(0)
+    bar = gl.allocate_shared_memory(gl.int64, [1], gl.amd.cdna5.mbarrier.MBarrierLayout())
+    if COMPLETION:
+        gl.amd.cdna5.mbarrier.init(bar, count=gl.num_warps())
+    gl.amd.cdna5.tdm.async_gather(src_desc, rows, smem, mbarrier=bar if COMPLETION else None)
+    if COMPLETION:
+        if enabled:
+            gl.amd.cdna5.mbarrier.wait(bar, 0)
+    else:
+        gl.amd.cdna5.tdm.async_wait(0)
+    gl.amd.cdna5.tdm.async_scatter(dst_desc, rows, smem, mbarrier=bar if COMPLETION else None)
+    if COMPLETION:
+        if enabled:
+            gl.amd.cdna5.mbarrier.wait(bar, 1)
+    else:
+        gl.amd.cdna5.tdm.async_wait(0)
 
 
 @pytest.mark.skipif(not is_hip_cdna5(), reason="TDM requires AMD gfx1250")
@@ -2785,12 +2809,13 @@ def _gsan_gfx1250_tdm_indexed_kernel(src, dst, enabled, COL: gl.constexpr, INDEX
 @pytest.mark.parametrize("col", [32, 112])
 @pytest.mark.parametrize("index16", [False, True])
 @pytest.mark.parametrize("padded", [False, True])
-def test_gsan_gfx1250_tdm_indexed_footprints(with_gsan, enabled, col, index16, padded):
+@pytest.mark.parametrize("completion", [False, True])
+def test_gsan_gfx1250_tdm_indexed_footprints(with_gsan, enabled, col, index16, padded, completion):
     src = torch.arange(32 * 144, dtype=torch.int32, device="cuda").reshape(32, 144)
     dst = torch.full_like(src, -1)
     before_src = _shadow_cells_for_tensor(src)
     before_dst = _shadow_cells_for_tensor(dst)
-    kernel = _gsan_gfx1250_tdm_indexed_kernel[(1, )](src, dst, enabled, col, index16, padded)
+    kernel = _gsan_gfx1250_tdm_indexed_kernel[(1, )](src, dst, enabled, col, index16, padded, COMPLETION=completion)
     expected = torch.full_like(src, -1)
     touched = torch.zeros((32, 144), dtype=torch.bool)
     if enabled:
@@ -2895,3 +2920,51 @@ def test_gsan_gfx1250_tdm_unsigned32_broadcast_footprint(with_gsan, sanitized, i
         touched = torch.full((1, 64), in_bounds, dtype=torch.bool)
         _assert_shadow_mask(before_src, _shadow_cells_for_tensor(src), touched, access_kind="read")
         _assert_shadow_mask(before_dst, _shadow_cells_for_tensor(dst), touched, access_kind="write")
+
+
+@gluon.jit
+def _gsan_gfx1250_named_barrier_kernel(out, selector):
+    bars = gl.allocate_shared_memory(gl.int64, [2, 1], gl.amd.cdna5.mbarrier.MBarrierLayout())
+    gl.amd.cdna5.mbarrier.init(bars.index(0), count=256)
+    gl.amd.cdna5.mbarrier.init(bars.index(1), count=256)
+    gl.amd.cdna5.mbarrier.wait(bars.index(selector), 1)
+    for iteration in range(8):
+        bar = bars.index((iteration + selector) % 2)
+        gl.amd.cdna5.mbarrier.arrive(bar, count=1)
+        phase = gl.amd.cdna5.mbarrier.arrive(bar, count=1)
+        gl.amd.cdna5.mbarrier.wait(bar, phase)
+        gl.amd.cdna5.mbarrier.wait(bar, phase)
+        gl.store(out + iteration, phase)
+
+
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Named barriers require AMD gfx1250")
+@pytest.mark.parametrize("selector", [0, 1])
+def test_gsan_gfx1250_named_barrier_dynamic_alias_phases(with_gsan, selector):
+    out = torch.empty(8, dtype=torch.int32, device="cuda")
+    _gsan_gfx1250_named_barrier_kernel[(1, )](out, selector, num_warps=4)
+    torch.testing.assert_close(out, torch.tensor([0, 0, 1, 1, 0, 0, 1, 1], dtype=torch.int32, device="cuda"))
+
+
+@gluon.jit
+def _gsan_gfx1250_async_completion_kernel(src, dst):
+    layout: gl.constexpr = gl.BlockedLayout([1, 8], [4, 8], [4, 1], [1, 0])
+    shared: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [1, 0])
+    rows = gl.arange(0, 16, gl.SliceLayout(1, layout))
+    cols = gl.arange(0, 64, gl.SliceLayout(0, layout))
+    indices = rows[:, None] * 64 + cols[None, :]
+    smem = gl.allocate_shared_memory(gl.int32, [16, 64], shared)
+    bar = gl.allocate_shared_memory(gl.int64, [1], gl.amd.cdna5.mbarrier.MBarrierLayout())
+    gl.amd.cdna5.mbarrier.init(bar, count=256)
+    gl.amd.cdna5.async_copy.global_to_shared(smem, src + indices)
+    gl.amd.cdna5.async_copy.mbarrier_arrive(bar)
+    phase = gl.amd.cdna5.mbarrier.arrive(bar)
+    gl.amd.cdna5.mbarrier.wait(bar, phase)
+    gl.store(dst + indices, smem.load(layout))
+
+
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Completion barriers require AMD gfx1250")
+def test_gsan_gfx1250_async_completion_barrier_payload(with_gsan):
+    src = torch.arange(1024, dtype=torch.int32, device="cuda")
+    dst = torch.empty_like(src)
+    _gsan_gfx1250_async_completion_kernel[(1, )](src, dst, num_warps=4)
+    torch.testing.assert_close(dst, src)

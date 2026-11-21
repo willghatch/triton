@@ -1500,7 +1500,8 @@ def test_gsan_amd_direct_async_release_acquire_handoff(buffer, monkeypatch):
 
 
 @gluon.jit
-def _amd_tdm_handoff_kernel(payload, flag, output, KIND: gl.constexpr, ORDERED: gl.constexpr):
+def _amd_tdm_handoff_kernel(payload, flag, output, KIND: gl.constexpr, ORDERED: gl.constexpr,
+                            COMPLETION: gl.constexpr = False):
     parent: gl.constexpr = gl.BlockedLayout([16, 1], [1, 32], [1, 4], [1, 0])
     shared: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [1, 0])
     row = gl.arange(0, 16, gl.SliceLayout(1, parent))
@@ -1519,9 +1520,15 @@ def _amd_tdm_handoff_kernel(payload, flag, output, KIND: gl.constexpr, ORDERED: 
         while gl.atomic_add(flag, 0, sem="acquire" if ORDERED else "relaxed") == 0:
             pass
         smem = gl.allocate_shared_memory(gl.int32, [16, 64], shared)
+        bar = gl.allocate_shared_memory(gl.int64, [1], gl.amd.cdna5.mbarrier.MBarrierLayout())
+        if COMPLETION:
+            gl.amd.cdna5.mbarrier.init(bar, count=gl.num_warps())
         if KIND == "raw":
-            gl.amd.cdna5.tdm.async_gather(desc, row, smem)
-            gl.amd.cdna5.tdm.async_wait(0)
+            gl.amd.cdna5.tdm.async_gather(desc, row, smem, mbarrier=bar if COMPLETION else None)
+            if COMPLETION:
+                gl.amd.cdna5.mbarrier.wait(bar, 0)
+            else:
+                gl.amd.cdna5.tdm.async_wait(0)
             gl.store(output + row[:, None] * 64 + col[None, :], smem.load(parent))
         elif KIND == "fused":
             out_desc = gl.amd.cdna5.tdm.make_tensor_descriptor(output, [16, 64], [64, 1], [16, 64], shared)
@@ -1531,16 +1538,19 @@ def _amd_tdm_handoff_kernel(payload, flag, output, KIND: gl.constexpr, ORDERED: 
             gl.store(output + row[:, None] * 64 + col[None, :], smem.load(parent))
         else:
             smem.store(gl.full([16, 64], 7, gl.int32, parent))
-            gl.amd.cdna5.tdm.async_scatter(desc, row, smem)
-            gl.amd.cdna5.tdm.async_wait(0)
+            gl.amd.cdna5.tdm.async_scatter(desc, row, smem, mbarrier=bar if COMPLETION else None)
+            if COMPLETION:
+                gl.amd.cdna5.mbarrier.wait(bar, 0)
+            else:
+                gl.amd.cdna5.tdm.async_wait(0)
 
 
 @run_with_gsan
-def _run_amd_tdm_handoff(kind, ordered):
+def _run_amd_tdm_handoff(kind, ordered, completion=False):
     payload = torch.full((16, 64), 1, dtype=torch.int32, device="cuda")
     flag = torch.zeros(1, dtype=torch.int32, device="cuda")
     output = torch.zeros_like(payload)
-    _amd_tdm_handoff_kernel[(2, )](payload, flag, output, kind, ordered)
+    _amd_tdm_handoff_kernel[(2, )](payload, flag, output, kind, ordered, completion)
     torch.cuda.synchronize()
     if kind in ("raw", "fused"):
         torch.testing.assert_close(output, torch.full_like(output, 7))
@@ -1571,3 +1581,20 @@ def test_gsan_gfx1250_tdm_ordered_handoff(kind, monkeypatch):
     monkeypatch.setenv("TRITON_TEST_PROCESS_TIMEOUT", "60")
     result = run_in_process(_run_amd_tdm_handoff, args=(kind, True), allow_abort=True)
     assert result.exc is None, result.driver_stderr_output
+
+
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Completion barriers require AMD gfx1250")
+@pytest.mark.parametrize("kind", ["raw", "war", "waw"])
+@pytest.mark.parametrize("ordered", [False, True])
+def test_gsan_gfx1250_local_completion_barrier_handoff(kind, ordered, monkeypatch):
+    monkeypatch.setenv("TRITON_TEST_PROCESS_TIMEOUT", "60")
+    if ordered:
+        result = run_in_process(_run_amd_tdm_handoff, args=(kind, True, True), allow_abort=True)
+        assert result.exc is None, result.driver_stderr_output
+    else:
+        marker = "tdm.async_gather" if kind == "raw" else "tdm.async_scatter"
+        error = {"raw": "Read after write", "war": "Write after read", "waw": "Write after write"}[kind]
+        # A local completion wait orders no producer in another logical block.
+        _run_failure_case("amd local completion " + kind, runner=_run_amd_tdm_handoff,
+                          source_function=_amd_tdm_handoff_kernel.fn, marker=marker, error=error + " race detected",
+                          runner_args=(kind, False, True))

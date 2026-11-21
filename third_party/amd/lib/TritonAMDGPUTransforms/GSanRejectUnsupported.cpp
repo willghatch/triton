@@ -74,10 +74,11 @@ MemoryAccess getMemoryAccess(Operation *op) {
 // shared memory only, so the global-memory check misses them.
 // cond_barrier phase-shifts warps (block pingpong, warp pipelining), which
 // the GSan instrumentation has not been validated with.
-bool isUnsupportedSync(Operation *op) {
-  return isa<amdgpu::InitBarrierOp, amdgpu::WaitBarrierOp,
-             amdgpu::ArriveBarrierOp, amdgpu::AsyncCopyMbarrierArriveOp,
-             amdgpu::ClusterBarrierArriveOp, amdgpu::ClusterBarrierWaitOp,
+bool isUnsupportedSync(Operation *op, bool localBarriersSupported) {
+  if (isa<amdgpu::InitBarrierOp, amdgpu::WaitBarrierOp, amdgpu::ArriveBarrierOp,
+          amdgpu::AsyncCopyMbarrierArriveOp>(op))
+    return !localBarriersSupported;
+  return isa<amdgpu::ClusterBarrierArriveOp, amdgpu::ClusterBarrierWaitOp,
              amdgpu::CondBarrierOp>(op);
 }
 
@@ -91,6 +92,15 @@ struct TritonAMDGPUGSanRejectUnsupportedPass
           TritonAMDGPUGSanRejectUnsupportedPass> {
   void runOnOperation() override {
     ModuleOp mod = getOperation();
+    // Like NVIDIA single-CTA GSan, ordinary AMD logical blocks share one
+    // participant clock. Local named/completion barriers retain their hardware
+    // semantics without importing clocks from any other block. Global async
+    // accesses remain checked at issue time. Partial regions and clusters need
+    // separate participation/clock contracts and are rejected below.
+    auto target = mod->getAttrOfType<StringAttr>(ttg::AttrTargetName);
+    bool localBarriersSupported = target &&
+                                  target.getValue() == "hip:gfx1250" &&
+                                  ttg::lookupNumCTAs(mod) == 1;
     bool failed = false;
     int64_t numUnchecked = 0;
     if (auto numCTAs = mod->getAttrOfType<IntegerAttr>("ttg.num-ctas");
@@ -117,7 +127,7 @@ struct TritonAMDGPUGSanRejectUnsupportedPass
         failed = true;
         return;
       }
-      if (isUnsupportedSync(op)) {
+      if (isUnsupportedSync(op, localBarriersSupported)) {
         op->emitError("GSan on AMD does not support synchronization "
                       "operation '")
             << op->getName() << "'";
@@ -125,25 +135,25 @@ struct TritonAMDGPUGSanRejectUnsupportedPass
         return;
       }
       if (auto copy = dyn_cast<amdgpu::AsyncTDMCopyGlobalToLocalOp>(op);
-          copy && copy.getBarrier()) {
+          copy && copy.getBarrier() && !localBarriersSupported) {
         op->emitError("GSan on AMD does not support TDM completion barriers");
         failed = true;
         return;
       }
       if (auto copy = dyn_cast<amdgpu::AsyncTDMCopyLocalToGlobalOp>(op);
-          copy && copy.getBarrier()) {
+          copy && copy.getBarrier() && !localBarriersSupported) {
         op->emitError("GSan on AMD does not support TDM completion barriers");
         failed = true;
         return;
       }
       if (auto gather = dyn_cast<amdgpu::AsyncTDMGatherOp>(op);
-          gather && gather.getBarrier()) {
+          gather && gather.getBarrier() && !localBarriersSupported) {
         op->emitError("GSan on AMD does not support TDM completion barriers");
         failed = true;
         return;
       }
       if (auto scatter = dyn_cast<amdgpu::AsyncTDMScatterOp>(op);
-          scatter && scatter.getBarrier()) {
+          scatter && scatter.getBarrier() && !localBarriersSupported) {
         op->emitError("GSan on AMD does not support TDM completion barriers");
         failed = true;
         return;
