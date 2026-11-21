@@ -27,9 +27,9 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 THREADS_PER_WARP = gl.constexpr(64 if is_hip_cdna4() else 32)
 amd_global_load_to_shared = (gl.amd.cdna5.async_copy.global_to_shared
                              if is_hip_cdna5() else gl.amd.cdna4.async_copy.global_load_to_shared)
-# tl.atomic_load/atomic_store arrived with the shared base after the AMD
-# prototype; a cross-block atomic_load spin loop hangs under GSan on gfx950.
-_HIP_ATOMIC_LOAD_SPIN_HANG = "GSan on AMD hangs in tl.atomic_load spin loops (not yet validated on gfx950)"
+# Cross-block atomic_load spin loops are validated on gfx1250. Keep gfx950
+# excluded until its previously observed GSan polling hang is revalidated.
+_GFX950_ATOMIC_LOAD_SPIN_HANG = "GSan atomic_load spin loops previously hung on gfx950; revalidation required"
 
 pytestmark = pytest.mark.skipif(not (is_cuda() or is_hip_cdna4() or is_hip_cdna5()),
                                 reason="requires CUDA or AMD gfx950/gfx1250 backend")
@@ -1185,7 +1185,7 @@ def test_atomic_poll_semantic_mismatch_read_after_write(shadow_granularity, prod
                       error="Read after write race detected")
 
 
-@pytest.mark.xfail(is_hip(), run=False, reason=_HIP_ATOMIC_LOAD_SPIN_HANG)
+@pytest.mark.xfail(is_hip_cdna4(), run=False, reason=_GFX950_ATOMIC_LOAD_SPIN_HANG)
 @pytest.mark.parametrize("producer_sem, consumer_sem, scope", CROSS_SM_SEMANTIC_MISMATCH_CASES)
 def test_atomic_load_store_semantic_mismatch_read_after_write(producer_sem, consumer_sem, scope):
     _run_failure_case(f"atomic_load_store_semantic_mismatch_{producer_sem}_{consumer_sem}_{scope}",
