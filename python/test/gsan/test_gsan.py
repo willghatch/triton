@@ -1968,7 +1968,7 @@ TMA_MASK_CASES = [(g, 5, 8)
                   for g in (1, 2, 4, 8, 16)] + [(g, row, col) for g in (4, 16) for row, col in ((30, 8), (5, 32))]
 
 
-@pytest.mark.skipif(not is_cuda(), reason="GSan requires CUDA")
+@requires_gsan
 @pytest.mark.parametrize("num_ctas", [
     1,
     pytest.param(
@@ -3300,3 +3300,126 @@ def test_gsan_gfx1250_cluster_multicast_nonrecipient_independence(ctas, monkeypa
     monkeypatch.setenv("TRITON_TEST_PROCESS_TIMEOUT", "60")
     result = run_in_process(_run_gsan_gfx1250_cluster_tdm, args=(ctas, 2, 4))
     assert result.exc is None, result.exc
+
+
+@gluon.jit
+def _gsan_gfx1250_acceptance_initialize_kernel(ptr):
+    offsets = gl.arange(0, 2048, gl.BlockedLayout([1], [32], [4], [0]))
+    gl.store(ptr + offsets, offsets * 3 + 11)
+
+
+@gluon.jit
+def _gsan_gfx1250_acceptance_tdm_worker(src, dst):
+    shared: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [1, 0])
+    layout: gl.constexpr = gl.BlockedLayout([16, 1], [1, 32], [1, 4], [1, 0])
+    rows = gl.arange(0, 16, gl.SliceLayout(1, layout))
+    source = gl.amd.cdna5.tdm.make_tensor_descriptor(src, [32, 64], [64, 1], [16, 64], shared)
+    destination = gl.amd.cdna5.tdm.make_tensor_descriptor(dst, [16, 64], [64, 1], [16, 64], shared)
+    smem = gl.allocate_shared_memory(gl.int32, [16, 64], shared)
+    bar = gl.allocate_shared_memory(gl.int64, [1], gl.amd.cdna5.mbarrier.MBarrierLayout())
+    gl.amd.cdna5.mbarrier.init(bar, count=gl.num_warps())
+    for iteration in range(3):
+        gl.amd.cdna5.tdm.async_gather(source, rows * 2, smem, mbarrier=bar)
+        gl.amd.cdna5.mbarrier.wait(bar, 0)
+        gl.amd.cdna5.tdm.async_scatter(destination, 15 - rows, smem, mbarrier=bar)
+        gl.amd.cdna5.mbarrier.wait(bar, 1)
+
+
+@gluon.jit
+def _gsan_gfx1250_acceptance_default(src, dst):
+    pass
+
+
+@gluon.jit
+def _gsan_gfx1250_acceptance_region_kernel(src, dst):
+    gl.warp_specialize([(_gsan_gfx1250_acceptance_default, (src, dst)),
+                        (_gsan_gfx1250_acceptance_tdm_worker, (src, dst))], [4], [24])
+
+
+@gluon.jit(noinline=True)
+def _gsan_gfx1250_acceptance_rectangular_worker(src, dst):
+    shared: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [1, 0])
+    source = gl.amd.cdna5.tdm.make_tensor_descriptor(src, [16, 64], [64, 1], [16, 64], shared)
+    destination = gl.amd.cdna5.tdm.make_tensor_descriptor(dst, [16, 64], [64, 1], [16, 64], shared)
+    smem = gl.allocate_shared_memory(gl.int32, [16, 64], shared)
+    bar = gl.allocate_shared_memory(gl.int64, [1], gl.amd.cdna5.mbarrier.MBarrierLayout())
+    gl.amd.cdna5.mbarrier.init(bar, count=gl.num_warps())
+    gl.amd.cdna5.tdm.async_load(source, [0, 0], smem, mbarrier=bar)
+    gl.amd.cdna5.mbarrier.wait(bar, 0)
+    gl.amd.cdna5.tdm.async_store(destination, [0, 0], smem, mbarrier=bar)
+    gl.amd.cdna5.mbarrier.wait(bar, 1)
+
+
+@gluon.jit
+def _gsan_gfx1250_acceptance_noinline_region_kernel(src, dst):
+    gl.warp_specialize([(_gsan_gfx1250_acceptance_default, (src, dst)),
+                        (_gsan_gfx1250_acceptance_rectangular_worker, (src, dst))], [4], [24])
+
+
+@gluon.jit
+def _gsan_gfx1250_acceptance_consumer_kernel(src, dst):
+    offsets = gl.arange(0, 1024, gl.BlockedLayout([1], [32], [4], [0]))
+    gl.store(dst + offsets, gl.load(src + offsets) + 1)
+
+
+def _run_gsan_gfx1250_composed_graph_cluster(ctas):
+    from triton.experimental.gsan import configure, graph
+    from triton.experimental.gsan._testing_utils import ExplicitGraph, shadow_tensor_for
+
+    if ctas == 4:
+        configure(num_slots=1024)
+    triton.knobs.compilation.instrumentation_mode = "gsan"
+    normal_pool = create_mem_pool()
+    compact_pool = create_mem_pool(write_once=True)
+    with torch.cuda.use_mem_pool(normal_pool):
+        with torch.cuda.use_mem_pool(compact_pool):
+            source = torch.empty((32, 64), dtype=torch.int32, device="cuda")
+        middle, rectangular_result, graph_result, cluster_result, result = [
+            torch.empty((16, 64), dtype=torch.int32, device="cuda") for _ in range(5)
+        ]
+        # Instrumented initialization publishes both write-once history and
+        # the eager predecessor consumed by graph entry.
+        _gsan_gfx1250_acceptance_initialize_kernel[(1, )](source)
+        compact_shadow = shadow_tensor_for(source).cpu().clone()
+        assert torch.all(compact_shadow.view(torch.int32) != 0)
+        plan = graph.GraphPlan(torch.cuda.current_device(),
+                               [graph.GraphNode(), graph.GraphNode(
+                                   (0, )), graph.GraphNode((1, ))])
+        worker = _gsan_gfx1250_acceptance_region_kernel.warmup(source, middle, grid=(1, ))
+        rectangular = _gsan_gfx1250_acceptance_noinline_region_kernel.warmup(middle, rectangular_result, grid=(1, ))
+        consumer = _gsan_gfx1250_acceptance_consumer_kernel.warmup(rectangular_result, graph_result, grid=(1, ))
+        other_stream = torch.cuda.Stream()
+        expected = ((torch.arange(2048, dtype=torch.int32).reshape(32, 64)[::2].flip(0) * 3 + 11) + 2).cuda()
+        with ExplicitGraph(plan) as executable:
+            executable.add_kernel(worker, (source, middle), 1)
+            executable.add_kernel(rectangular, (middle, rectangular_result), 1)
+            executable.add_kernel(consumer, (rectangular_result, graph_result), 1)
+            executable.instantiate()
+            for iteration in range(3):
+                stream = other_stream if iteration % 2 else torch.cuda.current_stream()
+                if stream != torch.cuda.current_stream():
+                    stream.wait_stream(torch.cuda.current_stream())
+                completion = executable.launch(stream)
+            torch.cuda.current_stream().wait_stream(other_stream)
+            graph.acquire_completions(torch.cuda.current_device(),
+                                      torch.cuda.current_stream().cuda_stream, (completion, ))
+            # Native multicast recipients execute after actual graph completion.
+            # The raw cluster rendezvous inside this kernel is execution-only.
+            _gsan_gfx1250_cluster_tdm_kernel[(1, )](graph_result, cluster_result, ctas, True, True, num_ctas=ctas)
+            _gsan_gfx1250_acceptance_consumer_kernel[(1, )](cluster_result, result)
+            torch.testing.assert_close(result, expected)
+            assert torch.equal(shadow_tensor_for(source).cpu(), compact_shadow)
+            cell = shadow_cell_from_address(graph_result.data_ptr())
+            readers = [clock for clock in cell.read_clocks if clock.epoch]
+            assert len({clock.thread_id for clock in readers}) == ctas
+            for reader in readers:
+                state = thread_state_from_smid(reader.thread_id)
+                assert state.vector_clock[cell.write_clock.thread_id] >= cell.write_clock.epoch
+
+
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Composed TDM/graph/cluster acceptance requires AMD gfx1250")
+@pytest.mark.parametrize("ctas", [2, 4])
+def test_gsan_gfx1250_composed_write_once_graph_cluster(ctas, monkeypatch):
+    monkeypatch.setenv("TRITON_TEST_PROCESS_TIMEOUT", "60")
+    result = run_in_process(_run_gsan_gfx1250_composed_graph_cluster, args=(ctas, ))
+    assert result.exc is None, (result.exc, result.driver_stderr_output)
