@@ -197,3 +197,29 @@ module attributes {"ttg.instrumentation_mode" = "gsan", "ttg.num-ctas" = 1 : i32
     tt.return
   }
 }
+
+// -----
+
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#parent = #ttg.blocked<{sizePerThread = [16, 1], threadsPerWarp = [1, 64], warpsPerCTA = [1, 4], order = [1, 0]}>
+#idx = #ttg.slice<{dim = 1, parent = #parent}>
+module attributes {"ttg.instrumentation_mode" = "gsan", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  // CHECK-LABEL: llvm.func @tdm_indexed_descriptor_checks(
+  // CHECK-SAME: [[DESC:%[a-zA-Z0-9_]+]]: !llvm.struct
+  // CHECK: [[BUFFER:%[a-zA-Z0-9_]+]] = llvm.alloca {{.*}} x !llvm.struct<(i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32)> : (i32) -> !llvm.ptr<5>
+  // CHECK: [[GENERIC:%[a-zA-Z0-9_]+]] = llvm.addrspacecast [[BUFFER]] : !llvm.ptr<5> to !llvm.ptr
+  // CHECK: llvm.store [[DESC]], [[GENERIC]]
+  // CHECK: llvm.call @__triton_gsan_load_indexed_tensor_desc({{%[^,]+}}, [[GENERIC]],
+  tt.func public @tdm_indexed_descriptor_checks(%desc: !tt.tensordesc<16x64xi32, #shared>, %indices: tensor<16xi32, #idx>) {
+    %zero = arith.constant 0 : i32
+    tti.experimental_gsan_indexed_tensordesc_access %desc[%indices, %zero], false : !tt.tensordesc<16x64xi32, #shared>, tensor<16xi32, #idx>
+    tt.return
+  }
+  // CHECK-LABEL: llvm.func @tdm_indexed_descriptor_store(
+  // CHECK: llvm.call @__triton_gsan_store_indexed_tensor_desc(
+  tt.func public @tdm_indexed_descriptor_store(%desc: !tt.tensordesc<16x64xi32, #shared>, %indices: tensor<16xi32, #idx>) {
+    %zero = arith.constant 0 : i32
+    tti.experimental_gsan_indexed_tensordesc_access %desc[%indices, %zero], true : !tt.tensordesc<16x64xi32, #shared>, tensor<16xi32, #idx>
+    tt.return
+  }
+}

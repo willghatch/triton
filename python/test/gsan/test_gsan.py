@@ -2752,3 +2752,146 @@ def test_gsan_gfx1250_async_store_mask_updates_shadow(with_gsan):
     expected[::2] = src[::2]
     torch.testing.assert_close(dst, expected)
     _assert_shadow_mask(before, [_shadow_cells_for_tensor(dst)], active[None, :], access_kind="write")
+
+
+@gluon.jit
+def _gsan_gfx1250_tdm_indexed_kernel(src, dst, enabled, COL: gl.constexpr, INDEX16: gl.constexpr, PADDED: gl.constexpr,
+                                     ROW_BASE: gl.constexpr = 0):
+    shared: gl.constexpr = (gl.PaddedSharedLayout.with_identity_for([[64, 4]], [16, 64], [1, 0])
+                            if PADDED else gl.SwizzledSharedLayout(1, 1, 1, [1, 0]))
+    parent: gl.constexpr = gl.BlockedLayout([16, 1], [1, 32], [1, 4], [1, 0])
+    rows = ROW_BASE + 2 * gl.arange(0, 16, gl.SliceLayout(1, parent))
+    if INDEX16:
+        rows = rows.to(gl.uint16)
+    src_desc = gl.amd.cdna5.tdm.make_tensor_descriptor(src, [ROW_BASE + 29, 128], [144, 1], [16, 64], shared)
+    dst_desc = gl.amd.cdna5.tdm.make_tensor_descriptor(dst, [ROW_BASE + 29, 128], [144, 1], [16, 64], shared)
+    src_desc = gl.amd.cdna5.tdm.update_tensor_descriptor(src_desc, add_offsets=[0, COL], pred=enabled,
+                                                         clamp_bounds=True)
+    dst_desc = gl.amd.cdna5.tdm.update_tensor_descriptor(dst_desc, add_offsets=[0, COL], pred=enabled,
+                                                         clamp_bounds=True)
+    if PADDED:
+        smem = gl.allocate_shared_memory(gl.int32, [16, 64], shared)
+    else:
+        parent_smem = gl.allocate_shared_memory(gl.int32, [32, 64], shared)
+        smem = parent_smem.slice(16, 16, dim=0)
+    gl.amd.cdna5.tdm.async_gather(src_desc, rows, smem)
+    gl.amd.cdna5.tdm.async_wait(0)
+    gl.amd.cdna5.tdm.async_scatter(dst_desc, rows, smem)
+    gl.amd.cdna5.tdm.async_wait(0)
+
+
+@pytest.mark.skipif(not is_hip_cdna5(), reason="TDM requires AMD gfx1250")
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("col", [32, 112])
+@pytest.mark.parametrize("index16", [False, True])
+@pytest.mark.parametrize("padded", [False, True])
+def test_gsan_gfx1250_tdm_indexed_footprints(with_gsan, enabled, col, index16, padded):
+    src = torch.arange(32 * 144, dtype=torch.int32, device="cuda").reshape(32, 144)
+    dst = torch.full_like(src, -1)
+    before_src = _shadow_cells_for_tensor(src)
+    before_dst = _shadow_cells_for_tensor(dst)
+    kernel = _gsan_gfx1250_tdm_indexed_kernel[(1, )](src, dst, enabled, col, index16, padded)
+    expected = torch.full_like(src, -1)
+    touched = torch.zeros((32, 144), dtype=torch.bool)
+    if enabled:
+        expected[:29:2, col:min(col + 64, 128)] = src[:29:2, col:min(col + 64, 128)]
+        touched[:29:2, col:min(col + 64, 128)] = True
+    torch.testing.assert_close(dst, expected)
+    _assert_shadow_mask(before_src, _shadow_cells_for_tensor(src), touched, access_kind="read")
+    _assert_shadow_mask(before_dst, _shadow_cells_for_tensor(dst), touched, access_kind="write")
+    assert "__triton_gsan_load_indexed_tensor_desc" in kernel.asm["llir"]
+    assert "__triton_gsan_store_indexed_tensor_desc" in kernel.asm["llir"]
+
+
+@gluon.jit
+def _gsan_gfx1250_tdm_fused_kernel(src0, src1, dst0, dst1, enabled):
+    shared: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [1, 0])
+    desc0 = gl.amd.cdna5.tdm.make_tensor_descriptor(src0, [32, 128], [128, 1], [16, 64], shared)
+    desc1 = gl.amd.cdna5.tdm.make_tensor_descriptor(src1, [32, 128], [128, 1], [16, 64], shared)
+    desc0 = gl.amd.cdna5.tdm.update_tensor_descriptor(desc0, add_offsets=[0, 16], clamp_bounds=True)
+    desc1 = gl.amd.cdna5.tdm.update_tensor_descriptor(desc1, add_offsets=[24, 64], pred=enabled, clamp_bounds=True)
+    smem0 = gl.allocate_shared_memory(gl.int32, [16, 64], shared)
+    smem1 = gl.allocate_shared_memory(gl.int32, [16, 64], shared)
+    gl.amd.cdna5.tdm.async_load_fused([(desc0, smem0, 3), (desc1, smem1, 12)])
+    gl.amd.cdna5.tdm.async_wait(0)
+    out0 = gl.amd.cdna5.tdm.make_tensor_descriptor(dst0, [16, 64], [64, 1], [16, 64], shared)
+    out1 = gl.amd.cdna5.tdm.make_tensor_descriptor(dst1, [16, 64], [64, 1], [16, 64], shared)
+    out1 = gl.amd.cdna5.tdm.update_tensor_descriptor(out1, pred=enabled)
+    gl.amd.cdna5.tdm.async_store(out0, src=smem0)
+    gl.amd.cdna5.tdm.async_store(out1, src=smem1)
+    gl.amd.cdna5.tdm.async_wait(0)
+
+
+@pytest.mark.skipif(not is_hip_cdna5(), reason="TDM requires AMD gfx1250")
+@pytest.mark.parametrize("enabled", [False, True])
+def test_gsan_gfx1250_tdm_fused_member_footprints(with_gsan, enabled):
+    src0 = torch.arange(32 * 128, dtype=torch.int32, device="cuda").reshape(32, 128)
+    src1 = src0 + 10000
+    dst0 = torch.full((16, 64), -1, dtype=torch.int32, device="cuda")
+    dst1 = torch.full_like(dst0, -1)
+    before0, before1 = _shadow_cells_for_tensor(src0), _shadow_cells_for_tensor(src1)
+    _gsan_gfx1250_tdm_fused_kernel[(1, )](src0, src1, dst0, dst1, enabled)
+    torch.testing.assert_close(dst0, src0[:16, 16:80])
+    expected1 = torch.zeros_like(dst1) if enabled else torch.full_like(dst1, -1)
+    if enabled:
+        expected1[:8] = src1[24:, 64:]
+    torch.testing.assert_close(dst1, expected1)
+    reads0 = torch.zeros((32, 128), dtype=torch.bool)
+    reads1 = torch.zeros_like(reads0)
+    reads0[:16, 16:80] = True
+    if enabled:
+        reads1[24:, 64:] = True
+    _assert_shadow_mask(before0, _shadow_cells_for_tensor(src0), reads0, access_kind="read")
+    _assert_shadow_mask(before1, _shadow_cells_for_tensor(src1), reads1, access_kind="read")
+
+
+@pytest.mark.skipif(not is_hip_cdna5(), reason="TDM requires AMD gfx1250")
+def test_gsan_gfx1250_tdm_unsigned16_row_indices(with_gsan):
+    # A signed extension would drop every high-bit index while hardware reads
+    # rows >= 32768.  Inspect only that tail's shadow cells.
+    src = torch.arange((32768 + 32) * 144, dtype=torch.int32, device="cuda").reshape(-1, 144)
+    dst = torch.full_like(src, -1)
+    before_src = _shadow_cells_for_tensor(src[32768:])
+    before_dst = _shadow_cells_for_tensor(dst[32768:])
+    _gsan_gfx1250_tdm_indexed_kernel[(1, )](src, dst, True, 32, True, False, 32768)
+    expected = torch.full_like(dst[32768:], -1)
+    expected[:29:2, 32:96] = src[32768:32797:2, 32:96]
+    torch.testing.assert_close(dst[32768:], expected)
+    touched = torch.zeros((32, 144), dtype=torch.bool)
+    touched[:29:2, 32:96] = True
+    _assert_shadow_mask(before_src, _shadow_cells_for_tensor(src[32768:]), touched, access_kind="read")
+    _assert_shadow_mask(before_dst, _shadow_cells_for_tensor(dst[32768:]), touched, access_kind="write")
+
+
+@gluon.jit
+def _gsan_gfx1250_tdm_unsigned32_broadcast_kernel(src, dst, nrows):
+    shared: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [1, 0])
+    parent: gl.constexpr = gl.BlockedLayout([1, 1], [1, 32], [1, 4], [1, 0])
+    # Broadcast rows map to the same allocated row.  One indexed row avoids
+    # conflicting scatter destinations, while exercising bit31 of the index.
+    rows = gl.full([1], 0x80000000, gl.uint32, gl.SliceLayout(1, parent))
+    nrows = nrows.to(gl.uint32)
+    src_desc = gl.amd.cdna5.tdm.make_tensor_descriptor(src, [nrows, 64], [0, 1], [1, 64], shared)
+    dst_desc = gl.amd.cdna5.tdm.make_tensor_descriptor(dst, [nrows, 64], [0, 1], [1, 64], shared)
+    smem = gl.allocate_shared_memory(gl.int32, [1, 64], shared)
+    gl.amd.cdna5.tdm.async_gather(src_desc, rows, smem)
+    gl.amd.cdna5.tdm.async_wait(0)
+    gl.amd.cdna5.tdm.async_scatter(dst_desc, rows, smem)
+    gl.amd.cdna5.tdm.async_wait(0)
+
+
+@pytest.mark.skipif(not is_hip_cdna5(), reason="TDM requires AMD gfx1250")
+@pytest.mark.parametrize("sanitized", [False, True])
+@pytest.mark.parametrize("in_bounds", [False, True])
+def test_gsan_gfx1250_tdm_unsigned32_broadcast_footprint(with_gsan, sanitized, in_bounds):
+    triton.knobs.compilation.instrumentation_mode = "gsan" if sanitized else ""
+    src = torch.arange(64, dtype=torch.int32, device="cuda").reshape(1, 64)
+    dst = torch.full_like(src, -1)
+    before_src = _shadow_cells_for_tensor(src)
+    before_dst = _shadow_cells_for_tensor(dst)
+    _gsan_gfx1250_tdm_unsigned32_broadcast_kernel[(1, )](src, dst, 0x80000010 if in_bounds else 0x80000000)
+    torch.testing.assert_close(dst, src if in_bounds else torch.full_like(src, -1))
+    if sanitized:
+        touched = torch.full((1, 64), in_bounds, dtype=torch.bool)
+        _assert_shadow_mask(before_src, _shadow_cells_for_tensor(src), touched, access_kind="read")
+        _assert_shadow_mask(before_dst, _shadow_cells_for_tensor(dst), touched, access_kind="write")

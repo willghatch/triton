@@ -1440,6 +1440,10 @@ GSAN_DEVICE void tensorAccessIndexedDesc(const void *descriptor,
     return;
 
   auto desc = decodeTensorDesc(descriptor, 2, bytesPerElem);
+#if GSAN_AMDGPU
+  if (!desc.enabled())
+    return;
+#endif
   int64_t rowShape = desc.shape(0);
   int64_t colShape = desc.shape(1);
   int64_t firstCol = yOffset > 0 ? yOffset : 0;
@@ -1452,7 +1456,12 @@ GSAN_DEVICE void tensorAccessIndexedDesc(const void *descriptor,
   uintptr_t rowStride = desc.byteStride(0);
   uintptr_t colOffset = firstCol * desc.byteStride(1);
   for (int i = 0; i < numIndices; ++i) {
-    int index = indices[i];
+    int64_t index = indices[i];
+#if GSAN_AMDGPU
+    // TDM indices and bounds are unsigned 32-bit descriptor fields.
+    // NVIDIA TMA retains signed coordinates and negative-index clipping.
+    index = static_cast<uint32_t>(indices[i]);
+#endif
     if (index < 0 || static_cast<int64_t>(index) >= rowShape)
       continue;
 

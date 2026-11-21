@@ -1497,3 +1497,77 @@ def test_gsan_amd_direct_async_release_acquire_handoff(buffer, monkeypatch):
     monkeypatch.setenv("TRITON_TEST_PROCESS_TIMEOUT", HIP_DEFAULT_PROCESS_TIMEOUT_S)
     result = run_in_process(_run_amd_direct_async_handoff, args=(buffer, True), allow_abort=True)
     assert result.exc is None, result.driver_stderr_output
+
+
+@gluon.jit
+def _amd_tdm_handoff_kernel(payload, flag, output, KIND: gl.constexpr, ORDERED: gl.constexpr):
+    parent: gl.constexpr = gl.BlockedLayout([16, 1], [1, 32], [1, 4], [1, 0])
+    shared: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [1, 0])
+    row = gl.arange(0, 16, gl.SliceLayout(1, parent))
+    col = gl.arange(0, 64, gl.SliceLayout(0, parent))
+    ptrs = payload + row[:, None] * 64 + col[None, :]
+    desc = gl.amd.cdna5.tdm.make_tensor_descriptor(payload, [16, 64], [64, 1], [16, 64], shared)
+    if gl.program_id(0) == 0:
+        if KIND == "raw" or KIND == "fused":
+            gl.store(ptrs, 7)
+        elif KIND == "war":
+            gl.store(output + row[:, None] * 64 + col[None, :], gl.load(ptrs))
+        else:
+            gl.store(ptrs, 3)
+        gl.atomic_add(flag, 1, sem="release" if ORDERED else "relaxed")
+    else:
+        while gl.atomic_add(flag, 0, sem="acquire" if ORDERED else "relaxed") == 0:
+            pass
+        smem = gl.allocate_shared_memory(gl.int32, [16, 64], shared)
+        if KIND == "raw":
+            gl.amd.cdna5.tdm.async_gather(desc, row, smem)
+            gl.amd.cdna5.tdm.async_wait(0)
+            gl.store(output + row[:, None] * 64 + col[None, :], smem.load(parent))
+        elif KIND == "fused":
+            out_desc = gl.amd.cdna5.tdm.make_tensor_descriptor(output, [16, 64], [64, 1], [16, 64], shared)
+            other = gl.allocate_shared_memory(gl.int32, [16, 64], shared)
+            gl.amd.cdna5.tdm.async_load_fused([(out_desc, other, 3), (desc, smem, 12)])
+            gl.amd.cdna5.tdm.async_wait(0)
+            gl.store(output + row[:, None] * 64 + col[None, :], smem.load(parent))
+        else:
+            smem.store(gl.full([16, 64], 7, gl.int32, parent))
+            gl.amd.cdna5.tdm.async_scatter(desc, row, smem)
+            gl.amd.cdna5.tdm.async_wait(0)
+
+
+@run_with_gsan
+def _run_amd_tdm_handoff(kind, ordered):
+    payload = torch.full((16, 64), 1, dtype=torch.int32, device="cuda")
+    flag = torch.zeros(1, dtype=torch.int32, device="cuda")
+    output = torch.zeros_like(payload)
+    _amd_tdm_handoff_kernel[(2, )](payload, flag, output, kind, ordered)
+    torch.cuda.synchronize()
+    if kind in ("raw", "fused"):
+        torch.testing.assert_close(output, torch.full_like(output, 7))
+    else:
+        torch.testing.assert_close(payload, torch.full_like(payload, 7))
+        if kind == "war":
+            torch.testing.assert_close(output, torch.full_like(output, 1))
+
+
+@pytest.mark.skipif(not is_hip_cdna5(), reason="TDM requires AMD gfx1250")
+@pytest.mark.parametrize("kind", ["raw", "war", "waw", "fused"])
+def test_gsan_gfx1250_tdm_unordered_handoff(kind, monkeypatch):
+    monkeypatch.setenv("TRITON_TEST_PROCESS_TIMEOUT", "60")
+    marker = {
+        "raw": "tdm.async_gather", "war": "tdm.async_scatter", "waw": "tdm.async_scatter", "fused":
+        "tdm.async_load_fused"
+    }[kind]
+    error = {
+        "raw": "Read after write", "war": "Write after read", "waw": "Write after write", "fused": "Read after write"
+    }[kind] + " race detected"
+    _run_failure_case("amd advanced tdm " + kind, runner=_run_amd_tdm_handoff,
+                      source_function=_amd_tdm_handoff_kernel.fn, marker=marker, error=error, runner_args=(kind, False))
+
+
+@pytest.mark.skipif(not is_hip_cdna5(), reason="TDM requires AMD gfx1250")
+@pytest.mark.parametrize("kind", ["raw", "war", "waw", "fused"])
+def test_gsan_gfx1250_tdm_ordered_handoff(kind, monkeypatch):
+    monkeypatch.setenv("TRITON_TEST_PROCESS_TIMEOUT", "60")
+    result = run_in_process(_run_amd_tdm_handoff, args=(kind, True), allow_abort=True)
+    assert result.exc is None, result.driver_stderr_output

@@ -773,7 +773,8 @@ public:
 
     auto descTy = cast<tt::TensorDescType>(op.getDesc().getType());
     ArrayRef<int64_t> blockShape = descTy.getShape();
-    if (blockShape.size() != 2 || blockShape.front() != 1)
+    if (blockShape.size() != 2 ||
+        (targetInfo->isCuda() && blockShape.front() != 1))
       return rewriter.notifyMatchFailure(op, "expected a 1xN descriptor");
 
     auto elemTy = descTy.getSignlessBlockType().getElementType();
@@ -805,11 +806,18 @@ public:
                                          : kGSanLoadIndexedTensorDescRuntimeFn;
     auto runtimeFunc = getOrCreateGSanRuntimeFunction(rewriter, funcName);
     auto sourceLoc = materializeSourceLocation(rewriter, loc);
+    Value descriptor = adaptor.getDesc();
+    if (!targetInfo->isCuda()) {
+      Value storage = createGSanStackBuffer(rewriter, loc, *targetInfo,
+                                            descriptor.getType());
+      b.store(descriptor, storage);
+      descriptor = storage;
+    }
     b.call(runtimeFunc,
            ValueRange{*gsanGlobalStatePtr,
-                      castToGenericPointer(rewriter, loc, adaptor.getDesc()),
-                      indices, b.i32_val(indexElems.size()),
-                      adaptor.getOffset(), b.i32_val(blockShape.back()),
+                      castToGenericPointer(rewriter, loc, descriptor), indices,
+                      b.i32_val(indexElems.size()), adaptor.getOffset(),
+                      b.i32_val(blockShape.back()),
                       b.i32_val(elemTy.getIntOrFloatBitWidth() / 8),
                       materializeI32Bool(rewriter, b, pred), sourceLoc.file,
                       sourceLoc.line});

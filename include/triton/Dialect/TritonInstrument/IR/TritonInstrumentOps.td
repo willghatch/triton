@@ -259,10 +259,13 @@ def TTI_ExperimentalGSanTensorDescAccessOp
 
 def TTI_ExperimentalGSanIndexedTensorDescAccessOp
     : TTI_Op<"experimental_gsan_indexed_tensordesc_access"> {
-  let summary = "Instrument an indexed TMA gather or scatter for GSan";
+  let summary = "Instrument an indexed tensor descriptor gather or scatter for GSan";
   let description = [{
     Passes a native tensor descriptor and its row indices directly to the GSan
     runtime, which checks row and column bounds before updating shadow memory.
+    Positioned AMD TDM descriptors also carry their address and predicate;
+    16-bit hardware row indices are zero-extended to the runtime's 32-bit ABI.
+    Checks happen at issue time, matching rectangular descriptor accesses.
   }];
   let arguments = (ins TT_AnyTensorDescType:$desc,
                    RankedTensorOf<[I32]>:$indices, I32:$offset,

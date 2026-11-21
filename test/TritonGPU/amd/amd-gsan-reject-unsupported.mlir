@@ -1,4 +1,4 @@
-// RUN: triton-opt %s -split-input-file -tritonamdgpu-gsan-reject-unsupported -tritonamdgpu-gsan-instrument-direct-async -verify-diagnostics | FileCheck %s
+// RUN: triton-opt %s -split-input-file -tritonamdgpu-gsan-reject-unsupported -tritonamdgpu-gsan-instrument-direct-async -tritonamdgpu-gsan-instrument-tdm -verify-diagnostics | FileCheck %s
 
 // Operations GSan instruments pass through unchanged.
 
@@ -286,11 +286,16 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 64 : i32} {
   tt.func @tdm_advanced(%desc: !tt.tensordesc<64x64xf16, #shared>, %buf: !ttg.memdesc<64x64xf16, #shared, #smem, mutable>, %indices: tensor<64xi32, #idx>) {
-    // expected-error@+1 {{GSan on AMD cannot check global-memory operation 'amdg.async_tdm_fused_copy_global_to_local'}}
+    // CHECK-LABEL: @tdm_advanced
+    // CHECK: tti.experimental_gsan_tensordesc_access %arg0
+    // CHECK: tti.experimental_gsan_tensordesc_access %arg0
+    // CHECK: amdg.async_tdm_fused
     %fused = amdg.async_tdm_fused_copy_global_to_local %desc, %desc into %buf, %buf {warp_used_hints = array<i32: 3, 12>} : !tt.tensordesc<64x64xf16, #shared>, !tt.tensordesc<64x64xf16, #shared> -> !ttg.memdesc<64x64xf16, #shared, #smem, mutable>, !ttg.memdesc<64x64xf16, #shared, #smem, mutable>
-    // expected-error@+1 {{GSan on AMD cannot check global-memory operation 'amdg.async_tdm_gather'}}
+    // CHECK: tti.experimental_gsan_indexed_tensordesc_access %arg0[%arg2
+    // CHECK: amdg.async_tdm_gather
     %gather = amdg.async_tdm_gather %desc[%indices] to %buf : tensor<64xi32, #idx>, !ttg.memdesc<64x64xf16, #shared, #smem, mutable> -> !tt.tensordesc<64x64xf16, #shared>
-    // expected-error@+1 {{GSan on AMD cannot check global-memory operation 'amdg.async_tdm_scatter'}}
+    // CHECK: tti.experimental_gsan_indexed_tensordesc_access %arg0[%arg2
+    // CHECK: amdg.async_tdm_scatter
     %scatter = amdg.async_tdm_scatter %desc[%indices] from %buf : tensor<64xi32, #idx>, !ttg.memdesc<64x64xf16, #shared, #smem, mutable> -> !tt.tensordesc<64x64xf16, #shared>
     tt.return
   }
@@ -302,6 +307,23 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // expected-error@+1 {{GSan on AMD requires 32 or 64 threads per warp (got 16)}}
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 16 : i32} {
   tt.func @invalid_wave_size() {
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#bar = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#parent = #ttg.blocked<{sizePerThread = [16, 1], threadsPerWarp = [1, 32], warpsPerCTA = [1, 4], order = [1, 0]}>
+#idx = #ttg.slice<{dim = 1, parent = #parent}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @indexed_completion_barriers(%desc: !tt.tensordesc<16x64xi32, #shared>, %buf: !ttg.memdesc<16x64xi32, #shared, #smem, mutable>, %indices: tensor<16xi32, #idx>, %barrier: !ttg.memdesc<1xi64, #bar, #smem, mutable>) {
+    // expected-error@+1 {{GSan on AMD does not support TDM completion barriers}}
+    %gather = amdg.async_tdm_gather %desc[%indices] to %buf, barrier = %barrier : tensor<16xi32, #idx>, !ttg.memdesc<16x64xi32, #shared, #smem, mutable>, !ttg.memdesc<1xi64, #bar, #smem, mutable> -> !tt.tensordesc<16x64xi32, #shared>
+    // expected-error@+1 {{GSan on AMD does not support TDM completion barriers}}
+    %scatter = amdg.async_tdm_scatter %desc[%indices] from %buf, barrier = %barrier : tensor<16xi32, #idx>, !ttg.memdesc<16x64xi32, #shared, #smem, mutable>, !ttg.memdesc<1xi64, #bar, #smem, mutable> -> !tt.tensordesc<16x64xi32, #shared>
     tt.return
   }
 }
