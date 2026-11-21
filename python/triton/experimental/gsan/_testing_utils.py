@@ -98,13 +98,18 @@ def load_one_i32(ptr, out_ptr):
 
 
 class ExplicitGraph:
-    """Small native graph launcher for GSan regression tests (no stream capture)."""
+    """Small CUDA/HIP graph launcher for GSan regression tests (no stream capture)."""
 
     def __init__(self, plan):
         import ctypes as C
 
         self.C = C
-        self.cuda = C.CDLL("libcuda.so.1")
+        self.hip = torch.version.hip is not None
+        if self.hip:
+            from triton.backends.amd.driver import _get_path_to_hip_runtime_dylib
+            self.cuda = C.CDLL(_get_path_to_hip_runtime_dylib())
+        else:
+            self.cuda = C.CDLL("libcuda.so.1")
         self.plan = plan
         self.graph = C.c_void_p()
         self.executable = C.c_void_p()
@@ -118,21 +123,46 @@ class ExplicitGraph:
                         ("args", C.POINTER(C.c_void_p)), ("extra", C.c_void_p), ("kernel", C.c_void_p),
                         ("context", C.c_void_p)]
 
+        if self.hip:
+
+            class Dim3(C.Structure):
+                _fields_ = [("x", C.c_uint), ("y", C.c_uint), ("z", C.c_uint)]
+
+            class HIPParams(C.Structure):
+                _fields_ = [("blockDim", Dim3), ("extra", C.c_void_p), ("func", C.c_void_p), ("gridDim", Dim3),
+                            ("kernelParams", C.POINTER(C.c_void_p)), ("shared", C.c_uint)]
+
+            self.Dim3 = Dim3
+            Params = HIPParams
         self.Params = Params
         self._call("cuGraphCreate", C.byref(self.graph), C.c_uint(0))
         begin, self.end_spec = plan.boundary_kernels
         self.begin_node = self._add(begin, ())
 
     def _call(self, name, *args):
+        if self.hip:
+            name = {
+                "cuGraphAddKernelNode_v2": "hipGraphAddKernelNode", "cuGraphExecKernelNodeSetParams_v2":
+                "hipGraphExecKernelNodeSetParams", "cuGraphInstantiateWithFlags": "hipGraphInstantiateWithFlags"
+            }.get(name, "hip" + name[2:])
         status = getattr(self.cuda, name)(*args)
         if status:
-            raise RuntimeError(f"{name} failed with CUDA error {status}")
+            detail = ""
+            if self.hip:
+                self.cuda.hipGetErrorString.restype = self.C.c_char_p
+                detail = ": " + self.cuda.hipGetErrorString(status).decode()
+            raise RuntimeError(f"{name} failed with GPU driver error {status}{detail}")
 
     def _params(self, spec):
         C = self.C
         values = (C.c_uint64 * len(spec.arguments))(*spec.arguments)
         pointers = (C.c_void_p * len(values))(*(C.addressof(values) + i * 8 for i in range(len(values))))
-        params = self.Params(spec.function, spec.grid, 1, 1, spec.block, 1, 1, spec.shared, pointers, None, None, None)
+        if self.hip:
+            params = self.Params(self.Dim3(spec.block, 1, 1), None, spec.function, self.Dim3(spec.grid, 1, 1), pointers,
+                                 spec.shared)
+        else:
+            params = self.Params(spec.function, spec.grid, 1, 1, spec.block, 1, 1, spec.shared, pointers, None, None,
+                                 None)
         return params, values, pointers
 
     def _add(self, spec, dependencies):
@@ -151,12 +181,16 @@ class ExplicitGraph:
         C = self.C
         index = len(self.nodes)
         node = self.plan.nodes[index]
+        if self.hip and node.programmatic_dependencies:
+            raise ValueError("HIP does not support NVIDIA programmatic graph dependencies")
         assert compiled.metadata.num_ctas == 1
         assert not compiled.metadata.global_scratch_size and not compiled.metadata.profile_scratch_size
         compiled._init_handles()
         self.compiled.append(compiled)
         values = tuple(arg.data_ptr() if hasattr(arg, "data_ptr") else arg for arg in arguments)
-        spec = KernelLaunch(compiled.function, grid, compiled.metadata.num_warps * 32, compiled.run.shared,
+        spec = KernelLaunch(compiled.function, grid,
+                            compiled.metadata.num_warps * getattr(compiled.metadata, "warp_size", 32),
+                            getattr(compiled.run, "shared", compiled.metadata.shared),
                             (*values, *self.plan.node_launch_args(index), 0, 0))
         deps = tuple(self.nodes[j] for j in node.dependencies)
         if not node.dependencies and not node.programmatic_dependencies:
@@ -180,13 +214,16 @@ class ExplicitGraph:
         if stream is None:
             stream = torch.cuda.current_stream()
         prepared = self.plan.prepare_launch(stream.cuda_stream, dependencies)
+        attempted_submission = False
         try:
             for node, spec in ((self.begin_node, prepared.begin), (self.end_node, prepared.end)):
                 params, _values, _pointers = self._params(spec)
                 self._call("cuGraphExecKernelNodeSetParams_v2", self.executable, node, C.byref(params))
+            attempted_submission = True
             self._call("cuGraphLaunch", self.executable, C.c_void_p(stream.cuda_stream))
         except BaseException:
-            prepared.finish(False)
+            # A launch error may follow partial submission; retain live storage.
+            prepared.finish(submitted=attempted_submission)
             raise
         prepared.finish()
         return prepared.completion

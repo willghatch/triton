@@ -2179,8 +2179,9 @@ def _graph_join_kernel(Left, Right, Output):
 
 @pytest.mark.parametrize("pdl", [False, True])
 @pytest.mark.parametrize("change_stream", [False, True])
-@pytest.mark.skipif(not is_hopper_or_newer(), reason="Graph PDL requires Hopper or newer")
 def test_explicit_graph_fork_join_replay(with_gsan, pdl, change_stream):
+    if pdl and not is_hopper_or_newer():
+        pytest.skip("Programmatic graph dependencies require NVIDIA Hopper or newer")
     from triton.experimental.gsan import graph
     from triton.experimental.gsan._testing_utils import ExplicitGraph
 
@@ -2202,8 +2203,8 @@ def test_explicit_graph_fork_join_replay(with_gsan, pdl, change_stream):
     kernels = [
         (_graph_copy_kernel.warmup(source, root, ADD=1, SIGNAL=pdl, grid=(n, ), num_warps=1), (source, root)),
         (_graph_copy_kernel.warmup(root, left, ADD=2, grid=(n, ), num_warps=1), (root, left)),
-        (_graph_copy_kernel.warmup(root, right, ADD=3, WAIT=pdl, launch_pdl=pdl, grid=(n, ),
-                                   num_warps=1), (root, right)),
+        (_graph_copy_kernel.warmup(root, right, ADD=3, WAIT=pdl, **({"launch_pdl": pdl} if is_cuda() else {}),
+                                   grid=(n, ), num_warps=1), (root, right)),
         (_graph_join_kernel.warmup(left, right, result, grid=(n, ), num_warps=1), (left, right, result)),
     ]
     properties = triton.runtime.driver.active.utils.get_device_properties(torch.cuda.current_device())
@@ -2212,8 +2213,9 @@ def test_explicit_graph_fork_join_replay(with_gsan, pdl, change_stream):
         for compiled, arguments in kernels:
             executable.add_kernel(compiled, arguments, n)
             # Graph nodes bypass the eager launcher but need the same reservation.
-            assert executable.parameters[-1][0].shared == compiled.run.shared
-            assert 2 * compiled.run.shared > properties["max_shared_mem_per_multiprocessor"]
+            assert executable.parameters[-1][0].shared == getattr(compiled.run, "shared", compiled.metadata.shared)
+            if is_cuda():
+                assert 2 * compiled.run.shared > properties["max_shared_mem_per_multiprocessor"]
         executable.instantiate()
         # Consume an eager producer before replay and feed an eager consumer after.
         _write_blocks_kernel[(4, )](source, n, BLOCK_SIZE=128)
@@ -2230,7 +2232,6 @@ def test_explicit_graph_fork_join_replay(with_gsan, pdl, change_stream):
         assert torch.all(source == 9)
 
 
-@pytest.mark.skipif(not is_cuda(), reason="GSan requires CUDA")
 def test_graph_completion_is_immutable_across_stream_slot_reuse(with_gsan):
     from triton.experimental.gsan import graph, _stream_sync
 
@@ -2250,7 +2251,6 @@ def test_graph_completion_is_immutable_across_stream_slot_reuse(with_gsan):
     assert not torch.equal(snapshot.clock, _stream_sync._current_stream_clock(device, stream))
 
 
-@pytest.mark.skipif(not is_cuda(), reason="GSan graph support uses the CUDA driver API; HIP graph capture is rejected")
 def test_explicit_graph_aborted_launch_preserves_stream_order(with_gsan):
     from triton.experimental.gsan import graph, _stream_sync
 
@@ -2269,7 +2269,39 @@ def test_explicit_graph_aborted_launch_preserves_stream_order(with_gsan):
     plan.close()
 
 
-@pytest.mark.skipif(not is_cuda(), reason="GSan graph support uses the CUDA driver API; HIP graph capture is rejected")
+@pytest.mark.skipif(not is_hip(), reason="Uses HIP native invalid-executable rejection")
+def test_explicit_graph_native_rejection_preserves_stream_order(with_gsan, monkeypatch):
+    from triton.experimental.gsan import graph, _stream_sync
+    from triton.experimental.gsan._testing_utils import ExplicitGraph
+
+    device = torch.cuda.current_device()
+    stream = torch.cuda.current_stream().cuda_stream
+    values = torch.zeros(512, device="cuda", dtype=torch.int32)
+    result = torch.empty_like(values)
+    _write_blocks_kernel[(4, )](values, values.numel(), BLOCK_SIZE=128)
+    expected = _stream_sync._current_stream_clock(device, stream).clone()
+    with ExplicitGraph(graph.GraphPlan(device, ())) as executable:
+        executable.instantiate()
+        native_call = executable._call
+
+        def reject_launch(name, *args):
+            # Node updates succeed; the actual HIP launch rejects a null exec.
+            if name == "cuGraphLaunch":
+                args = (executable.C.c_void_p(), *args[1:])
+            return native_call(name, *args)
+
+        monkeypatch.setattr(executable, "_call", reject_launch)
+        with pytest.raises(RuntimeError, match="hipGraphLaunch failed"):
+            executable.launch()
+        # Consume the expected HIP last-error status before further torch work.
+        executable.cuda.hipGetLastError()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(_stream_sync._current_stream_clock(device, stream), expected)
+        _graph_copy_kernel[(values.numel(), )](values, result, ADD=0, num_warps=1)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(result, values.flip(0))
+
+
 def test_explicit_graph_storage_survives_executable_close(with_gsan):
     import gc
     import weakref

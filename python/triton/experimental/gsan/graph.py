@@ -1,7 +1,7 @@
-"""Explicit CUDA graph ordering for external launchers.
+"""Explicit GPU graph ordering for external launchers.
 
-The caller owns CUDA graph construction and must install the returned boundary
-kernels with full entry/exit edges. CUDA events remain the caller's responsibility:
+The caller owns GPU graph construction and must install the returned boundary
+kernels with full entry/exit edges. GPU events remain the caller's responsibility:
 a Completion describes a real dependency, it does not establish one by itself.
 """
 from __future__ import annotations
@@ -89,7 +89,7 @@ def _merge_clocks(Inputs, Output, num_inputs, N: tl.constexpr, BLOCK: tl.constex
 
 @dataclass(frozen=True)
 class KernelLaunch:
-    """Native CUDA kernel parameters. Every argument is an eight-byte value."""
+    """Native GPU kernel parameters. Every argument is an eight-byte value."""
     function: int
     grid: int
     block: int
@@ -101,8 +101,9 @@ def _kernel_launch(compiled, grid, arguments):
     compiled._init_handles()
     if compiled.metadata.global_scratch_size or compiled.metadata.profile_scratch_size:
         raise RuntimeError("GSan graph helpers must not require scratch allocations")
-    return KernelLaunch(compiled.function, grid, compiled.metadata.num_warps * 32, compiled.run.shared,
-                        (*arguments, 0, 0))
+    return KernelLaunch(compiled.function, grid,
+                        compiled.metadata.num_warps * getattr(compiled.metadata, "warp_size", 32),
+                        getattr(compiled.run, "shared", compiled.metadata.shared), (*arguments, 0, 0))
 
 
 def _collect_pending():
@@ -117,6 +118,7 @@ def _retain_until_stream_completes(device, stream, owner):
         event = torch.cuda.Event()
         event.record()
     _pending.append((event, owner))
+    return event
 
 
 class Completion:
@@ -148,18 +150,22 @@ class GraphLaunch:
             if not submitted:
                 with sync._clock_storage(self.plan.device, self.stream):
                     self.after.copy_(self.before)
-            _retain_until_stream_completes(self.plan.device, self.stream, self)
+            event = _retain_until_stream_completes(self.plan.device, self.stream, self)
+            if submitted:
+                self.plan._last_submission = event
             self._finished = True
 
 
 class GraphPlan:
-    """Clock storage owned by one CUDA executable graph.
+    """Clock storage owned by one GPU executable graph.
 
     Install ``boundary_kernels`` before instantiation. Add a full edge from the
     entry helper to every original root and from every original node to the exit
     helper. Before each launch patch both helpers from ``prepare_launch``; call
     ``GraphLaunch.finish`` immediately after submission. Node launch arguments
-    remain unchanged across replays and kernel-argument rebinding.
+    remain unchanged across replays and kernel-argument rebinding. HIP replays of
+    one plan are serialized with completion events, including across streams.
+    Programmatic dependencies require NVIDIA hardware.
     """
 
     def __init__(self, device: int, nodes, stream: int = 0):
@@ -167,8 +173,16 @@ class GraphPlan:
 
         self.device = device
         self.nodes = tuple(nodes)
+        self._hip = torch.version.hip is not None
+        if self._hip and any(node.programmatic_dependencies for node in self.nodes):
+            raise ValueError("HIP does not support NVIDIA programmatic graph dependencies")
+        self._last_submission = None
         self.entries, self.waits = dependency_frontiers(self.nodes)
         self.closed = False
+        # Empty graphs still need mapped participant state before clock allocation.
+        from ._allocator import gsan_malloc, gsan_free
+        bootstrap = gsan_malloc(1, device, stream)
+        gsan_free(bootstrap, device, 1, stream)
         self.num_threads = sync._runtime_state_layout(get_device_rank(device), device).num_threads
         self.global_state = get_global_state_pointer() + get_device_rank(device) * PER_DEVICE_STATE_STRIDE_BYTES
         with sync._clock_storage(device, stream), triton.knobs.compilation.scope():
@@ -222,6 +236,12 @@ class GraphPlan:
         if any(dep.device != self.device for dep in dependencies):
             raise ValueError("GSan graph completion belongs to another device")
         _collect_pending()
+        # The same plan reuses output and last-clock storage on every replay.
+        # Establish the inter-replay dependency explicitly on HIP rather than
+        # relying on driver serialization before importing self.last.
+        with sync._clock_storage(self.device, stream):
+            if self._hip and self._last_submission is not None:
+                torch.cuda.current_stream().wait_event(self._last_submission)
         before, after = sync._next_stream_clocks(self.device, stream)
         with sync._clock_storage(self.device, stream):
             torch.cuda.current_stream().wait_event(self._ready)
@@ -231,6 +251,9 @@ class GraphPlan:
                 dtype=torch.int64)
             completion = Completion(self.device, torch.empty_like(self.baseline))
             begin, end = self._boundary(inputs, len(dependencies) + 2, after, completion.clock)
+            # A rejected or partial submission may never reach the exit helper.
+            # Preserve existing eager ordering without importing any graph clock.
+            after.copy_(before)
             # Commit the reservation only after every fallible preparation step.
             # External launchers must serialize preparation and submission.
             sync._reserve_stream_clocks(self.device, stream)
@@ -251,7 +274,7 @@ def record_completion(device: int, stream: int) -> Completion:
 
 
 def acquire_completions(device: int, stream: int, dependencies):
-    """Import snapshots after the caller has enqueued the matching CUDA waits."""
+    """Import snapshots after the caller has enqueued the matching GPU waits."""
     import torch
 
     dependencies = tuple(dependencies)

@@ -991,7 +991,6 @@ def test_pool_partial_tma_tail_restrictions(shadow_granularity):
                       error="GSan 16-byte pools require complete aligned 16-byte accesses", runner_args=("tma_tail", ))
 
 
-@pytest.mark.skipif(not is_cuda(), reason="GSan graph support uses the CUDA driver API; HIP graph capture is rejected")
 def test_explicit_graph_unordered_nodes_report_race():
     _run_failure_case("graph_unordered", runner=_run_explicit_graph_failure_case, runner_args=("unordered", ),
                       source_function=_graph_unordered_write_kernel.fn, marker="tl.store(payload + pid, 1)",
