@@ -826,12 +826,17 @@ def _run_failure_case(case: str, shadow_granularity: int | None = None, *, runne
                                                   f"exc={result.exc!r}\n"
                                                   f"driver stderr:\n{result.driver_stderr_output}")
     if is_hip():
-        # The device trap either aborts the process with a signal or, with
-        # HIP_SKIP_ABORT_ON_GPU_ERROR (set by run_in_process), surfaces as a
-        # launch failure. Any other Python-level error is not a GSan report.
+        # HIP_SKIP_ABORT_ON_GPU_ERROR can surface a trap as launch failure or
+        # hipErrorIllegalAddress. Require the sanitizer's exact diagnostic and
+        # source location for the latter, so an unrelated memory fault cannot
+        # stand in for the expected GSan report.
         aborted = getattr(result.exc, "exitcode", 0) < 0
-        assert aborted or "launch failure" in str(result.exc), (f"case={case} did not fail with a device trap: "
-                                                                f"{result.exc!r}")
+        diagnostic = f"GSan device assertion failed: '{error}' at "
+        reported_illegal_address = "hipErrorIllegalAddress" in str(result.exc) and any(
+            line.startswith(diagnostic) and line.endswith(_expected_file_line(source_function, marker))
+            for line in result.driver_stderr_output.splitlines())
+        assert aborted or "launch failure" in str(
+            result.exc) or reported_illegal_address, (f"case={case} did not fail with a device trap: {result.exc!r}")
     assert "GSanLibrary.cu" not in result.driver_stderr_output
     assert Path(inspect.getsourcefile(source_function)).name in result.driver_stderr_output
     assert _expected_file_line(source_function, marker) in result.driver_stderr_output

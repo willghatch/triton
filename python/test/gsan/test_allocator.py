@@ -8,7 +8,7 @@ import triton
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
-from triton._internal_testing import is_cuda, is_hip, run_in_process
+from triton._internal_testing import is_cuda, is_hip, is_hip_cdna5, run_in_process
 from triton.experimental.gsan import ShareableHandleType, configure, create_mem_pool, freeze_config, get_allocator, has_live_allocations, reset
 from triton.experimental.gsan import _stream_sync
 from triton._C.libtriton.gsan_testing import (PER_DEVICE_STATE_STRIDE_BYTES, shadow_cell_address, shadow_granularity as
@@ -39,8 +39,8 @@ def has_gsan_allocator():
     return is_cuda() or is_hip()
 
 
-# Allocator-only tests also run on HIP. Tests that launch GSan-instrumented
-# kernels or use fabric handles require CUDA.
+# Allocator and ordinary GSan lifecycle tests also run on HIP.
+# Fabric handles and CUDA-specific configuration retain their own guards.
 requires_gsan_allocator = pytest.mark.skipif(not has_gsan_allocator(), reason="requires CUDA or HIP backend")
 
 # With 2 MiB pages, this rounds to a 6 MiB allocation inside an 8 MiB tree node.
@@ -454,7 +454,7 @@ def test_has_live_allocations(shadow_granularity):
     assert result.exc is None
 
 
-@pytest.mark.skipif(not is_cuda(), reason="requires CUDA backend")
+@requires_gsan_allocator
 def test_reset_rejects_live_allocations(shadow_granularity):
     result = run_in_process(_run_reset_rejects_live_allocations_check, args=(shadow_granularity, ))
     assert result.exc is None
@@ -466,13 +466,13 @@ def test_reset_collects_unreachable_allocations(shadow_granularity):
     assert result.exc is None
 
 
-@pytest.mark.skipif(not is_cuda(), reason="requires CUDA backend")
+@requires_gsan_allocator
 def test_reset_reinitializes_runtime_state(shadow_granularity):
     result = run_in_process(_run_reset_reinitializes_runtime_state_check, args=(shadow_granularity, ))
     assert result.exc is None
 
 
-@pytest.mark.skipif(not is_cuda(), reason="requires CUDA backend")
+@requires_gsan_allocator
 @pytest.mark.parametrize("num_pools", [1, 2])
 def test_reset_releases_cached_pool_clocks(num_pools, shadow_granularity):
     result = run_in_process(_run_reset_releases_cached_pool_clocks_check, args=(num_pools, shadow_granularity))
@@ -1114,3 +1114,80 @@ def test_graph_capture_is_rejected():
 def test_num_slots_rejected_on_cuda():
     with pytest.raises(ValueError, match="num_slots is only supported on the HIP backend"):
         configure(num_slots=64)
+
+
+@gluon.jit
+def _slot_disjoint_write_kernel(ptr, WIDTH: gl.constexpr):
+    offsets = gl.program_id(0) * WIDTH + gl.arange(0, WIDTH, layout=gl.BlockedLayout([1], [32], [4], [0]))
+    gl.store(ptr + offsets, offsets + 1)
+
+
+def _run_slot_oversubscription_check():
+    device = torch.cuda.current_device()
+    configure(device_ranks={device: 0}, num_devices=1, num_slots=2, clock_buffer_size=8)
+    pool = create_mem_pool()
+    streams = [torch.cuda.Stream() for _ in range(2)]
+    targets = []
+    for stream in streams:
+        with torch.cuda.stream(stream), torch.cuda.use_mem_pool(pool), triton.knobs.compilation.scope():
+            triton.knobs.compilation.instrumentation_mode = "gsan"
+            target = torch.empty(4096, dtype=torch.int32, device="cuda")
+            targets.append(target)
+            # Far more blocks than slots, across independent concurrent streams.
+            # The disjoint payload must remain clean as identities are recycled.
+            for _ in range(3):
+                _slot_disjoint_write_kernel[(128, )](target, 32, num_warps=4)
+    torch.cuda.synchronize()
+    for target in targets:
+        torch.testing.assert_close(target, torch.arange(1, 4097, dtype=torch.int32, device="cuda"))
+        clocks = [shadow_cell_from_address(target.data_ptr() + 128 * i).write_clock for i in range(128)]
+        assert all(0 <= clock.thread_id < 2 and clock.epoch > 0 for clock in clocks)
+    layout = get_runtime_state_layout(device)
+    slots = uint8_cuda_tensor_from_ptr(layout["slot_table_ptr"], 2 * layout["slot_entry_bytes"], device)
+    # Ownership words must be released even when two streams contend.
+    assert torch.count_nonzero(slots.view(torch.int32).reshape(2, -1)[:, 0]).item() == 0
+
+
+@pytest.mark.skipif(not is_hip_cdna5(), reason="wave32 slot stress requires AMD gfx1250")
+def test_slot_oversubscription_concurrent_streams():
+    result = run_in_process(_run_slot_oversubscription_check)
+    assert result.exc is None, result.driver_stderr_output
+
+
+@gluon.jit
+def _stale_release_history_kernel(flag, scratch, arrived, done, out):
+    if gl.program_id(0) == 0:
+        while gl.atomic_add(arrived, 0, sem="relaxed") != 1:
+            pass
+        gl.atomic_store(flag, 1, sem="release")
+        for _ in range(16):
+            gl.atomic_add(scratch, 1, sem="release")
+        gl.atomic_store(done, 1, sem="relaxed")
+        # Retain the identity until the consumer checks the old snapshot.
+        while gl.atomic_add(arrived, 0, sem="relaxed") != 2:
+            pass
+    else:
+        gl.atomic_add(arrived, 1, sem="relaxed")
+        while gl.atomic_add(done, 0, sem="relaxed") != 1:
+            pass
+        value = gl.atomic_load(flag, sem="acquire")
+        gl.store(out, value)
+        gl.atomic_add(arrived, 1, sem="relaxed")
+
+
+def _run_stale_release_history_check():
+    configure(device_ranks={torch.cuda.current_device(): 0}, num_devices=1, num_slots=2, clock_buffer_size=8)
+    pool = create_mem_pool()
+    with torch.cuda.use_mem_pool(pool), triton.knobs.compilation.scope():
+        triton.knobs.compilation.instrumentation_mode = "gsan"
+        flag, scratch, arrived, done, out = [torch.zeros(1, dtype=torch.int32, device="cuda") for _ in range(5)]
+        _stale_release_history_kernel[(2, )](flag, scratch, arrived, done, out, num_warps=1)
+        torch.cuda.synchronize()
+
+
+@pytest.mark.skipif(not is_hip(), reason="bounded slot identity setup is HIP-only")
+def test_clock_history_overwrite_reports_error():
+    from test_gsan_failures import _run_failure_case
+    _run_failure_case("stale_release_history", runner=_run_stale_release_history_check,
+                      source_function=_stale_release_history_kernel.fn, marker='value = gl.atomic_load(flag',
+                      error="GSan clock buffer token overwritten")

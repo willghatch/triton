@@ -7,7 +7,7 @@ import triton.language as tl
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
-from triton._internal_testing import is_blackwell, is_cuda, is_hopper_or_newer, is_sm12x
+from triton._internal_testing import is_blackwell, is_cuda, is_hip_cdna5, is_hopper_or_newer, is_sm12x
 from triton.experimental.gsan import create_mem_pool
 from triton.experimental.gsan._testing_utils import shadow_cell_from_address, shadow_tensor_for
 from triton.tools.tensor_descriptor import TensorDescriptor
@@ -22,7 +22,7 @@ from test_gsan import (
 
 # These tests exercise write-once cell coverage, not the general ordering matrix.
 pytestmark = [
-    pytest.mark.skipif(not is_cuda(), reason="requires CUDA backend"),
+    pytest.mark.skipif(not (is_cuda() or is_hip_cdna5()), reason="requires CUDA or AMD gfx1250 backend"),
     pytest.mark.parametrize("shadow_granularity", [1, 2, 4, 8, 16], indirect=True),
 ]
 

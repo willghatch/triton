@@ -9,13 +9,13 @@ import triton.language as tl
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
-from triton._internal_testing import is_cuda, is_hopper_or_newer
+from triton._internal_testing import is_cuda, is_hip_cdna5, is_hopper_or_newer
 from triton.experimental.gsan import create_mem_pool
 from triton.experimental.gsan._allocator import get_reserve_pointer, get_reserve_size
 from triton.tools.tensor_descriptor import TensorDescriptor
 from test_gsan_failures import _raw_kernel, _run_failure_case
 
-pytestmark = pytest.mark.skipif(not is_cuda(), reason="requires CUDA backend")
+pytestmark = pytest.mark.skipif(not (is_cuda() or is_hip_cdna5()), reason="requires CUDA or AMD gfx1250 backend")
 
 
 @contextlib.contextmanager
@@ -121,7 +121,8 @@ def test_write_once_rejects_invalid_cell_access(case, marker, error, shadow_gran
 @pytest.mark.parametrize("case,marker,error", [
     ("cross_kernel", "gl.store(ptr + offsets, 3)", "Write-once memory written more than once"),
     ("cache_reuse", "gl.store(ptr + offsets, 3)", "Write-once memory written more than once"),
-    ("alias", "gl.store(ptr + offsets, 3)", "Write-once memory written more than once"),
+    pytest.param("alias", "gl.store(ptr + offsets, 3)", "Write-once memory written more than once",
+                 marks=pytest.mark.skipif(not is_cuda(), reason="POSIX allocation handles require CUDA")),
     ("atomic_load", "value = gl.atomic_load", "Atomic operations on write-once memory are not supported"),
     ("atomic_store", "gl.atomic_store", "Atomic operations on write-once memory are not supported"),
     ("atomic_rmw", "gl.atomic_add", "Atomic operations on write-once memory are not supported"),
