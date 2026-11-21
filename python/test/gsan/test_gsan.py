@@ -232,7 +232,7 @@ def test_load_store_updates_shadow(with_gsan):
 @gluon.jit
 def _disjoint_access_kernel(ptr, out, counter, KIND: gl.constexpr, CELL_BYTES: gl.constexpr):
     pid = gl.program_id(0)
-    offsets = gl.arange(0, 128, layout=gl.BlockedLayout([16], [32], [1], [0]))
+    offsets = gl.arange(0, 128, layout=gl.BlockedLayout([16], [THREADS_PER_WARP], [1], [0]))
     mask = offsets // CELL_BYTES % 2 == pid
     if pid == 1:
         while gl.atomic_add(counter, 0, sem="relaxed") == 0:
@@ -246,7 +246,7 @@ def _disjoint_access_kernel(ptr, out, counter, KIND: gl.constexpr, CELL_BYTES: g
         gl.atomic_add(counter, 1, sem="relaxed")
 
 
-@pytest.mark.skipif(not is_cuda(), reason="GSan requires CUDA")
+@requires_gsan
 @pytest.mark.parametrize("kind", ["raw", "war", "waw"])
 @pytest.mark.parametrize("shadow_granularity", [1, 2, 4, 8, 16], indirect=True)
 def test_disjoint_masked_accesses(fresh_knobs, shadow_granularity, kind):
@@ -270,37 +270,60 @@ def test_disjoint_masked_accesses(fresh_knobs, shadow_granularity, kind):
         read_mask = ~first_cta if kind == "raw" else first_cta
         torch.testing.assert_close(out[read_mask], expected[read_mask])
 
+    # Inspect all cells, including cells masked off in each participating block.
+    for offset in range(0, target.numel(), shadow_granularity):
+        reader = (kind == "raw" and offset // shadow_granularity % 2 == 1
+                  or kind == "war" and offset // shadow_granularity % 2 == 0)
+        cell = shadow_cell_from_address(target.data_ptr() + offset)
+        assert (cell.num_reads > 0) == reader
+        if reader:
+            assert cell.write_clock == ScalarClock(0, 0, AtomicScope.NON_ATOMIC)
+        else:
+            assert cell.write_clock.epoch != 0
+            assert cell.write_clock.scope == AtomicScope.NON_ATOMIC
+        output_cell = shadow_cell_from_address(out.data_ptr() + offset)
+        if reader:
+            assert output_cell.write_clock.epoch != 0
+        else:
+            assert output_cell.write_clock == ScalarClock(0, 0, AtomicScope.NON_ATOMIC)
+
 
 @triton.jit
 def _byte_pool_atomic_kernel(ptr):
     tl.atomic_add(ptr, 1, sem="acq_rel")
 
 
-@pytest.mark.skipif(not is_cuda(), reason="GSan requires CUDA")
+@requires_gsan
 @pytest.mark.gsan_fine_granularity("16-byte pools do not support atomics")
 @pytest.mark.parametrize(
     "dtype,shadow_granularity",
     [(dtype, g) for dtype in (torch.float16, torch.int32, torch.int64) for g in (1, 2, 4, 8) if g <= dtype.itemsize],
     indirect=["shadow_granularity"])
 def test_atomic_updates_every_shadow_cell(with_gsan, dtype):
-    target = torch.zeros(1, dtype=dtype, device="cuda")
-    _byte_pool_atomic_kernel[(1, )](target, num_warps=1)
-    assert target.item() == 1
+    target = torch.zeros(3, dtype=dtype, device="cuda")
+    _byte_pool_atomic_kernel[(1, )](target[1:], num_warps=1)
+    torch.testing.assert_close(target, torch.tensor([0, 1, 0], dtype=dtype, device="cuda"))
     for offset in range(0, target.element_size(), with_gsan):
-        cell = shadow_cell_from_address(target.data_ptr() + offset)
+        cell = shadow_cell_from_address(target.data_ptr() + target.element_size() + offset)
         assert cell.write_clock.is_release
         assert cell.write_clock.scope == AtomicScope.GPU
         assert cell.num_reads == 1
 
+    for index in (0, 2):
+        for offset in range(0, target.element_size(), with_gsan):
+            cell = shadow_cell_from_address(target.data_ptr() + index * target.element_size() + offset)
+            assert cell.write_clock == ScalarClock(0, 0, AtomicScope.NON_ATOMIC)
+            assert cell.num_reads == 0
+
 
 @gluon.jit
 def _mixed_pool_store_kernel(pointers):
-    offsets = gl.arange(0, 512, layout=gl.BlockedLayout([16], [32], [1], [0]))
+    offsets = gl.arange(0, 512, layout=gl.BlockedLayout([16], [THREADS_PER_WARP], [1], [0]))
     for i in gl.static_range(len(pointers)):
         gl.store(pointers[i] + offsets, i + 1)
 
 
-@pytest.mark.skipif(not is_cuda(), reason="GSan requires CUDA")
+@requires_gsan
 def test_mem_pools_mix_granularities_in_one_kernel(fresh_knobs):
     triton.knobs.compilation.instrumentation_mode = "gsan"
     combinations = [(g, w) for g in (1, 2, 4, 8, 16) for w in (False, True)]
@@ -310,10 +333,11 @@ def test_mem_pools_mix_granularities_in_one_kernel(fresh_knobs):
         with torch.cuda.use_mem_pool(pool):
             tensors.append(torch.zeros(512, dtype=torch.uint8, device="cuda"))
     _mixed_pool_store_kernel[(1, )](tuple(tensors), num_warps=1)
-    for i, (tensor, (_, write_once)) in enumerate(zip(tensors, combinations)):
+    for i, (tensor, (granularity, write_once)) in enumerate(zip(tensors, combinations)):
         torch.testing.assert_close(tensor, torch.full_like(tensor, i + 1))
-        cell = shadow_cell_from_address(tensor.data_ptr())
-        assert (cell if write_once else cell.write_clock).epoch != 0
+        for offset in range(0, tensor.numel(), granularity):
+            cell = shadow_cell_from_address(tensor.data_ptr() + offset)
+            assert (cell if write_once else cell.write_clock).epoch != 0
 
 
 @requires_gsan
@@ -1175,7 +1199,7 @@ def test_atomic_load_only_records_read(with_gsan, dtype, sem, scope, expected_sc
     _assert_atomic_read_only_shadow(target.data_ptr(), expected_scope)
 
 
-@pytest.mark.skipif(not is_cuda(), reason="GSan requires CUDA")
+@requires_gsan
 @pytest.mark.parametrize("op", ["load", "store"])
 @pytest.mark.parametrize("dtype,shadow_granularity",
                          [(dtype, g)
@@ -1186,7 +1210,7 @@ def test_atomic_load_store_vectorized_shadow(with_gsan, op, dtype):
 
     @gluon.jit
     def kernel(Src, Out, STORE: gl.constexpr):
-        x = gl.arange(0, 256, layout=gl.BlockedLayout([8], [32], [1], [0]))
+        x = gl.arange(0, 256, layout=gl.BlockedLayout([8], [THREADS_PER_WARP], [1], [0]))
         mask = x // 8 % 2 == 0
         if STORE:
             values = gl.load(Src + x)
@@ -1201,9 +1225,10 @@ def test_atomic_load_store_vectorized_shadow(with_gsan, op, dtype):
 
     mask = torch.arange(256, device="cuda") // 8 % 2 == 0
     assert torch.equal(out, torch.where(mask, src, -1))
-    suffix = "b64" if dtype == torch.float64 else "v2.b32"
-    opcode = "st" if op == "store" else "ld"
-    assert f"{opcode}.relaxed.gpu.global.{suffix}" in compiled.asm["ptx"]
+    if is_cuda():
+        suffix = "b64" if dtype == torch.float64 else "v2.b32"
+        opcode = "st" if op == "store" else "ld"
+        assert f"{opcode}.relaxed.gpu.global.{suffix}" in compiled.asm["ptx"]
     target = out if op == "store" else src
     target_ptr = target.data_ptr()
     granularity = get_shadow_granularity(target_ptr)
