@@ -72,14 +72,15 @@ MemoryAccess getMemoryAccess(Operation *op) {
 
 // Synchronization operations that GSan does not model on AMD; they touch
 // shared memory only, so the global-memory check misses them.
-// cond_barrier phase-shifts warps (block pingpong, warp pipelining), which
-// the GSan instrumentation has not been validated with.
+// Single-CTA MI450 regions retain one logical block participant. Scheduling
+// barriers preserve hardware participation without importing global clocks.
 bool isUnsupportedSync(Operation *op, bool localBarriersSupported) {
   if (isa<amdgpu::InitBarrierOp, amdgpu::WaitBarrierOp, amdgpu::ArriveBarrierOp,
           amdgpu::AsyncCopyMbarrierArriveOp>(op))
     return !localBarriersSupported;
-  return isa<amdgpu::ClusterBarrierArriveOp, amdgpu::ClusterBarrierWaitOp,
-             amdgpu::CondBarrierOp>(op);
+  if (isa<amdgpu::CondBarrierOp>(op))
+    return !localBarriersSupported;
+  return isa<amdgpu::ClusterBarrierArriveOp, amdgpu::ClusterBarrierWaitOp>(op);
 }
 
 bool isWarpPipelined(Operation *op) {
@@ -95,8 +96,9 @@ struct TritonAMDGPUGSanRejectUnsupportedPass
     // Like NVIDIA single-CTA GSan, ordinary AMD logical blocks share one
     // participant clock. Local named/completion barriers retain their hardware
     // semantics without importing clocks from any other block. Global async
-    // accesses remain checked at issue time. Partial regions and clusters need
-    // separate participation/clock contracts and are rejected below.
+    // accesses remain checked at issue time in every active region. MI450
+    // init/exit synchronize the default region explicitly; cluster participant
+    // contracts remain unsupported.
     auto target = mod->getAttrOfType<StringAttr>(ttg::AttrTargetName);
     bool localBarriersSupported = target &&
                                   target.getValue() == "hip:gfx1250" &&
@@ -117,12 +119,12 @@ struct TritonAMDGPUGSanRejectUnsupportedPass
       failed = true;
     }
     mod.walk([&](Operation *op) {
-      if (isa<ttg::WarpSpecializeOp>(op)) {
+      if (isa<ttg::WarpSpecializeOp>(op) && !localBarriersSupported) {
         op->emitError("GSan on AMD does not support warp specialization");
         failed = true;
         return;
       }
-      if (isWarpPipelined(op)) {
+      if (isWarpPipelined(op) && !localBarriersSupported) {
         op->emitError("GSan on AMD does not support warp pipelining");
         failed = true;
         return;

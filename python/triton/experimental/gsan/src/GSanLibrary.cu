@@ -209,11 +209,14 @@ GSAN_DEVICE bool useSystemScopeShadowLocks(ThreadState *state) {
 
 GSAN_DEVICE uint32_t getLaneId() { return gsanLaneId(); }
 
-// Whole-workgroup barrier; AMD has no named or partial barriers. The fences
+// Whole-workgroup barrier for cooperative runtime calls. Serial init/exit
+// uses a sentinel because its barriers must remain visible in compiler IR,
+// where warp specialization substitutes the active region barrier. The fences
 // are agent scope so that the slot hand-off at kernel exit also publishes
 // thread-state writes of all waves (the next owner may run on another XCD).
 GSAN_DEVICE void syncThreads(uint32_t barrierId, uint32_t numThreads) {
-  (void)barrierId;
+  if (barrierId == ~0u)
+    return;
   (void)numThreads;
   __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
   __builtin_amdgcn_s_barrier();

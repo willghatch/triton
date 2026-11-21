@@ -482,13 +482,14 @@ def _gluon_ws_completion_kernel(out_ptr):
     ], [4], [24])
 
 
-@pytest.mark.skipif(not is_cuda(), reason="warp specialization under GSan requires CUDA")
+@pytest.mark.skipif(not (is_cuda() or is_hip_cdna5()), reason="requires CUDA or MI450 warp specialization")
 def test_gluon_warp_specialize_completes(with_gsan):
     expected = torch.arange(256, dtype=torch.int32, device="cuda")
 
     out = torch.full((256, ), -1, dtype=torch.int32, device="cuda")
     compiled = _gluon_ws_completion_kernel[(1, )](out, num_warps=4)
-    assert 'asm sideeffect "barrier.sync $0, $1;"' in compiled.asm["llir"]
+    if is_cuda():
+        assert 'asm sideeffect "barrier.sync $0, $1;"' in compiled.asm["llir"]
     torch.cuda.synchronize()
     torch.testing.assert_close(out, expected)
 

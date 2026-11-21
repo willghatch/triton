@@ -296,8 +296,8 @@ Value createGSanStackBuffer(ConversionPatternRewriter &rewriter, Location loc,
   return castToGenericPointer(rewriter, loc, buffer);
 }
 
-// Named-barrier ID for the runtime's block barriers in init/exit. The AMD
-// runtime ignores it and uses a whole-workgroup s_barrier.
+// Named-barrier ID for NVIDIA cooperative runtime barriers. AMD init/exit
+// uses serial calls and explicit IR barriers so region lowering sees them.
 Value getGSanBarrierId(ConversionPatternRewriter &rewriter, Location loc,
                        const TargetInfoBase &targetInfo) {
   if (targetInfo.isCuda())
@@ -1278,9 +1278,25 @@ public:
     auto numThreads = b.i32_val(ttg::lookupNumWarps(op) *
                                 ttg::lookupThreadsPerWarp(rewriter));
     Value barrierId = getGSanBarrierId(rewriter, loc, *targetInfo);
-    b.call(runtimeFunc, ValueRange{*gsanGlobalStatePtr, *launchTablePtr,
-                                   *launchIndex, threadIdx, numThreads,
-                                   barrierId, sourceLoc.file, sourceLoc.line});
+    if (targetInfo->isCuda()) {
+      b.call(runtimeFunc,
+             ValueRange{*gsanGlobalStatePtr, *launchTablePtr, *launchIndex,
+                        threadIdx, numThreads, barrierId, sourceLoc.file,
+                        sourceLoc.line});
+    } else {
+      // Keep synchronization visible to warp-specialization lowering. Its
+      // default group initializes the block clock before the dispatch barrier
+      // releases worker regions. Runtime-internal whole-CTA barriers would
+      // wait for workers already parked in the dispatch loop.
+      Value leader = b.icmp_eq(threadIdx, b.i32_val(0));
+      emitPredicated(rewriter, loc, leader, ValueRange{}, [&] {
+        b.call(runtimeFunc,
+               ValueRange{*gsanGlobalStatePtr, *launchTablePtr, *launchIndex,
+                          b.i32_val(0), b.i32_val(1), b.i32_val(-1),
+                          sourceLoc.file, sourceLoc.line});
+        return SmallVector<Value>{};
+      });
+    }
     b.barrier(ttg::AddrSpace::Local);
     rewriter.eraseOp(op);
     return success();
@@ -1324,7 +1340,22 @@ struct GSanStreamClockOpConversion : public ConvertOpToLLVMPattern<OpTy> {
       auto sourceLoc = materializeSourceLocation(rewriter, loc);
       args.append({sourceLoc.file, sourceLoc.line});
     }
-    b.call(runtimeFunc, args);
+    if (targetInfo->isCuda()) {
+      b.call(runtimeFunc, args);
+    } else {
+      // Region work has joined the default group before kernel exit. Serialize
+      // publication and slot release on its leader, then reconverge the group.
+      b.barrier(ttg::AddrSpace::Local);
+      Value leader = b.icmp_eq(threadIdx, b.i32_val(0));
+      args[3] = b.i32_val(0);
+      args[4] = b.i32_val(1);
+      args[5] = b.i32_val(-1);
+      emitPredicated(rewriter, loc, leader, ValueRange{}, [&] {
+        b.call(runtimeFunc, args);
+        return SmallVector<Value>{};
+      });
+      b.barrier(ttg::AddrSpace::Local);
+    }
     rewriter.eraseOp(op);
     return success();
   }

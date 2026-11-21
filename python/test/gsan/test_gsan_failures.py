@@ -1598,3 +1598,155 @@ def test_gsan_gfx1250_local_completion_barrier_handoff(kind, ordered, monkeypatc
         _run_failure_case("amd local completion " + kind, runner=_run_amd_tdm_handoff,
                           source_function=_amd_tdm_handoff_kernel.fn, marker=marker, error=error + " race detected",
                           runner_args=(kind, False, True))
+
+
+@gluon.jit
+def _amd_ws_handoff_default(payload, flag, ack, output, ORDERED: gl.constexpr, ITERATIONS: gl.constexpr,
+                            WORKER_WARPS: gl.constexpr):
+    pass
+
+
+@gluon.jit(noinline=True)
+def _amd_ws_handoff_worker(payload, flag, ack, output, ORDERED: gl.constexpr, ITERATIONS: gl.constexpr,
+                           WORKER_WARPS: gl.constexpr):
+    offsets = gl.arange(0, 128, layout=gl.BlockedLayout([1], [32], [WORKER_WARPS], [0]))
+    for iteration in range(ITERATIONS):
+        if gl.program_id(0) == 0:
+            if iteration > 0:
+                while gl.atomic_add(ack, 0, sem="acquire") != iteration:
+                    pass
+            gl.store(payload + offsets, offsets + 100 * iteration, offsets < 123)
+            gl.atomic_xchg(flag, iteration + 1, sem="release" if ORDERED else "relaxed")
+        else:
+            while gl.atomic_add(flag, 0, sem="acquire") != iteration + 1:
+                pass
+            values = gl.load(payload + offsets, offsets < 123, other=0)
+            gl.store(output + iteration * 128 + offsets, values, offsets < 123)
+            gl.atomic_xchg(ack, iteration + 1, sem="release")
+
+
+@gluon.jit
+def _amd_ws_handoff_kernel(payload, flag, ack, output, ORDERED: gl.constexpr, ITERATIONS: gl.constexpr,
+                           WORKER_WARPS: gl.constexpr):
+    gl.warp_specialize([
+        (_amd_ws_handoff_default, (payload, flag, ack, output, ORDERED, ITERATIONS, WORKER_WARPS)),
+        (_amd_ws_handoff_worker, (payload, flag, ack, output, ORDERED, ITERATIONS, WORKER_WARPS)),
+    ], [WORKER_WARPS], [24])
+
+
+@run_with_gsan
+def _run_amd_ws_handoff(ordered, iterations, worker_warps=4):
+    payload = torch.zeros(128, dtype=torch.int32, device="cuda")
+    flag = torch.zeros(1, dtype=torch.int32, device="cuda")
+    ack = torch.zeros_like(flag)
+    output = torch.zeros(iterations * 128, dtype=torch.int32, device="cuda")
+    compiled = _amd_ws_handoff_kernel[(2, )](payload, flag, ack, output, ordered, iterations, worker_warps, num_warps=4)
+    torch.cuda.synchronize()
+    expected = torch.cat([
+        torch.cat((torch.arange(123, dtype=torch.int32, device="cuda") + 100 * i,
+                   torch.zeros(5, dtype=torch.int32, device="cuda"))) for i in range(iterations)
+    ])
+    torch.testing.assert_close(output, expected)
+    return compiled.asm["llir"], compiled.asm["amdgcn"]
+
+
+@pytest.mark.skipif(not is_hip_cdna5(), reason="requires MI450 warp specialization")
+@pytest.mark.parametrize("worker_warps", [1, 2, 4])
+def test_gsan_amd_warp_specialize_noinline_scalar_handoff(monkeypatch, worker_warps):
+    monkeypatch.setenv("TRITON_TEST_PROCESS_TIMEOUT", "60")
+    result = run_in_process(_run_amd_ws_handoff, args=(True, 4, worker_warps), allow_abort=True)
+    assert result.exc is None, result.driver_stderr_output
+
+
+@pytest.mark.skipif(not is_hip_cdna5(), reason="requires MI450 warp specialization")
+def test_gsan_amd_warp_specialize_noinline_missing_release(monkeypatch):
+    monkeypatch.setenv("TRITON_TEST_PROCESS_TIMEOUT", "60")
+    _run_failure_case("nondefault noinline region missing release", runner=_run_amd_ws_handoff,
+                      source_function=_amd_ws_handoff_worker.fn, marker="values = gl.load",
+                      error="Read after write race detected", runner_args=(False, 1))
+
+
+@gluon.jit
+def _amd_warp_pipeline_handoff_kernel(payload, flag, output, ORDERED: gl.constexpr):
+    offsets = gl.arange(0, 256, layout=gl.BlockedLayout([1], [32], [8], [0]))
+    if gl.program_id(0) == 0:
+        gl.store(payload + offsets, offsets)
+        gl.atomic_xchg(flag, 1, sem="release" if ORDERED else "relaxed")
+    else:
+        while gl.atomic_add(flag, 0, sem="acquire") != 1:
+            pass
+        for iteration in range(4):
+            with gl.amd.warp_pipeline_stage("read"):
+                values = gl.load(payload + offsets)
+            with gl.amd.warp_pipeline_stage("write"):
+                gl.store(output + iteration * 256 + offsets, values + iteration)
+
+
+@run_with_gsan
+def _run_amd_warp_pipeline_handoff(ordered):
+    payload = torch.zeros(256, dtype=torch.int32, device="cuda")
+    flag = torch.zeros(1, dtype=torch.int32, device="cuda")
+    output = torch.zeros(4 * 256, dtype=torch.int32, device="cuda")
+    compiled = _amd_warp_pipeline_handoff_kernel[(2, )](payload, flag, output, ordered, num_warps=8)
+    torch.cuda.synchronize()
+    expected = torch.cat([torch.arange(256, dtype=torch.int32, device="cuda") + i for i in range(4)])
+    torch.testing.assert_close(output, expected)
+    return compiled.asm["llir"], compiled.asm["amdgcn"]
+
+
+@pytest.mark.skipif(not is_hip_cdna5(), reason="requires MI450 warp pipelining")
+def test_gsan_amd_warp_pipeline_repeated_handoff(monkeypatch):
+    monkeypatch.setenv("TRITON_TEST_PROCESS_TIMEOUT", "60")
+    result = run_in_process(_run_amd_warp_pipeline_handoff, args=(True, ), allow_abort=True)
+    assert result.exc is None, result.driver_stderr_output
+
+
+@pytest.mark.skipif(not is_hip_cdna5(), reason="requires MI450 warp pipelining")
+def test_gsan_amd_warp_pipeline_missing_release(monkeypatch):
+    monkeypatch.setenv("TRITON_TEST_PROCESS_TIMEOUT", "60")
+    _run_failure_case("warp pipeline missing release", runner=_run_amd_warp_pipeline_handoff,
+                      source_function=_amd_warp_pipeline_handoff_kernel.fn, marker="values = gl.load",
+                      error="Read after write race detected", runner_args=(False, ))
+
+
+@gluon.jit(noinline=True)
+def _amd_ws_tdm_completion_worker(src, dst):
+    shared: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [1, 0])
+    source = gl.amd.cdna5.tdm.make_tensor_descriptor(src, [16, 64], [64, 1], [16, 64], shared)
+    destination = gl.amd.cdna5.tdm.make_tensor_descriptor(dst, [16, 64], [64, 1], [16, 64], shared)
+    smem = gl.allocate_shared_memory(gl.int32, [16, 64], shared)
+    bar = gl.allocate_shared_memory(gl.int64, [1], gl.amd.cdna5.mbarrier.MBarrierLayout())
+    gl.amd.cdna5.mbarrier.init(bar, count=gl.num_warps())
+    for iteration in range(4):
+        gl.amd.cdna5.tdm.async_load(source, [0, 0], smem, mbarrier=bar)
+        gl.amd.cdna5.mbarrier.wait(bar, 0)
+        gl.amd.cdna5.tdm.async_store(destination, [0, 0], smem, mbarrier=bar)
+        gl.amd.cdna5.mbarrier.wait(bar, 1)
+
+
+@gluon.jit
+def _amd_ws_tdm_completion_default(src, dst):
+    pass
+
+
+@gluon.jit
+def _amd_ws_tdm_completion_kernel(src, dst):
+    gl.warp_specialize([(_amd_ws_tdm_completion_default, (src, dst)), (_amd_ws_tdm_completion_worker, (src, dst))], [4],
+                       [24])
+
+
+@run_with_gsan
+def _run_amd_ws_tdm_completion():
+    src = torch.arange(16 * 64, dtype=torch.int32, device="cuda")
+    dst = torch.full_like(src, -1)
+    compiled = _amd_ws_tdm_completion_kernel[(1, )](src, dst, num_warps=4)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(dst, src)
+    return compiled.asm["llir"], compiled.asm["amdgcn"]
+
+
+@pytest.mark.skipif(not is_hip_cdna5(), reason="requires MI450 TDM and warp specialization")
+def test_gsan_amd_warp_specialize_noinline_tdm_completion(monkeypatch):
+    monkeypatch.setenv("TRITON_TEST_PROCESS_TIMEOUT", "60")
+    result = run_in_process(_run_amd_ws_tdm_completion, allow_abort=True)
+    assert result.exc is None, result.driver_stderr_output
