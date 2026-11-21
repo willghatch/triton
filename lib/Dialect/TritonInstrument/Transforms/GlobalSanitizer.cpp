@@ -396,8 +396,10 @@ public:
     DenseSet<StringRef> calledFuncs;
     module.walk(
         [&](tt::CallOp callOp) { calledFuncs.insert(callOp.getCallee()); });
+    auto target = module->getAttrOfType<StringAttr>(ttg::AttrTargetName);
+    const bool isAMD = target && target.getValue().starts_with("hip:");
     int64_t mBarrierCapacity = 0;
-    if (ttg::lookupNumCTAs(module) > 1) {
+    if (!isAMD && ttg::lookupNumCTAs(module) > 1) {
       auto capacity = getMBarrierCapacity(module);
       if (failed(capacity)) {
         signalPassFailure();
@@ -573,7 +575,10 @@ public:
 
     if (instrumentMBarriers)
       instrumentMBarrierOps(module, mbarrierScratch);
-    instrumentClusterBarrierEquivalents(module);
+    // AMD cluster arrive/wait are execution-only scheduling rendezvous.
+    // They do not imply NVIDIA cluster memory fences or clock acquisition.
+    if (!isAMD)
+      instrumentClusterBarrierEquivalents(module);
   }
 };
 

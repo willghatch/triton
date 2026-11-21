@@ -284,6 +284,8 @@ class HIPLauncher(object):
 
         # GSan-instrumented kernels take three extra arguments after the user
         # arguments (and before the scratch pointers), as on NVIDIA.
+        self.num_ctas = metadata.num_ctas
+        self.gsan_reserved_lds = getattr(metadata, "gsan_reserved_lds", 0)
         self.gsan_enabled = is_enabled(metadata, "gsan")
         if self.gsan_enabled:
             signature["_gsan_globals_ptr"] = "*i8"
@@ -346,6 +348,21 @@ class HIPLauncher(object):
             import triton.experimental.gsan._allocator as gsan_allocator
             import triton.experimental.gsan._stream_sync as gsan_stream_sync
             device = active_driver.get_current_device()
+            if self.num_ctas > 1:
+                layout = gsan_allocator.get_runtime_state_layout(device)
+                # Every physically resident CTA needs an independent slot.
+                # The per-CTA LDS reservation bounds all concurrent launches
+                # by CU count times cluster size, regardless of grid size.
+                props = active_driver.utils.get_device_properties(device)
+                cu_count = props["multiprocessor_count"]
+                lds_per_cu = props["shared_mem_per_multiprocessor"]
+                if not props["clusterLaunch"] or not lds_per_cu or not self.gsan_reserved_lds:
+                    raise RuntimeError("GSan cluster launch requires known HIP cluster/LDS capabilities")
+                required_slots = cu_count * (lds_per_cu // self.gsan_reserved_lds)
+                if layout["num_slots"] < required_slots:
+                    raise RuntimeError(f"GSan cluster launch needs at least {required_slots} runtime slots; "
+                                       f"configured {layout['num_slots']}. Configure num_slots before allocating "
+                                       "GSan memory (and reduce clock_buffer_size if necessary).")
             device_rank = gsan_allocator.get_device_rank(device)
             gsan_state_ptr = gsan_allocator.get_global_state_pointer() + device_rank * GSAN_PER_DEVICE_STATE_STRIDE
             # AMD kernels never use PDL; the compiler sets tti.gsan_launch_pdl = 0.

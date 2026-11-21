@@ -331,3 +331,18 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
+
+// -----
+
+// MI450 execution-only cluster rendezvous passes through without importing
+// NVIDIA cluster memory ordering or dropping global access checks.
+module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @mi450_cluster_execution
+  // CHECK: amdg.cluster_barrier_arrive
+  // CHECK: amdg.cluster_barrier_wait
+  tt.func @mi450_cluster_execution() {
+    amdg.cluster_barrier_arrive
+    amdg.cluster_barrier_wait
+    tt.return
+  }
+}

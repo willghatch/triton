@@ -2969,3 +2969,334 @@ def test_gsan_gfx1250_async_completion_barrier_payload(with_gsan):
     dst = torch.empty_like(src)
     _gsan_gfx1250_async_completion_kernel[(1, )](src, dst, num_warps=4)
     torch.testing.assert_close(dst, src)
+
+
+@gluon.jit
+def _gsan_gfx1250_cluster_copy_kernel(src, dst, CTAS: gl.constexpr, REPLICATED: gl.constexpr):
+    distributed: gl.constexpr = gl.BlockedLayout([1], [32], [4], [0],
+                                                 cga_layout=(((1, ), ) if CTAS == 2 else
+                                                             ((1, ), (2, )) if CTAS == 4 else
+                                                             ((1, ), (2, ), (4, )) if CTAS == 8 else
+                                                             ((1, ), (2, ), (4, ), (8, ))))
+    replicated: gl.constexpr = gl.BlockedLayout([1], [32], [4], [0], cga_layout=((0, ), ) if CTAS == 2 else
+                                                ((0, ), (0, )))
+    offsets = gl.program_id(0) * (128 * CTAS) + gl.arange(0, 128 * CTAS, distributed)
+    if REPLICATED:
+        read_offsets = gl.program_id(0) * (128 * CTAS) + gl.arange(0, 128 * CTAS, replicated)
+        values = gl.load(src + read_offsets)
+        values = gl.convert_layout(values, distributed)
+    else:
+        values = gl.load(src + offsets)
+    # This rendezvous aligns execution; it does not publish global clocks.
+    gl.amd.cdna5.cluster.arrive()
+    gl.amd.cdna5.cluster.wait()
+    gl.store(dst + offsets, values)
+
+
+def _run_gsan_gfx1250_cluster_copy(ctas, replicated, sanitized, granularity):
+    from triton.experimental.gsan import configure
+    configure(num_slots=max(1024, 256 * ctas), clock_buffer_size=4)
+    triton.knobs.compilation.instrumentation_mode = "gsan" if sanitized else ""
+    pool = create_mem_pool(shadow_granularity=granularity)
+    with torch.cuda.use_mem_pool(pool):
+        src = torch.arange(128 * ctas, dtype=torch.int32, device="cuda")
+        dst = torch.empty_like(src)
+        triton.knobs.compilation.instrumentation_mode = "gsan" if sanitized else ""
+        compiled = _gsan_gfx1250_cluster_copy_kernel[(1, )](src, dst, ctas, replicated, num_ctas=ctas,
+                                                            instrumentation_mode="gsan" if sanitized else "")
+        torch.testing.assert_close(dst, src)
+        if not sanitized:
+            return
+        assert compiled.metadata.num_ctas == ctas
+        from triton.backends.amd.compiler import get_static_lds_size
+        assert compiled.metadata.shared + get_static_lds_size(compiled.asm["amdgcn"]) == 320 * 1024 // ctas
+        writers = {
+            shadow_cell_from_address(dst.data_ptr() + 128 * cta * 4).write_clock.thread_id
+            for cta in range(ctas)
+        }
+        assert len(writers) == ctas
+        for offset in [0, 127, 128 * ctas - 1]:
+            cell = shadow_cell_from_address(src.data_ptr() + offset * 4)
+            readers = {clock.thread_id for clock in cell.read_clocks if clock.epoch != 0}
+            assert len(readers) == (ctas if replicated else 1)
+
+
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Clusters require AMD gfx1250")
+@pytest.mark.parametrize("ctas", [2, 4])
+@pytest.mark.parametrize("replicated", [False, True])
+@pytest.mark.parametrize("sanitized", [False, True])
+@pytest.mark.gsan_fine_granularity("White-box reader checks use 4-byte elements")
+def test_gsan_gfx1250_cluster_copy_participants(shadow_granularity, ctas, replicated, sanitized, monkeypatch):
+    monkeypatch.setenv("TRITON_TEST_PROCESS_TIMEOUT", "60")
+    result = run_in_process(_run_gsan_gfx1250_cluster_copy, args=(ctas, replicated, sanitized, shadow_granularity))
+    assert result.exc is None, result.exc
+
+
+@gluon.jit
+def _gsan_gfx1250_cluster_tdm_kernel(src, dst, CTAS: gl.constexpr, MULTICAST: gl.constexpr,
+                                     COMPLETION: gl.constexpr = False):
+    cga: gl.constexpr = ((((0, 1), (0, 0)) if CTAS == 4 else ((0, 1), (0, 0), (0, 0)) if CTAS == 8 else
+                          ((0, 1), (0, 2), (0, 0), (0, 0))) if MULTICAST == 2 else ((0, 1), ) if CTAS == 2 else
+                         ((0, 1), (0, 2)))
+    shared_cga: gl.constexpr = (cga if MULTICAST == 2 else (((0, 0), ) if CTAS == 2 else
+                                                            ((0, 0), (0, 0))) if MULTICAST else cga)
+    layout: gl.constexpr = gl.BlockedLayout([1, 4], [4, 8], [4, 1], [1, 0], cga_layout=cga)
+    shared: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [1, 0], shared_cga)
+    desc = gl.amd.cdna5.tdm.make_tensor_descriptor(src, [16, 64], [64, 1], [16, 64], shared)
+    smem = gl.allocate_shared_memory(gl.int32, [16, 64], shared)
+    if COMPLETION:
+        bar_cga: gl.constexpr = ((0, ), ) if CTAS == 2 else ((0, ), (0, ))
+        bar = gl.allocate_shared_memory(gl.int64, [1], gl.amd.cdna5.mbarrier.MBarrierLayout(bar_cga))
+        gl.amd.cdna5.mbarrier.init(bar, count=gl.num_warps())
+        gl.amd.cdna5.tdm.async_load(desc, [0, 0], smem, mbarrier=bar)
+        gl.amd.cdna5.mbarrier.wait(bar, 0)
+        gl.amd.cdna5.mbarrier.wait(bar, 0)
+    else:
+        gl.amd.cdna5.tdm.async_load(desc, [0, 0], smem)
+        gl.amd.cdna5.tdm.async_wait(0)
+    gl.amd.cdna5.cluster.arrive()
+    gl.amd.cdna5.cluster.wait()
+    rows = gl.arange(0, 16, gl.SliceLayout(1, layout))
+    cols = gl.arange(0, 64, gl.SliceLayout(0, layout))
+    read_layout: gl.constexpr = gl.BlockedLayout([1, 4], [4, 8], [4, 1], [1, 0], cga_layout=shared_cga)
+    values = gl.convert_layout(smem.load(read_layout), layout)
+    gl.store(dst + rows[:, None] * 64 + cols[None, :], values)
+
+
+def _run_gsan_gfx1250_cluster_tdm(ctas, multicast, granularity, completion=False):
+    from triton.experimental.gsan import configure
+    configure(num_slots=max(1024, ctas * 256), clock_buffer_size=16)
+    triton.knobs.compilation.instrumentation_mode = "gsan"
+    pool = create_mem_pool(shadow_granularity=granularity)
+    with torch.cuda.use_mem_pool(pool):
+        src = torch.arange(1024, dtype=torch.int32, device="cuda").reshape(16, 64)
+        dst = torch.empty_like(src)
+        _gsan_gfx1250_cluster_tdm_kernel[(1, )](src, dst, ctas, multicast, completion, num_ctas=ctas)
+        torch.testing.assert_close(dst, src)
+        for offset in [0, 63, 1023]:
+            cell = shadow_cell_from_address(src.data_ptr() + offset * 4)
+            readers = {clock.thread_id for clock in cell.read_clocks if clock.epoch != 0}
+            assert len(readers) == ((2 if ctas == 4 else 4) if multicast == 2 else ctas if multicast else 1)
+
+        if multicast == 2:
+            first = shadow_cell_from_address(src.data_ptr())
+            last = shadow_cell_from_address(src.data_ptr() + 63 * 4)
+            first_readers = {clock.thread_id for clock in first.read_clocks if clock.epoch}
+            last_readers = {clock.thread_id for clock in last.read_clocks if clock.epoch}
+            assert first_readers.isdisjoint(last_readers)
+            for reader in first_readers:
+                state = thread_state_from_smid(reader)
+                assert all(state.vector_clock[other] == 0 for other in last_readers)
+
+
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Cluster TDM requires AMD gfx1250")
+@pytest.mark.parametrize("ctas", [2, 4])
+@pytest.mark.parametrize("multicast", [False, True])
+@pytest.mark.gsan_fine_granularity("White-box reader checks use 4-byte elements")
+def test_gsan_gfx1250_cluster_tdm_recipient_footprints(shadow_granularity, ctas, multicast, monkeypatch):
+    monkeypatch.setenv("TRITON_TEST_PROCESS_TIMEOUT", "60")
+    result = run_in_process(_run_gsan_gfx1250_cluster_tdm, args=(ctas, multicast, shadow_granularity))
+    assert result.exc is None, result.exc
+
+
+@gluon.jit
+def _gsan_gfx1250_cluster_atomic_handoff_kernel(payload, flag, out, CTAS: gl.constexpr):
+    layout: gl.constexpr = gl.BlockedLayout([1], [32], [4], [0], cga_layout=((1, ), ) if CTAS == 2 else ((1, ), (2, )))
+    offsets = gl.arange(0, 128 * CTAS, layout)
+    consumer = (offsets > 0) & (offsets % 128 == 0)
+    gl.store(payload + offsets * 0, 7, mask=offsets == 0)
+    gl.atomic_add(flag + offsets * 0, 1, mask=offsets == 0, sem="release", scope="gpu")
+    gl.amd.cdna5.cluster.arrive()
+    gl.amd.cdna5.cluster.wait()
+    gl.atomic_add(flag + offsets * 0, 0, mask=consumer, sem="acquire", scope="gpu")
+    value = gl.load(payload + offsets * 0, mask=consumer, other=0)
+    gl.store(out + offsets // 128, value, mask=consumer)
+
+
+def _run_gsan_gfx1250_cluster_atomic_handoff(ctas):
+    from triton.experimental.gsan import configure
+    configure(num_slots=1024, clock_buffer_size=16)
+    triton.knobs.compilation.instrumentation_mode = "gsan"
+    pool = create_mem_pool()
+    with torch.cuda.use_mem_pool(pool):
+        payload = torch.zeros(1, dtype=torch.int32, device="cuda")
+        flag = torch.zeros_like(payload)
+        out = torch.zeros(ctas, dtype=torch.int32, device="cuda")
+        _gsan_gfx1250_cluster_atomic_handoff_kernel[(1, )](payload, flag, out, ctas, num_ctas=ctas)
+        torch.testing.assert_close(out[1:], torch.full_like(out[1:], 7))
+        cell = shadow_cell_from_address(payload.data_ptr())
+        readers = [clock for clock in cell.read_clocks if clock.epoch != 0]
+        assert len(readers) == ctas - 1
+        for reader in readers:
+            assert reader.thread_id != cell.write_clock.thread_id
+            state = thread_state_from_smid(reader.thread_id)
+            assert state.vector_clock[cell.write_clock.thread_id] >= cell.write_clock.epoch
+
+
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Cluster atomics require AMD gfx1250")
+@pytest.mark.parametrize("ctas", [2, 4])
+def test_gsan_gfx1250_cluster_atomic_release_acquire(ctas, monkeypatch):
+    monkeypatch.setenv("TRITON_TEST_PROCESS_TIMEOUT", "60")
+    result = run_in_process(_run_gsan_gfx1250_cluster_atomic_handoff, args=(ctas, ))
+    assert result.exc is None, result.exc
+
+
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Cluster completion TDM requires AMD gfx1250")
+@pytest.mark.parametrize("ctas", [2, 4])
+def test_gsan_gfx1250_cluster_tdm_local_completion(ctas, monkeypatch):
+    monkeypatch.setenv("TRITON_TEST_PROCESS_TIMEOUT", "60")
+    result = run_in_process(_run_gsan_gfx1250_cluster_tdm, args=(ctas, True, 4, True))
+    assert result.exc is None, result.exc
+
+
+def _run_gsan_gfx1250_cluster_streams(ctas):
+    from triton.experimental.gsan import configure
+    configure(num_slots=1024, clock_buffer_size=16)
+    triton.knobs.compilation.instrumentation_mode = "gsan"
+    pool = create_mem_pool()
+    with torch.cuda.use_mem_pool(pool):
+        src = torch.arange(300 * 128 * ctas, dtype=torch.int32, device="cuda")
+        outputs = [torch.empty_like(src), torch.empty_like(src)]
+        streams = [torch.cuda.Stream(), torch.cuda.Stream()]
+        for stream, out in zip(streams, outputs):
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                _gsan_gfx1250_cluster_copy_kernel[(300, )](src, out, ctas, False, num_ctas=ctas)
+        for stream in streams:
+            stream.synchronize()
+        for out in outputs:
+            torch.testing.assert_close(out, src)
+
+
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Clusters require AMD gfx1250")
+@pytest.mark.parametrize("ctas", [2, 4])
+def test_gsan_gfx1250_cluster_oversubscribed_streams(ctas, monkeypatch):
+    monkeypatch.setenv("TRITON_TEST_PROCESS_TIMEOUT", "60")
+    result = run_in_process(_run_gsan_gfx1250_cluster_streams, args=(ctas, ))
+    assert result.exc is None, result.exc
+
+
+def _run_gsan_gfx1250_cluster_insufficient_slots():
+    from triton.experimental.gsan import configure
+    configure(num_slots=2, clock_buffer_size=16)
+    triton.knobs.compilation.instrumentation_mode = "gsan"
+    pool = create_mem_pool()
+    with torch.cuda.use_mem_pool(pool):
+        src = torch.zeros(256, dtype=torch.int32, device="cuda")
+        out = torch.empty_like(src)
+        with pytest.raises(RuntimeError, match="GSan cluster launch needs at least .*runtime slots"):
+            _gsan_gfx1250_cluster_copy_kernel[(1, )](src, out, 2, False, num_ctas=2)
+
+
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Clusters require AMD gfx1250")
+def test_gsan_gfx1250_cluster_insufficient_slots_rejected(monkeypatch):
+    monkeypatch.setenv("TRITON_TEST_PROCESS_TIMEOUT", "60")
+    result = run_in_process(_run_gsan_gfx1250_cluster_insufficient_slots)
+    assert result.exc is None, result.exc
+
+
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Clusters require AMD gfx1250")
+@pytest.mark.parametrize("ctas", [8, 16])
+def test_gsan_gfx1250_cluster_large_launch_contract(ctas, monkeypatch):
+    monkeypatch.setenv("TRITON_TEST_PROCESS_TIMEOUT", "60")
+    result = run_in_process(_run_gsan_gfx1250_cluster_copy, args=(ctas, False, True, 4))
+    assert result.exc is None, result.exc
+
+
+@gluon.jit
+def _gsan_gfx1250_cluster_region_default(src, dst, layout: gl.constexpr):
+    pass
+
+
+@gluon.jit(noinline=True)
+def _gsan_gfx1250_cluster_region_worker(src, dst, layout: gl.constexpr):
+    offsets = gl.arange(0, 256, layout)
+    gl.store(dst + offsets, gl.load(src + offsets))
+
+
+@gluon.jit
+def _gsan_gfx1250_cluster_region_kernel(src, dst):
+    layout: gl.constexpr = gl.BlockedLayout([1], [32], [4], [0], cga_layout=((1, ), ))
+    gl.warp_specialize([(_gsan_gfx1250_cluster_region_default, (src, dst, layout)),
+                        (_gsan_gfx1250_cluster_region_worker, (src, dst, layout))], [4], [24])
+    gl.amd.cdna5.cluster.arrive()
+    gl.amd.cdna5.cluster.wait()
+
+
+def _run_gsan_gfx1250_cluster_region():
+    triton.knobs.compilation.instrumentation_mode = "gsan"
+    pool = create_mem_pool()
+    with torch.cuda.use_mem_pool(pool):
+        src = torch.arange(256, dtype=torch.int32, device="cuda")
+        dst = torch.empty_like(src)
+        compiled = _gsan_gfx1250_cluster_region_kernel[(1, )](src, dst, num_ctas=2)
+        torch.testing.assert_close(dst, src)
+        assert "tt.call" in compiled.asm["ttgir"]
+        writers = {shadow_cell_from_address(dst.data_ptr() + cta * 128 * 4).write_clock.thread_id for cta in range(2)}
+        assert len(writers) == 2
+
+
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Cluster regions require AMD gfx1250")
+def test_gsan_gfx1250_cluster_noinline_worker_region(monkeypatch):
+    monkeypatch.setenv("TRITON_TEST_PROCESS_TIMEOUT", "60")
+    result = run_in_process(_run_gsan_gfx1250_cluster_region)
+    assert result.exc is None, result.exc
+
+
+@gluon.jit
+def _gsan_gfx1250_cluster_indexed_kernel(src, dst, CTAS: gl.constexpr):
+    cga: gl.constexpr = ((0, 1), ) if CTAS == 2 else ((0, 1), (0, 2))
+    idx_cga: gl.constexpr = ((0, 0), ) if CTAS == 2 else ((0, 0), (0, 0))
+    shared: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [1, 0], cga)
+    parent: gl.constexpr = gl.BlockedLayout([16, 1], [1, 32], [1, 4], [1, 0], cga_layout=idx_cga)
+    rows = 2 * gl.arange(0, 16, gl.SliceLayout(1, parent))
+    src_desc = gl.amd.cdna5.tdm.make_tensor_descriptor(src, [31, 64], [80, 1], [16, 64], shared)
+    dst_desc = gl.amd.cdna5.tdm.make_tensor_descriptor(dst, [31, 64], [80, 1], [16, 64], shared)
+    src_desc = gl.amd.cdna5.tdm.update_tensor_descriptor(src_desc, add_offsets=[0, 8], clamp_bounds=True)
+    dst_desc = gl.amd.cdna5.tdm.update_tensor_descriptor(dst_desc, add_offsets=[0, 8], clamp_bounds=True)
+    smem = gl.allocate_shared_memory(gl.int32, [16, 64], shared)
+    gl.amd.cdna5.tdm.async_gather(src_desc, rows, smem)
+    gl.amd.cdna5.tdm.async_wait(0)
+    gl.amd.cdna5.tdm.async_scatter(dst_desc, rows, smem)
+    gl.amd.cdna5.tdm.async_wait(0)
+
+
+def _run_gsan_gfx1250_cluster_indexed(ctas):
+    from triton.experimental.gsan import configure
+    configure(num_slots=1024, clock_buffer_size=16)
+    triton.knobs.compilation.instrumentation_mode = "gsan"
+    pool = create_mem_pool()
+    with torch.cuda.use_mem_pool(pool):
+        src = (1 + torch.arange(32 * 80, dtype=torch.int32, device="cuda")).reshape(32, 80)
+        dst = torch.zeros_like(src)
+        _gsan_gfx1250_cluster_indexed_kernel[(1, )](src, dst, ctas, num_ctas=ctas)
+        expected = torch.zeros_like(src)
+        expected[:31:2, 8:64] = src[:31:2, 8:64]
+        torch.testing.assert_close(dst, expected)
+        writers = {
+            shadow_cell_from_address(dst.data_ptr() + (8 + cta * (64 // ctas)) * 4).write_clock.thread_id
+            for cta in range(ctas)
+        }
+        assert len(writers) == ctas
+        for offset in [0, 64, 80, 31 * 80]:
+            cell = shadow_cell_from_address(src.data_ptr() + offset * 4)
+            assert all(clock.epoch == 0 for clock in cell.read_clocks)
+        for offset in [8, 30 * 80 + 63]:
+            cell = shadow_cell_from_address(src.data_ptr() + offset * 4)
+            assert len({clock.thread_id for clock in cell.read_clocks if clock.epoch}) == 1
+
+
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Cluster indexed TDM requires AMD gfx1250")
+@pytest.mark.parametrize("ctas", [2, 4])
+def test_gsan_gfx1250_cluster_indexed_column_footprints(ctas, monkeypatch):
+    monkeypatch.setenv("TRITON_TEST_PROCESS_TIMEOUT", "60")
+    result = run_in_process(_run_gsan_gfx1250_cluster_indexed, args=(ctas, ))
+    assert result.exc is None, result.exc
+
+
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Multicast subgroups require AMD gfx1250")
+@pytest.mark.parametrize("ctas", [4, 8, 16])
+def test_gsan_gfx1250_cluster_multicast_nonrecipient_independence(ctas, monkeypatch):
+    monkeypatch.setenv("TRITON_TEST_PROCESS_TIMEOUT", "60")
+    result = run_in_process(_run_gsan_gfx1250_cluster_tdm, args=(ctas, 2, 4))
+    assert result.exc is None, result.exc

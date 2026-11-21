@@ -223,3 +223,22 @@ module attributes {"ttg.instrumentation_mode" = "gsan", "ttg.num-ctas" = 1 : i32
     tt.return
   }
 }
+
+// -----
+
+// Replicated MI450 loads must check all recipient CTAs. A raw cluster
+// rendezvous must not add a NVIDIA cluster clock synchronization call.
+#replicated = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0], CGALayout = [[0]]}>
+module attributes {"ttg.instrumentation_mode" = "gsan", "ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: llvm.func @mi450_replicated_load
+  // CHECK-NOT: llvm.amdgcn.cluster.workgroup.id
+  // CHECK: llvm.call @__triton_gsan_load_tensor(
+  // CHECK-NOT: llvm.call @__triton_gsan_cluster_barrier_sync
+  // CHECK: llvm.return
+  tt.func public @mi450_replicated_load(%ptrs: tensor<128x!tt.ptr<f32>, #replicated>) {
+    %v = tt.load %ptrs : tensor<128x!tt.ptr<f32>, #replicated>
+    amdg.cluster_barrier_arrive
+    amdg.cluster_barrier_wait
+    tt.return
+  }
+}

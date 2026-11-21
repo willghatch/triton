@@ -355,7 +355,7 @@ def is_consan_supported(base_arch):
 
 
 # Per-workgroup LDS limit (bytes) of the architectures GSan supports.
-# Reserve the full allocation to limit workgroup residency.
+# Reserve this budget per cluster to limit resident participants.
 _GSAN_LDS_LIMIT = {"gfx950": 160 * 1024, "gfx1250": 320 * 1024}
 
 
@@ -422,9 +422,8 @@ class HIPOptions:
     fpsan_homomorphic_casts: bool = False
     # WGP/CU execution mode for gfx11 and gfx120x; ignored on other targets.
     wgp_cu_mode: str = "wgp"
-    # GSan: total LDS each workgroup reserves, so that at most one GSan
-    # workgroup is resident per CU (bounds the number of live GSan slots).
-    # Always the target's per-workgroup LDS limit under GSan.
+    # GSan reserves the full LDS budget across a cluster. Dividing it among
+    # CTAs requires a correspondingly larger runtime slot capacity at launch.
     min_shared_mem: int = 0
 
     # Experimental hint for how the AMD backend schedules a kernel's instructions. The only
@@ -474,11 +473,13 @@ class HIPOptions:
                 raise ValueError(f"GSan is not supported on {self.arch}; only gfx950 and gfx1250 are supported")
             if knobs.compilation.enable_asan:
                 raise ValueError("GSan cannot be combined with AddressSanitizer (TRITON_ENABLE_ASAN)")
-            if self.num_ctas > 1:
-                raise ValueError("GSan on AMD does not support num_ctas > 1")
+            if self.num_ctas not in (1, 2, 4, 8, 16):
+                raise ValueError("GSan requires num_ctas in {1, 2, 4, 8, 16}")
+            if self.num_ctas > 1 and self.base_arch != "gfx1250":
+                raise ValueError("GSan multi-CTA launches require gfx1250")
             # Derived from the target (not the current device) so AOT and
             # arch-override compiles reserve the right amount.
-            object.__setattr__(self, 'min_shared_mem', _GSAN_LDS_LIMIT[self.base_arch])
+            object.__setattr__(self, 'min_shared_mem', _GSAN_LDS_LIMIT[self.base_arch] // self.num_ctas)
             # Built by Triton itself, so it is not affected by the bitcode path knob.
             gsan_name = "gsan-gfx1250.bc" if self.base_arch == "gfx1250" else "gsan.bc"
             gsan_lib = Path(__file__).parent / "lib" / gsan_name
@@ -1016,8 +1017,8 @@ class HIPBackend(BaseBackend):
             print(amdgcn)
         if is_enabled(options, "gsan"):
             # Triton's LDS is dynamic, but the static LDS also counts against
-            # the per-workgroup limit, and a launch exceeding it kills the
-            # process without an error. Reserve exactly the limit.
+            # per-CTA budget, and a launch exceeding the hardware limit can
+            # kill the process. Count both in the residency reservation.
             static_lds = get_static_lds_size(amdgcn)
             dynamic_lds = metadata["shared"]
             reserved = max(dynamic_lds, options.min_shared_mem - static_lds)
@@ -1025,6 +1026,7 @@ class HIPBackend(BaseBackend):
                 raise RuntimeError(f"GSan: kernel needs {dynamic_lds} B dynamic + {static_lds} B static LDS, "
                                    f"exceeding the {options.min_shared_mem} B limit")
             metadata["shared"] = reserved
+            metadata["gsan_reserved_lds"] = reserved + static_lds
         return amdgcn
 
     @staticmethod

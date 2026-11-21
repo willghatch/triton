@@ -7,6 +7,7 @@
 #include "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/Utility.h"
 #include "triton/Conversion/TritonGPUToLLVM/PatternTritonGPUOpToLLVM.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
+#include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
 #include "triton/Dialect/TritonInstrument/IR/Dialect.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/Support/LogicalResult.h"
@@ -622,6 +623,10 @@ public:
     auto ctx = op.getContext();
     auto kReg = str_attr("register");
     auto freeVarMasks = getFreeVariableMasks(ptrTy);
+    // AMD loads execute in every recipient CTA, including layout replicas.
+    // Stores retain the backend's redundant-CTA suppression.
+    if (!targetInfo->isCuda() && !op.getIsStore())
+      freeVarMasks[str_attr("block")] = 0;
     auto threadPred = ttg::emitRedundantThreadPredicate(freeVarMasks, rewriter,
                                                         loc, *targetInfo);
     auto gsanGlobalStatePtr = getGSanGlobalStateArg(op, rewriter, loc);
@@ -635,6 +640,20 @@ public:
     return success();
   }
 };
+
+static SmallVector<Value>
+getAMDDescCTAOffsets(tt::TensorDescType descTy,
+                     ConversionPatternRewriter &rewriter, Location loc,
+                     const TargetInfoBase &targetInfo) {
+  auto layout = ttg::toLinearLayoutIgnoringPadding(descTy.getShape(),
+                                                   descTy.getSharedLayout());
+  auto block = rewriter.getStringAttr("block");
+  auto cga = layout.sublayout({block}, to_vector(layout.getOutDimNames()));
+  auto offsets = applyLinearLayout(
+      loc, rewriter, cga, {{block, targetInfo.getClusterCTAId(rewriter, loc)}});
+  return llvm::map_to_vector(offsets,
+                             [](auto offset) { return offset.second; });
+}
 
 template <typename AccessOp>
 struct GSanTensorDescAccessOpConversion
@@ -659,7 +678,13 @@ public:
       return failure();
 
     auto descTy = cast<tt::TensorDescType>(op.getDesc().getType());
-    ArrayRef<int64_t> blockShape = descTy.getShape();
+    SmallVector<int64_t> blockShape = llvm::to_vector(descTy.getShape());
+    SmallVector<Value> ctaOffsets;
+    if (!targetInfo->isCuda() && ttg::lookupNumCTAs(op) > 1) {
+      ctaOffsets = getAMDDescCTAOffsets(descTy, rewriter, loc, *targetInfo);
+      blockShape =
+          ttg::getShapePerCTA(descTy.getSharedLayout(), descTy.getShape());
+    }
     if (blockShape.empty() || blockShape.size() > 5 ||
         blockShape.size() != op.getCoords().size()) {
       return rewriter.notifyMatchFailure(
@@ -691,6 +716,8 @@ public:
     for (auto [dim, coord] : llvm::enumerate(adaptor.getCoords())) {
       Value coordSlot = b.gep(ptr_ty(ctx), coordsTy, coords,
                               ValueRange{b.i32_val(0), b.i32_val(dim)});
+      if (!ctaOffsets.empty())
+        coord = b.add(coord, ctaOffsets[dim]);
       b.store(coord, coordSlot);
       Value shapeSlot = b.gep(ptr_ty(ctx), shapeTy, shape,
                               ValueRange{b.i32_val(0), b.i32_val(dim)});
@@ -700,7 +727,7 @@ public:
     Value warpId = getLaneAndWarpId(rewriter, loc).second;
     int numWarps = ttg::lookupNumWarps(op);
     int numCTAs = ttg::lookupNumCTAs(op);
-    if (numCTAs > 1) {
+    if (numCTAs > 1 && targetInfo->isCuda()) {
       Value ctaRank = targetInfo->getClusterCTAId(rewriter, loc);
       warpId = b.add(b.mul(warpId, b.i32_val(numCTAs)), ctaRank);
       numWarps *= numCTAs;
@@ -772,7 +799,13 @@ public:
       return failure();
 
     auto descTy = cast<tt::TensorDescType>(op.getDesc().getType());
-    ArrayRef<int64_t> blockShape = descTy.getShape();
+    SmallVector<int64_t> blockShape = llvm::to_vector(descTy.getShape());
+    SmallVector<Value> ctaOffsets;
+    if (!targetInfo->isCuda() && ttg::lookupNumCTAs(op) > 1) {
+      ctaOffsets = getAMDDescCTAOffsets(descTy, rewriter, loc, *targetInfo);
+      blockShape =
+          ttg::getShapePerCTA(descTy.getSharedLayout(), descTy.getShape());
+    }
     if (blockShape.size() != 2 ||
         (targetInfo->isCuda() && blockShape.front() != 1))
       return rewriter.notifyMatchFailure(op, "expected a 1xN descriptor");
@@ -798,6 +831,8 @@ public:
 
     auto freeVarMasks = getFreeVariableMasks(op.getIndices().getType());
     freeVarMasks[StringAttr::get(ctx, "lane")] = 0;
+    if (!targetInfo->isCuda())
+      freeVarMasks[StringAttr::get(ctx, "block")] = 0;
     Value pred = ttg::emitRedundantThreadPredicate(freeVarMasks, rewriter, loc,
                                                    *targetInfo);
     pred = ttg::maybeAnd(rewriter, loc, pred, adaptor.getPred());
@@ -816,7 +851,10 @@ public:
     b.call(runtimeFunc,
            ValueRange{*gsanGlobalStatePtr,
                       castToGenericPointer(rewriter, loc, descriptor), indices,
-                      b.i32_val(indexElems.size()), adaptor.getOffset(),
+                      b.i32_val(indexElems.size()),
+                      ctaOffsets.empty()
+                          ? adaptor.getOffset()
+                          : b.add(adaptor.getOffset(), ctaOffsets.back()),
                       b.i32_val(blockShape.back()),
                       b.i32_val(elemTy.getIntOrFloatBitWidth() / 8),
                       materializeI32Bool(rewriter, b, pred), sourceLoc.file,

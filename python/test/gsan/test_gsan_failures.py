@@ -1750,3 +1750,59 @@ def test_gsan_amd_warp_specialize_noinline_tdm_completion(monkeypatch):
     monkeypatch.setenv("TRITON_TEST_PROCESS_TIMEOUT", "60")
     result = run_in_process(_run_amd_ws_tdm_completion, allow_abort=True)
     assert result.exc is None, result.driver_stderr_output
+
+
+@gluon.jit
+def _gsan_gfx1250_cluster_execution_race_kernel(payload, out):
+    layout: gl.constexpr = gl.BlockedLayout([1], [32], [4], [0], cga_layout=[[1]])
+    offsets = gl.arange(0, 256, layout)
+    gl.store(payload + offsets * 0, 7, mask=offsets == 0)
+    gl.amd.cdna5.cluster.arrive()
+    gl.amd.cdna5.cluster.wait()
+    value = gl.load(payload + offsets * 0, mask=offsets == 128, other=0)
+    gl.store(out + offsets * 0, value, mask=offsets == 128)
+
+
+@run_with_gsan
+def _run_gsan_gfx1250_cluster_execution_race():
+    payload = torch.zeros(1, dtype=torch.int32, device="cuda")
+    out = torch.zeros_like(payload)
+    _gsan_gfx1250_cluster_execution_race_kernel[(1, )](payload, out, num_ctas=2)
+
+
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Clusters require AMD gfx1250")
+@pytest.mark.gsan_fine_granularity("The payload uses 4-byte cells")
+def test_gsan_gfx1250_cluster_execution_barrier_does_not_acquire(shadow_granularity, monkeypatch):
+    monkeypatch.setenv("TRITON_TEST_PROCESS_TIMEOUT", "60")
+    _run_failure_case("gfx1250_execution_cluster", shadow_granularity, runner=_run_gsan_gfx1250_cluster_execution_race,
+                      source_function=_gsan_gfx1250_cluster_execution_race_kernel.fn, marker="value = gl.load(payload",
+                      error="Read after write race detected")
+
+
+@gluon.jit
+def _gsan_gfx1250_cluster_duplicate_tdm_store_kernel(dst):
+    shared: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [1, 0], ((0, 0), ))
+    layout: gl.constexpr = gl.BlockedLayout([1, 4], [4, 8], [4, 1], [1, 0], cga_layout=((0, 0), ))
+    desc = gl.amd.cdna5.tdm.make_tensor_descriptor(dst, [16, 64], [64, 1], [16, 64], shared)
+    smem = gl.allocate_shared_memory(gl.int32, [16, 64], shared)
+    smem.store(gl.full((16, 64), 7, gl.int32, layout))
+    gl.amd.cdna5.cluster.arrive()
+    gl.amd.cdna5.cluster.wait()
+    # TDM stores issue in both CTAs; replicated shared storage is not a
+    # license to suppress an actual second global writer.
+    gl.amd.cdna5.tdm.async_store(desc, src=smem)
+    gl.amd.cdna5.tdm.async_wait(0)
+
+
+@run_with_gsan
+def _run_gsan_gfx1250_cluster_duplicate_tdm_store():
+    dst = torch.zeros((16, 64), dtype=torch.int32, device="cuda")
+    _gsan_gfx1250_cluster_duplicate_tdm_store_kernel[(1, )](dst, num_ctas=2)
+
+
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Cluster TDM requires AMD gfx1250")
+def test_gsan_gfx1250_cluster_duplicate_tdm_writers_detected(monkeypatch):
+    monkeypatch.setenv("TRITON_TEST_PROCESS_TIMEOUT", "60")
+    _run_failure_case("gfx1250_duplicate_cluster_tdm_store", 4, runner=_run_gsan_gfx1250_cluster_duplicate_tdm_store,
+                      source_function=_gsan_gfx1250_cluster_duplicate_tdm_store_kernel.fn,
+                      marker="gl.amd.cdna5.tdm.async_store(desc", error="Write after write race detected")

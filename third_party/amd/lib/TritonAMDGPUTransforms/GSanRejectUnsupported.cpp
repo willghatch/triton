@@ -72,7 +72,7 @@ MemoryAccess getMemoryAccess(Operation *op) {
 
 // Synchronization operations that GSan does not model on AMD; they touch
 // shared memory only, so the global-memory check misses them.
-// Single-CTA MI450 regions retain one logical block participant. Scheduling
+// MI450 regions retain one logical participant per CTA. Scheduling
 // barriers preserve hardware participation without importing global clocks.
 bool isUnsupportedSync(Operation *op, bool localBarriersSupported) {
   if (isa<amdgpu::InitBarrierOp, amdgpu::WaitBarrierOp, amdgpu::ArriveBarrierOp,
@@ -80,7 +80,9 @@ bool isUnsupportedSync(Operation *op, bool localBarriersSupported) {
     return !localBarriersSupported;
   if (isa<amdgpu::CondBarrierOp>(op))
     return !localBarriersSupported;
-  return isa<amdgpu::ClusterBarrierArriveOp, amdgpu::ClusterBarrierWaitOp>(op);
+  return isa<amdgpu::ClusterBarrierArriveOp, amdgpu::ClusterBarrierWaitOp>(
+             op) &&
+         !localBarriersSupported;
 }
 
 bool isWarpPipelined(Operation *op) {
@@ -93,20 +95,24 @@ struct TritonAMDGPUGSanRejectUnsupportedPass
           TritonAMDGPUGSanRejectUnsupportedPass> {
   void runOnOperation() override {
     ModuleOp mod = getOperation();
-    // Like NVIDIA single-CTA GSan, ordinary AMD logical blocks share one
+    // Like NVIDIA single-CTA GSan, each AMD logical block uses one
     // participant clock. Local named/completion barriers retain their hardware
     // semantics without importing clocks from any other block. Global async
     // accesses remain checked at issue time in every active region. MI450
-    // init/exit synchronize the default region explicitly; cluster participant
-    // contracts remain unsupported.
+    // init/exit synchronize each CTA default region explicitly. Cluster
+    // scheduling barriers retain execution semantics without importing clocks.
     auto target = mod->getAttrOfType<StringAttr>(ttg::AttrTargetName);
-    bool localBarriersSupported = target &&
-                                  target.getValue() == "hip:gfx1250" &&
-                                  ttg::lookupNumCTAs(mod) == 1;
+    bool localBarriersSupported = target && target.getValue() == "hip:gfx1250";
     bool failed = false;
+    int numCTAs = ttg::lookupNumCTAs(mod);
+    if (localBarriersSupported &&
+        (numCTAs < 1 || numCTAs > 16 || (numCTAs & (numCTAs - 1)))) {
+      mod.emitError("GSan on MI450 requires num_ctas in {1, 2, 4, 8, 16}");
+      failed = true;
+    }
     int64_t numUnchecked = 0;
     if (auto numCTAs = mod->getAttrOfType<IntegerAttr>("ttg.num-ctas");
-        numCTAs && numCTAs.getInt() > 1) {
+        numCTAs && numCTAs.getInt() > 1 && !localBarriersSupported) {
       mod.emitError("GSan on AMD does not support num_ctas > 1 (got ")
           << numCTAs.getInt() << ")";
       failed = true;
