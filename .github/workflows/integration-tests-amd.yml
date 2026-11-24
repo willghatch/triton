@@ -213,6 +213,12 @@ jobs:
             cd ../../triton_kernels/
             TRITON_CI_CACHE_PHASE=triton-kernels python3 -m pytest -s -n 10 tests/
           fi
+      - name: Run GSan tests on AMD
+        if: ${{ contains(matrix.runner, 'amd-gfx950') }}
+        env:
+          # Race-detection tests intentionally trap; avoid large GPU core dumps.
+          HSA_DISABLE_COREDUMP_ON_EXCEPTION: "1"
+        run: make NUM_GPUS=1 NUM_PROCS=8 test-gsan
       - name: Run asan tests on AMD
         if: false
         run: |
