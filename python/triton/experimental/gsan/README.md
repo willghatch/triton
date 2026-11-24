@@ -119,3 +119,111 @@ We may want to consider adding more memory primitives:
 3. Atomic reduce operations e.g. `tl.reduce_add(ptr, 1, sem=”release”, scope=”sys”)`
 
 These would allow more efficient communication patterns by minimizing the synchronization effects of operations. For example, fence \+ relaxed atomic store allows more memory ops to be placed in-between without causing over-synchronization.
+
+# **5\. AMD prototype**
+
+GSan also runs, as a prototype, on AMD gfx950 (MI350-series, wave64) and gfx1250 (MI450-series, wave32) with a single GPU.
+It supports ordinary global `tl.load`/`tl.store`, atomic RMW/CAS, atomic load/store/poll, AMD buffer loads and stores (including packed FP4 storage), and buffer atomics (from Triton's buffer-op conversion or explicit Gluon `buffer` ops), direct pointer-addressed global↔LDS copies (LDS-to-global on gfx1250), buffer-addressed global-to-LDS copies on gfx950, rectangular TDM copies on gfx1250, and launches on ordinary streams with memory from the GSan allocator.
+On gfx1250, write-once pools support ordinary masked loads/stores, mixed normal/write-once pointer tensors, and direct asynchronous-copy reads at shadow granularities 1, 2, 4, 8, and 16.
+Reads leave compact write-once shadow cells unchanged; unwritten reads, repeated writes, and active atomic accesses are rejected.
+The complete aligned access requirement for 16-byte pools still applies.
+Reset rejects live managed allocations and clears runtime and launch-stream clocks after their allocations are released.
+On gfx1250, rectangular, fused-load, gather, and scatter TDM operations are instrumented, including named-barrier completion operands.
+Checks decode the positioned native descriptor, including dynamic address, element strides, bounds, predicate, and unsigned gather/scatter indices.
+Their checks happen when the transfer is issued, matching NVIDIA TMA checks; completion epochs are not tracked.
+TDM instructions require gfx1250.
+Native AMD tensor descriptors support 8-, 16-, 32-, and 64-bit elements; FP4 TDM remains a native compiler restriction.
+Gfx1250 warp-specialized regions, noinline worker calls, and explicit warp-pipeline phase shifts are supported.
+Rectangular TDM has noinline-worker execution coverage; indexed TDM inside a noinline worker can produce native LLVM register-copy errors and incorrect values with or without GSan, and remains outside this validated composition.
+Each CTA remains one logical sanitizer participant shared by its regions; local named/completion barriers preserve hardware phases without adding global-memory ordering between different CTAs.
+Automatic BlockPingpong scheduling remains disabled: its existing AMD compiler pass requires MFMA layouts, while gfx1250 uses WMMA.
+Other AMD targets, combining GSan with AddressSanitizer, and implicit HIP graph capture remain rejected.
+The wave32 runtime reserves 320 KiB of total LDS per cluster, divided among its CTAs; gfx950 reserves 160 KiB per workgroup.
+MI450 cluster launches preserve independent sanitizer participants for every CTA, including replicated multicast readers.
+Before launch, configured runtime slots must cover `device CU count * floor(device LDS per CU / emitted total LDS per CTA)`, using the actual HIP properties and static-plus-dynamic reservation.
+This conservatively covers concurrent resident participants even when the cluster reservation is divided.
+For example, on a 256-CU device a four-CTA cluster requires `configure(num_slots=1024, clock_buffer_size=16)` before creating a GSan pool; configured slot and clock-history sizes must fit the allocator state budget.
+This is a physical-residency bound; suspended CWSR participants can still exhaust the fixed table and trigger its existing timeout diagnostic.
+Two- and four-CTA launches have focused end-to-end memory, multicast, synchronization, and concurrent-stream coverage; eight- and sixteen-CTA disjoint launches also pass value and actor-identity checks, and grouped TDM multicast verifies four recipients per cell, disjoint groups, and nonrecipient clock independence.
+AMD cluster arrive/wait are execution rendezvous and do not acquire other CTAs' global-memory clocks; release/acquire atomics provide their actual ordering.
+AMD named and TDM completion barriers access each CTA's own LDS barrier object and retain their phase semantics.
+Direct cross-CTA LDS transfers and remote LDS barrier-address mapping remain unavailable through the current AMD compiler; this is a compiler boundary, not a claim of absent hardware support.
+Multi-CTA `atomic_poll` remains rejected by the native compiler because its current lowering requires cross-CTA shared memory.
+A detected race prints `GSan device assertion failed: '<kind> race detected' at <file>:<line>` and aborts the process (device trap), so run failing cases in a subprocess.
+The explicit graph interface (`triton.experimental.gsan.graph.GraphPlan`) supports HIP fork/join dependencies, repeated replay, immutable completion clocks, and executable storage lifetime.
+An external launcher must install the plan's boundary kernels and actual node dependencies; importing completion clocks does not create a GPU execution dependency.
+Repeated replay of one HIP plan establishes a real completion-event dependency before reusing its clock storage, including when switching streams.
+The regression graph launcher covers single-CTA kernel nodes; cluster node attributes and scratch-buffer integration require support in the external launcher and are not validated by those graph tests.
+NVIDIA programmatic dependent launches (PDL) have no HIP equivalent and are rejected; implicit graph capture remains unsupported on both backends.
+
+Known limitations:
+
+* Default pools have 4-byte shadow granularity: unsynchronized writes to different bytes of one 4-byte word are reported as a race. Pools from `create_mem_pool(shadow_granularity=1)` (or 2) track finer cells.
+* Ordinary same-stream launch order and the explicit graph interface create modeled happens-before between kernels.
+  General event waits (e.g. `wait_stream`) and host synchronization are not tracked, so cross-stream accesses ordered only by them are reported.
+* Blocks are identified by slots of a fixed table (`num_slots` or `TRITON_GSAN_NUM_SLOTS`, default up to 512). When the runtime state would not fit in 1 GiB per device, the default slot count shrinks, but not below the CU count; then the default clock buffer shrinks instead. The allocator prints a note when it picks fewer slots than CUs or fewer than 1024 clock-buffer entries. A block that takes over a slot from an earlier block, in any kernel or stream, shares that block's identity (its epoch), so the earlier block's accesses look like its own and are treated as ordered. Slots are chosen by hash, so a race between two blocks that do not run concurrently is missed with probability about 1/num_slots per racing pair; grids larger than the slot count have many such pairs.
+* Earlier prototype measurements found three to four orders of magnitude slowdown; this is not a performance estimate for every supported operation.
+  Instrumented kernels reserve the maximum LDS per cluster, so a single-CTA launch admits one CTA per CU; multi-CTA clusters divide that reservation.
+* Buffer loads and stores are checked on the addresses they access, `base + soffset + offset` in bytes, and only for elements the hardware does not drop (masked off or past the descriptor's `num_records`). An element wider than 4 bytes counts as accessed when its first 4 bytes are in bounds. A contiguous run of elements is checked as one access, which counts the whole run when its first element is in bounds, so the bytes of a run that `num_records` cuts are also counted (this can report a race on bytes just past the bound). A buffer descriptor must be built by `make_buffer_descriptor` in the same function as its use (not passed in, loop-carried, or selected); otherwise compilation fails.
+* Under GSan, buffer atomics are emitted as global atomics.
+  On gfx950, for elements wider than 4 bytes, an active element must be entirely in bounds: GSan reports a device assertion if the first 4 bytes fit but the whole element does not.
+  On gfx1250, a partially bounded atomic element is dropped entirely, matching the hardware.
+  This restriction also applies to dynamic bounds; masked-off and wholly out-of-bounds elements are still dropped.
+  Partial atomic accesses need a lowering that preserves both their memory effects and synchronization before they can be supported.
+* Direct async copies are checked at issue time, matching NVIDIA's checking approach; the interval through completion is not tracked, and async waits do not add happens-before edges.
+* Buffer global-to-LDS copies check the independently wrapped unsigned byte offsets and descriptor byte bounds, including individual dwords of partially in-bounds wide elements.
+  Sub-dword element types (such as f16 and i8) require a blocked layout whose per-lane dword groups have provably contiguous offsets and uniform masks; checks use the issued dword bounds, so a partial dword dropped by hardware leaves every contained element unchecked.
+  A buffer descriptor must be defined directly by `amdg.make_buffer_desc`; passed-in, selected, or loop-carried descriptors fail compilation.
+  Exact dynamic buffer bounds can prevent merging checks into complete 16-byte accesses, so use shadow granularity 1, 2, 4, or 8 for those copies; 16-byte pools retain the runtime's complete-access requirement.
+* Pointer LDS-to-global copies (`amdg.async_copy_local_to_global`) on gfx1250 receive issue-time write checks.
+* An unmatched timed-out `atomic_poll` does not check its read, matching the existing NVIDIA checker; a matched active poll on write-once memory is rejected.
+* Single-CTA regions do not add intra-CTA race detection; the logical block programming model and existing sampled-reader/clock-history limits still apply.
+
+## **5.1 Build and test from a fresh checkout**
+
+These commands assume a gfx1250 machine with a ROCm build of PyTorch whose bundled HIP runtime Triton uses (validated with `torch 2.15.0a0+rocm10.1.0a20260822`).
+Use the corresponding `device-gfx950` wheel extra on gfx950; the additional MI450 TDM, completion, region, and cluster coverage requires gfx1250.
+The AMD build compiles the GSan device libraries (`third_party/amd/backend/lib/gsan.bc` for gfx950 and `gsan-gfx1250.bc` for gfx1250) with the `clang++` from Triton's LLVM; the host allocator is compiled on first use with the system C++ compiler.
+
+```bash
+git clone https://github.com/triton-lang/triton.git && cd triton
+# In a fresh virtualenv; the validated PyTorch build came from:
+pip install --index-url https://rocm.nightlies.amd.com/whl-multi-arch/ "torch[device-gfx1250]==2.15.0a0+rocm10.1.0a20260822"
+pip install -r python/requirements.txt
+pip install -e . --no-build-isolation
+pip install -r python/test-requirements.txt
+export HIP_VISIBLE_DEVICES=0
+# Without this, every reported race writes a large GPU core dump into the cwd.
+export HSA_DISABLE_COREDUMP_ON_EXCEPTION=1
+# Single-GPU matrix; gpu-lock is required on shared GPU hosts.
+TRITON_TEST_PROCESS_TIMEOUT=60 gpu-lock timeout 1200 pytest -s --tb=short -ra \
+    python/test/gsan/test_allocator.py python/test/gsan/test_utils.py \
+    python/test/gsan/test_write_once.py python/test/gsan/test_write_once_failures.py \
+    python/test/gsan/test_gsan.py python/test/gsan/test_gsan_failures.py \
+    -k 'not test_configure_supports_swapped_cuda_device_ids and not test_configure_supports_sparse_global_device_ids and not test_default_topology_uses_cuda_device_indices and not test_malloc_on_non_current_device'
+# Compiler-only tests (no GPU); run from the CMake build directory.
+cd build/cmake.linux-x86_64-cpython-3.*
+lit -v test/TritonGPU/amd/amd-gsan-reject-unsupported.mlir test/Conversion/amd/tritongpu_to_llvm_gsan.mlir \
+    test/TritonGPU/amd/amd-gsan-instrument-buffer-ops.mlir test/TritonGPU/gsan.mlir \
+    test/Conversion/tritongpu_to_llvm_gsan.mlir
+```
+
+In the development container with `tritonbuild` and `gpu-lock` on `PATH`, use `MAX_JOBS=128 CMAKE_BUILD_PARALLEL_LEVEL=128 tritonbuild --rocm-gpu gfx1250 worktree-setup` and `tritonbuild --rocm-gpu gfx1250 run -- make` for CPU setup/build, without holding the GPU lock.
+Run the matrix command above through `tritonbuild --rocm-gpu gfx1250 run -- gpu-lock timeout 1200 pytest ...`; the timeout starts after acquiring the GPU lock.
+Use `tritonbuild --rocm-gpu gfx1250 lit -- -v ...` for the listed compiler-only tests.
+Choose CPU parallelism appropriate to the host; 128 workers is half of the validated machine's 256 cores.
+Expected device traps print ROCm queue-error diagnostics; a test passes only when its isolated child reports the expected sanitizer error at the user source location.
+On a timeout or persistent GPU hang, stop further GPU runs and preserve the revision, command, and log for recovery.
+
+To sanitize your own kernels, allocate their tensors from a GSan memory pool and enable the instrumentation mode:
+
+```python
+import torch, triton
+from triton.experimental.gsan import create_mem_pool
+
+triton.knobs.compilation.instrumentation_mode = "gsan"  # or TRITON_INSTRUMENTATION_MODE=gsan
+with torch.cuda.use_mem_pool(create_mem_pool()):
+    x = torch.zeros(1024, device="cuda")
+    my_kernel[grid](x, ...)
+    torch.cuda.synchronize()
+```

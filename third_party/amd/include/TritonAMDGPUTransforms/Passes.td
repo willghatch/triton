@@ -392,14 +392,19 @@ def TritonAMDGPUGSanRejectUnsupported : Pass<"tritonamdgpu-gsan-reject-unsupport
   let summary = "Reject operations that the global sanitizer (GSan) cannot check on AMD";
   let description = [{
     GSan instruments `tt.load`, `tt.store`, the `tt.atomic_*` operations,
-    AMD buffer loads, stores, and atomics, direct async copies, and rectangular TDM copies.
-    Any other operation that reads or writes global memory (advanced TDM copies,
-    tensor descriptor ops, ...) would silently escape race checking, so this
-    pass reports an error for it instead.
-    It also rejects features the AMD GSan prototype does not model or has not
-    been validated with: warp specialization, warp pipelining, mbarrier,
-    cluster, and conditional barriers (block pingpong), `num_ctas > 1`, and
-    warp sizes other than 64.
+    AMD buffer loads, stores, and atomics, direct async copies, and rectangular,
+    fused-load, gather, and scatter TDM copies.
+    Any other operation that reads or writes global memory (such as
+    `tt.descriptor_load`) would silently escape race checking, so this pass
+    reports an error for it instead.
+    On gfx1250, warp specialization, explicit warp pipelining, local named and
+    completion barriers, conditional barriers, and cluster execution are
+    accepted, with `num_ctas` in {1, 2, 4, 8, 16}.
+    These barriers preserve execution semantics without ordering global-memory
+    accesses between CTAs; each CTA remains one logical sanitizer participant.
+    On other targets, these features and `num_ctas > 1` are rejected.
+    The pass accepts warp sizes of 32 or 64; the compiler selects wave32 for
+    gfx1250 and wave64 for gfx950 and rejects other AMD GSan targets.
     Operations with unspecified memory effects (non-pure inline assembly or
     external calls) get a warning, since their accesses are not checked, and
     their count is recorded in the module attribute `tti.gsan_unchecked_ops`.
@@ -444,11 +449,15 @@ def TritonAMDGPUGSanInstrumentDirectAsync : Pass<"tritonamdgpu-gsan-instrument-d
 }
 
 def TritonAMDGPUGSanInstrumentTDM : Pass<"tritonamdgpu-gsan-instrument-tdm", "mlir::ModuleOp"> {
-  let summary = "Check rectangular AMD TDM transfers at issue time for GSan";
+  let summary = "Check AMD TDM transfers at issue time for GSan";
   let description = [{
-    Inserts descriptor checks for global-to-LDS reads and LDS-to-global writes.
+    Inserts descriptor checks for rectangular global-to-LDS reads and
+    LDS-to-global writes, each descriptor of a fused load, and indexed gather
+    reads and scatter writes.
     The runtime recovers the positioned native descriptor address, element
-    strides, bounds, and predicate, and checks the logical rectangular tile.
+    strides, bounds, and predicate, and checks the logical tile or indexed
+    footprint.
+    Hardware 16-bit row indices are zero-extended to the runtime's 32-bit ABI.
     Completion epochs are not modeled, matching NVIDIA TMA checking.
   }];
   let dependentDialects = ["mlir::arith::ArithDialect",
