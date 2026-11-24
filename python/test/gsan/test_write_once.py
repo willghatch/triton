@@ -15,6 +15,8 @@ from test_gsan import (
     _device_tma_masked_load_kernel,
     _device_tma_masked_store_kernel,
     _gather_reference,
+    _gsan_gfx1250_tdm_copy_kernel,
+    _gsan_gfx1250_tdm_indexed_kernel,
     _gluon_async_copy_masked_kernel,
     _host_tma_gather_kernel,
     _host_tma_scatter_kernel,
@@ -185,3 +187,33 @@ def test_write_once_adjacent_cta_writes(with_write_once_gsan, shadow_granularity
     torch.testing.assert_close(target, expected)
     for cell in range(4):
         assert shadow_cell_from_address(target.data_ptr() + cell * shadow_granularity).epoch > 0
+
+
+def _run_tdm_write_once_copy(src, target, indexed):
+    if indexed:
+        _gsan_gfx1250_tdm_indexed_kernel[(1, )](src, target, True, 112, False, False)
+    else:
+        _gsan_gfx1250_tdm_copy_kernel[(1, )](src, target, 24, True, False)
+
+
+@pytest.mark.skipif(not is_hip_cdna5(), reason="TDM requires AMD gfx1250")
+@pytest.mark.parametrize("indexed", [False, True], ids=["rectangular", "scatter"])
+def test_write_once_native_tdm_store(with_write_once_gsan, shadow_granularity, indexed):
+    shape = (32, 144 if indexed else 128)
+    src = torch.arange(32 * shape[1], dtype=torch.int32, device="cuda").reshape(shape)
+    with torch.cuda.use_mem_pool(with_write_once_gsan):
+        target = torch.full(shape, -1, dtype=torch.int32, device="cuda")
+
+    _run_tdm_write_once_copy(src, target, indexed)
+
+    expected = torch.full_like(src, -1)
+    written = torch.zeros(shape, dtype=torch.bool)
+    if indexed:
+        expected[:29:2, 112:128] = src[:29:2, 112:128]
+        written[:29:2, 112:128] = True
+    else:
+        expected[24:, 16:80] = src[24:, 32:96]
+        written[24:, 16:80] = True
+    torch.testing.assert_close(target, expected)
+    expected_cells = written.repeat_interleave(target.element_size()).reshape(-1, shadow_granularity).any(dim=1)
+    assert torch.equal(shadow_tensor_for(target).cpu().view(torch.int32) != 0, expected_cells)

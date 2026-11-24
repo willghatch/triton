@@ -2744,6 +2744,31 @@ def test_gsan_gfx1250_tdm_offsets_bounds_predicate(with_gsan, row, enabled, comp
     _assert_shadow_mask(before_dst, _shadow_cells_for_tensor(dst), writes, access_kind="write")
 
 
+@pytest.mark.skipif(not is_hip_cdna5(), reason="TDM requires AMD gfx1250")
+def test_gsan_gfx1250_tdm_mixed_pools(fresh_knobs):
+    triton.knobs.compilation.instrumentation_mode = "gsan"
+    fine_pool = create_mem_pool(shadow_granularity=4)
+    coarse_pool = create_mem_pool(shadow_granularity=16)
+    with torch.cuda.use_mem_pool(coarse_pool):
+        src = torch.arange(32 * 128, dtype=torch.int32, device="cuda").reshape(32, 128)
+    with torch.cuda.use_mem_pool(fine_pool):
+        dst = torch.full_like(src, -1)
+    assert get_shadow_granularity(src.data_ptr()) == 16
+    assert get_shadow_granularity(dst.data_ptr()) == 4
+    before_src = _shadow_cells_for_tensor(src)
+    before_dst = _shadow_cells_for_tensor(dst)
+    _gsan_gfx1250_tdm_copy_kernel[(1, )](src, dst, 24, True, False)
+    expected = torch.full_like(dst, -1)
+    expected[24:, 16:80] = src[24:, 32:96]
+    torch.testing.assert_close(dst, expected)
+    reads = torch.zeros((32, 128), dtype=torch.bool)
+    writes = torch.zeros_like(reads)
+    reads[24:, 32:96] = True
+    writes[24:, 16:80] = True
+    _assert_shadow_mask(before_src, _shadow_cells_for_tensor(src), reads, access_kind="read")
+    _assert_shadow_mask(before_dst, _shadow_cells_for_tensor(dst), writes, access_kind="write")
+
+
 @gluon.jit
 def _gsan_gfx1250_async_store_kernel(src, dst):
     layout: gl.constexpr = gl.BlockedLayout([1], [32], [1], [0])

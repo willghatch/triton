@@ -13,7 +13,9 @@ from triton._internal_testing import is_cuda, is_hip_cdna5, is_hopper_or_newer
 from triton.experimental.gsan import create_mem_pool
 from triton.experimental.gsan._allocator import get_reserve_pointer, get_reserve_size
 from triton.tools.tensor_descriptor import TensorDescriptor
+from test_gsan import _gsan_gfx1250_tdm_copy_kernel, _gsan_gfx1250_tdm_indexed_kernel
 from test_gsan_failures import _raw_kernel, _run_failure_case
+from test_write_once import _run_tdm_write_once_copy
 
 pytestmark = pytest.mark.skipif(not (is_cuda() or is_hip_cdna5()), reason="requires CUDA or AMD gfx1250 backend")
 
@@ -234,3 +236,24 @@ def test_write_once_rejects_partial_16_byte_cell():
     _run_failure_case("partial", runner=_run_write_once_failure, runner_args=("partial", 16),
                       source_function=_write_once_failure_kernel.fn, marker="gl.store(ptr, 1)",
                       error="GSan 16-byte pools require complete aligned 16-byte accesses")
+
+
+def _run_tdm_write_once_repeat(indexed):
+    shape = (32, 144 if indexed else 128)
+    with _write_once_pools(4) as pool:
+        src = torch.ones(shape, dtype=torch.int32, device="cuda")
+        with torch.cuda.use_mem_pool(pool):
+            target = torch.empty_like(src)
+        _run_tdm_write_once_copy(src, target, indexed)
+        torch.cuda.synchronize()
+        _run_tdm_write_once_copy(src, target, indexed)
+        torch.cuda.synchronize()
+
+
+@pytest.mark.skipif(not is_hip_cdna5(), reason="TDM requires AMD gfx1250")
+@pytest.mark.parametrize("indexed", [False, True], ids=["rectangular", "scatter"])
+def test_write_once_rejects_repeated_native_tdm_store(indexed):
+    kernel = _gsan_gfx1250_tdm_indexed_kernel if indexed else _gsan_gfx1250_tdm_copy_kernel
+    marker = "tdm.async_scatter(dst_desc" if indexed else "tdm.async_store(dst_desc"
+    _run_failure_case("native_tdm_repeat", runner=_run_tdm_write_once_repeat, runner_args=(indexed, ),
+                      source_function=kernel.fn, marker=marker, error="Write-once memory written more than once")
